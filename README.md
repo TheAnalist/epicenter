@@ -2,11 +2,13 @@
 
 *Requires Cargo with `build.build-dir` support — Rust 1.91+.*
 
-Install: `cargo install epicenter-cli` — the crate ships the `epicenter` binary.
+Rust has two main problems: slow compilation times and big target directories.
+This usually means that every Cargo project compiles its dependencies into its own `target/` directory:
+ten projects = ten copies of the same rlibs, consuming gigabytes of storage.
+So *epicenter* tries to solve this problem with a simple idea:
+why not keep one shared version of compiled dependencies?
 
-Every Cargo project compiles its dependencies into its own `target/` directory:
-ten projects = ten copies of the same rlibs. epicenter manages that state as
-**three tiers, one tool**:
+It manages that state as **three tiers, one tool**:
 
 - **store** — a durable vault of unit groups addressed by Cargo's own
   fingerprint hashes (`…/epicenter/store/…`); survives `cargo clean`, feeds
@@ -18,7 +20,7 @@ ten projects = ten copies of the same rlibs. epicenter manages that state as
   (`…/epicenter/work/<id>/`), where CI jobs and agents run fully parallel:
   nothing shared but the read-only vault.
 
-Around those tiers epicenter owns the lifecycle: **configure** (`setup`,
+Around those tiers *epicenter* owns the lifecycle: **configure** (`setup`,
 `doctor` — cross-OS config truth), **observe** (`status`, `who`, `why`, `vault`,
 `verify`), **reclaim** (`prune` for age-based housekeeping, tiered `evict` for
 deliberate removals with honest freed-vs-released accounting), **persist**
@@ -157,15 +159,6 @@ re-verifies that the cargo config and the cache directory agree.
   shared-cross-OS setup — the canonical form therefore uses forward slashes,
   which are valid separators on Windows too.
 
-## Colors
-
-Output uses one brand green (`#92D293`) for headings and accents, dim gray for
-labels, amber strictly for warnings, red only for failures — calm unless
-something needs attention. Status glyphs are geometric and emoji-free:
-`✓` pass · `▲` warning · `✕` failure · `◆` info. Colors turn off automatically
-when output is piped or when `NO_COLOR` is set; force them in scripts with
-`CLICOLOR_FORCE=1`.
-
 ## The vault — surviving `cargo clean` and cold starts
 
 Cargo's own fingerprints make the shared build dir fast while it is warm — but a
@@ -229,8 +222,8 @@ die with the job; with a value it selects that path instead. With both pinned
 per job, two builds of the same project share nothing but the read-only vault:
 **no lock contention anywhere — the fully parallel case.**
 
-The command's exit code becomes epicenter's exit code; its stdout and stderr
-pass through untouched (epicenter's own frame lines go to stderr). Every job
+The command's exit code becomes *epicenter*'s exit code; its stdout and stderr
+pass through untouched (*epicenter*'s own frame lines go to stderr). Every job
 owns its build dir, so parallel jobs never wait on Cargo's per-build-dir lock,
 and job dirs are disposable — they live under
 `{cargo-cache-home}/epicenter/work/<id>/`.
@@ -261,6 +254,7 @@ only cost is the next compile. `evict` therefore treats the tiers explicitly:
   a view a live build has locked refuses to be touched.
 
 ## Cross-OS notes
+
 - macOS / BSD: nothing platform-specific to configure — same template, same
   commands. First-run checks worth doing on real hardware: the Cargo lock guard
   (`exec --reuse` must refuse while a build runs in the job dir, and
@@ -278,7 +272,7 @@ only cost is the next compile. `evict` therefore treats the tiers explicitly:
 
 One line: `epicenter setup --with-wrapper kache`. The wrapper tier adds
 compile-result caching across machines (CI/remote) and languages beyond Rust.
-epicenter stays the cache-state authority either way: config health, pruning,
+*epicenter* stays the cache-state authority either way: config health, pruning,
 ownership, diagnostics.
 
 ## License
