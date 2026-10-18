@@ -38,11 +38,11 @@ spawned**.
 ## Quickstart
 
 ```bash
-cargo build                      # in this crate
-cargo run -- setup               # write the shared-cache config (backs up files it touches)
+cargo install epicenter-cli
+epicenter setup                  # write the shared-cache config (backs up files it touches)
 cargo build                      # any project of yours — intermediates now land in the shared cache
-cargo run -- status              # watch it fill up
-cargo run -- doctor              # verify everything is healthy
+epicenter status                 # watch it fill up
+epicenter doctor                 # verify everything is healthy
 ```
 
 ## Three workflows, one tool
