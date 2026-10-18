@@ -1,0 +1,20 @@
+[package]
+name = "epicenter"
+version = "0.0.1"
+edition = "2024"
+description = "The state layer for Cargo builds: shared cache, durable vault, per-job dirs"
+
+[[bin]]
+name = "epicenter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
