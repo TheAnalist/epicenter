@@ -1,8 +1,14 @@
 [package]
-name = "epicenter"
+name = "epicenter-cli"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.91"
 description = "The state layer for Cargo builds: shared cache, durable vault, per-job dirs"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["cargo", "build-cache", "compilation", "vault", "cli"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+exclude = ["src/benchmark.rs"]
 
 [[bin]]
 name = "epicenter"

@@ -102,10 +102,9 @@ impl DepRef {
     /// Cargo stores a dependency's fingerprint hash as a u64 in the
     /// fingerprint JSON, and writes the same value into the dependency's
     /// memo file as hex of its **little-endian** bytes (cargo's `to_hex`).
-    /// Live-verified: serde's `serde_core` entry `9416646317397223793`
-    /// resolves to `serde_core-…/lib-serde_core` = `71a9f323efa5ae82`.
-    /// (An earlier probe compared the decimal digits and found 0/222 edges;
-    /// the byte order was the whole story.)
+    /// Example: serde's `serde_core` entry `9416646317397223793`
+    /// resolves to `serde_core-…/lib-serde_core` = `71a9f323efa5ae82`
+    /// (the same number, in opposite byte order).
     pub fn memo_hash(&self) -> Option<String> {
         let value: u64 = self.unit_hash.parse().ok()?;
         let mut out = String::with_capacity(16);
@@ -551,7 +550,7 @@ mod tests {
 
     #[test]
     fn dep_hashes_resolve_to_memo_hashes_little_endian() {
-        // Live: serde's fingerprint lists serde_core as 9416646317397223793,
+        // Example: serde's fingerprint lists serde_core as 9416646317397223793,
         // and serde_core-b468be6fa8c1f936/lib-serde_core contains 71a9f323efa5ae82.
         let dep = DepRef {
             name: "serde_core".into(),

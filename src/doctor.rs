@@ -703,8 +703,8 @@ mod tests {
         Ok(())
     }
 
-    /// Two units with a resolved dependency edge (the live-verified
-    /// serde → serde_core pair); artifacts carry explicit stamps so the
+    /// Two units with a resolved dependency edge (the serde → serde_core
+    /// pair); artifacts carry explicit stamps so the
     /// ordering is deterministic.
     fn edge_build_dir(root: &Path, dep_at: u64, unit_at: u64) -> Result<()> {
         let stamp = |path: &Path, secs: u64| -> Result<()> {

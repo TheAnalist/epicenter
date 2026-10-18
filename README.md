@@ -1,10 +1,12 @@
 # epicenter — the state layer for Cargo builds
 
-*Requires Cargo with build.build-dir support — Rust 1.91+*
+*Requires Cargo with `build.build-dir` support — Rust 1.91+.*
 
-Rust has two main problems: compilation times and large `target/` directories. What this usually means is ten `target/` directories, ten copies of the same dependencies, and gigabytes of duplicated compile work.
+Install: `cargo install epicenter-cli` — the crate ships the `epicenter` binary.
 
-**epicenter manages that state as three tiers, one tool**:
+Every Cargo project compiles its dependencies into its own `target/` directory:
+ten projects = ten copies of the same rlibs. epicenter manages that state as
+**three tiers, one tool**:
 
 - **store** — a durable vault of unit groups addressed by Cargo's own
   fingerprint hashes (`…/epicenter/store/…`); survives `cargo clean`, feeds
@@ -26,19 +28,21 @@ no daemon — and a rustc-wrapper (kache or sccache) remains an optional tier.
 One configuration for Linux, WSL, macOS and native Windows: the platform code
 is std-only and cfg-gated, and the canonical template line is identical
 everywhere. (Linux/WSL and Windows are verified live; Apple and BSD targets are
-compile-verified)
+compile-verified — see Cross-OS notes for the first-run checklist.)
 
-*epicenter* isn't a Cargo wrapper, it "exploits" Cargo's own fingerprint engine which decides freshness, and so recompilation.  When the vault restores a unit, Cargo sees it as `Fresh` in milliseconds with **zero `rustc` processes spawned**.
-
+*epicenter isn't a Cargo wrapper* — it leans on Cargo's own fingerprint engine,
+which decides freshness and therefore recompilation. A unit restored from the
+vault is `Fresh` to Cargo in milliseconds, with **zero `rustc` processes
+spawned**.
 
 ## Quickstart
 
 ```bash
-cargo build                      # build epicenter
+cargo build                      # in this crate
 cargo run -- setup               # write the shared-cache config (backs up files it touches)
-cargo build                      # in any project — intermediates now land in the shared cache
-cargo run -- status              # see size, breakdown, and largest units
-cargo run -- doctor              # 10-point health & configuration check
+cargo build                      # any project of yours — intermediates now land in the shared cache
+cargo run -- status              # watch it fill up
+cargo run -- doctor              # verify everything is healthy
 ```
 
 ## Three workflows, one tool
@@ -46,8 +50,8 @@ cargo run -- doctor              # 10-point health & configuration check
 1. **Daily development (zero extra steps)** — run `epicenter setup` once. Every
    project on the machine immediately shares compiled dependencies.
 2. **Survive `cargo clean` and cold starts (the vault)** — `epicenter harvest`
-   snapshots built units into the read-only vault; `epicenter restore`
-   hard-links them back so Cargo skips compilation completely.
+   snapshots built units into the read-only vault; `epicenter restore` links
+   them back so Cargo skips compilation completely.
 3. **Parallel agents & CI jobs (zero lock waits)** —
    `epicenter exec --id agent-1 --target-dir -- cargo test` seeds a private
    per-job build dir from the vault in milliseconds. Ten agents can build the
@@ -58,27 +62,27 @@ cargo run -- doctor              # 10-point health & configuration check
 
 | command | what it does |
 |---|---|
-| `epicenter setup` | write the shared-cache config; **backs up** any file it modifies (`*.epicenter-bak`) |
-| `epicenter setup --cache-root <path>` | use a custom cache directory instead of the default |
+| `epicenter setup` | write the shared-cache config; **backups** any file it modifies (`*.epicenter-bak`) |
+| `epicenter setup --cache-root <path>` | use a different cache directory instead of the default |
 | `epicenter setup --use-default` | remove a custom root, back to the canonical default |
-| `epicenter setup --with-wrapper kache` | also configure [kache](https://github.com/kunobi-ninja/kache) (or `sccache`) as `rustc-wrapper` |
+| `epicenter setup --with-wrapper kache` | also configure [kache](https://github.com/kunobi-ninja/kache) (or sccache) as `rustc-wrapper` |
 | `epicenter setup --without-wrapper` | remove a previously configured wrapper |
 | `epicenter status` | sizes, per-directory breakdown, largest build units |
 | `epicenter who [--unit <q>]` | unit forensics: per-package blocks, toolchain generations, stale flags |
 | `epicenter why <unit>` | one unit in depth: hashes, features, deps, artifact inventory, FRESH/DIRTY verdict |
-| `epicenter evict --unit <q>` | remove units deliberately (store + views): dry run by default, `-y` / `--yes` to delete |
+| `epicenter evict --unit <q>` | remove units deliberately (store + views): dry run by default, `--yes` to delete |
 | `epicenter evict --unit <q> --tier store` | trim the **vault only** — no `--force` needed, the vault is yours to trim |
 | `epicenter evict --unit <q> --tier view` | unlink the working copies only (build dir + job dirs); vault untouched |
 | `epicenter evict --work <job\|build> --crate <name>` | surgical cache-bust: unlink one crate from ONE view; the vault is never touched |
 | `epicenter evict --stale` / `--husks` / `--older-than 90d` / `--rustc-key <h>` | bulk selectors, by default across the store and every known view |
 | `epicenter evict --work-dir <job>` | remove ONE job dir now — explicit choices bypass the GC window (dry run default; a live build's dir is refused) |
 | `epicenter evict --work-dirs [--older-than 7d]` | collect stale per-job working dirs; a dir a live build has locked is never touched |
-| `epicenter prune [--older-than 30d]` | age-based housekeeping of the shared build dir (policy GC, default 30d). **Dry run by default** — pass `-y` / `--yes` to delete |
-| `epicenter doctor` | 10-point health check with plain-language verdicts |
+| `epicenter prune [--older-than 30d]` | age-based housekeeping of the shared build dir (policy GC, default 30d). **Dry run by default** — pass `--yes` to delete |
+| `epicenter doctor` | health check with plain-language verdicts: config, wrapper, filesystem, toolchain, mtime ordering |
 | `epicenter vault` | show the vault: generations (toolchain + flags), sizes, links into the build view |
 | `epicenter harvest [--unit <q>] [--dry-run]` | store built unit groups from the shared build dir into the vault |
-| `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | hard-link vault unit groups into a working dir (default: the shared build dir) |
-| `epicenter verify` | audit the vault: file sizes, canonical stamps, hash contents |
+| `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | seed a working dir from the vault (default: the shared build dir) — artifacts hard-linked, fingerprint state copied |
+| `epicenter verify` | audit the vault: file sizes, canonical stamps, hash contents, dependency ordering — and name the job dirs under `work/` |
 | `epicenter exec [--harvest] [--rm] [--reuse] [--target-dir [DIR]] [--id <id>] [--cwd <dir>] -- <cmd>` | run a command in a fresh per-job build dir seeded from the vault (CI/agents) |
 
 ## `prune` vs `evict` — housekeeping vs deliberate removal
@@ -102,9 +106,9 @@ Rules of thumb:
 - you want the *space* back, not just an unlink from the working view →
   **`evict --tier all`** (or `--tier store` to trim the vault alone)
 
-Both report what they *would* do first; nothing is deleted without `-y` /
-`--yes`. (What "tiers" mean in practice — and how the numbers stay honest — is
-in *Tiers, and honest numbers* below.)
+Both report what they *would* do first; nothing is deleted without `--yes`.
+(What "tiers" mean in practice — and how the numbers stay honest — is in
+*Tiers, and honest numbers* below.)
 
 ## Configuration — one file owns the decision
 
@@ -143,8 +147,8 @@ re-verifies that the cargo config and the cache directory agree.
 ## How resolution works (and why it is safe)
 
 - configs always contain the **template**, never an expanded path —
-  cargo re-expands `{cargo-cache-home}` on the platform it builds for, 
-  so you'll never experience path misconfigurations;
+  cargo re-expands `{cargo-cache-home}` on the platform it builds for, so one
+  file serves WSL and Windows;
 - commands that touch the filesystem (`status`/`prune`) ask **cargo itself**
   (`cargo metadata` → `build_directory`) for the effective directory, then
   normalize separators locally; the expansion is never written back into any
@@ -152,6 +156,15 @@ re-verifies that the cargo config and the cache directory agree.
 - paths with backslash separators are the one known hazard in a
   shared-cross-OS setup — the canonical form therefore uses forward slashes,
   which are valid separators on Windows too.
+
+## Colors
+
+Output uses one brand green (`#92D293`) for headings and accents, dim gray for
+labels, amber strictly for warnings, red only for failures — calm unless
+something needs attention. Status glyphs are geometric and emoji-free:
+`✓` pass · `▲` warning · `✕` failure · `◆` info. Colors turn off automatically
+when output is piped or when `NO_COLOR` is set; force them in scripts with
+`CLICOLOR_FORCE=1`.
 
 ## The vault — surviving `cargo clean` and cold starts
 
@@ -165,7 +178,6 @@ The vault makes the state durable:
     manifest.json              file list, sizes, canonical stamps
     units/<pkg>-<hash>/        one unit group: fingerprint files + artifacts
   build/…                      the shared build dir — a disposable view of the store
-  work/<job-id>/               isolated per-job views minted by `epicenter exec`
 ```
 
 ```bash
@@ -173,17 +185,19 @@ epicenter harvest              # after a build: store every unit group in the va
 epicenter vault                # what the store holds, per generation
 epicenter verify               # audit: sizes, stamps, hash contents
 cargo clean                    # the view is gone — the store is not
-epicenter restore              # (or --into <dir>): hard-link the units back
+epicenter restore              # (or --into <dir>): seed the view from the vault
 cargo build                    # Cargo sees fresh fingerprints: zero recompiles
 ```
 
-Wiping one unit and restoring it takes milliseconds,
+Measured under WSL on ext4: wiping one unit and restoring it takes milliseconds,
 after which `cargo build -v` reports `Fresh … in 0.01s` with **zero rustc
-processes**. Restore hard-links, so a thousand jobs share one copy of every
-rlib. The store is read-only, files carry one canonical timestamp per unit
-group, and restore never modifies timestamps — a shared inode must never be
-touched. Everything is fail-open: a partial vault just means Cargo recompiles
-what is missing, never a broken build.
+processes**. Restore hard-links `deps/` artifacts — a thousand jobs share one
+copy of every rlib — and copies the fingerprint state and build-script trees,
+because Cargo rewrites those in place (a shared inode would either hit the
+read-only store file or corrupt the store). Files carry one canonical
+timestamp per unit group; hard links share the store's stamp, private copies
+are stamped after copying. Everything is fail-open: a partial vault just means
+Cargo recompiles what is missing, never a broken build.
 
 Generations are keyed by `<rustc-release>-<commit>-<host>-<flag-digest>`: a
 toolchain upgrade opens a new generation instead of invalidating one, and
@@ -204,8 +218,8 @@ epicenter exec --rm --id nightly -- cargo test  # delete the job dir on success
 For long-lived agents, a job dir is a home:
 
 ```bash
-epicenter exec --id agent-1 --target-dir -- cargo build           # per-job finals dir
-epicenter exec --id agent-1 --reuse --target-dir -- cargo test    # continue in it
+epicenter exec --id agent-7 --target-dir -- cargo build           # per-job finals dir
+epicenter exec --id agent-7 --reuse --target-dir -- cargo test    # continue in it
 ```
 
 `--reuse` continues in an existing job dir instead of refusing (restore is
@@ -223,12 +237,12 @@ and job dirs are disposable — they live under
 
 Job dirs accumulate by design (one per job). `epicenter evict --work-dirs`
 collects the ones untouched for a week (customizable with `--older-than`,
-dry-run by default, `-y` / `--yes` to delete) and reports what was *actually*
-freed — bytes still hard-linked from the vault or a wrapper's store are
-released, not freed, and are reported separately. A dir a live build has locked
-is never touched. And a dir you no longer need goes **right now**:
-`epicenter evict --work-dir <job> -y` — the age window is a GC policy for bulk
-collection, not a gate on explicit choices.
+dry-run by default, `--yes` to delete) and reports what was *actually* freed —
+bytes still hard-linked from the vault or a wrapper's store are released, not
+freed, and are reported separately. A dir a live build has locked is never
+touched. And a dir you no longer need goes **right now**: `epicenter evict
+--work-dir <job> --yes` — the age window is a GC policy for bulk collection,
+not a gate on explicit choices.
 
 ### Tiers, and honest numbers
 
@@ -246,8 +260,13 @@ only cost is the next compile. `evict` therefore treats the tiers explicitly:
   CI). A freshness operation, never a space claim; the vault is untouched and
   a view a live build has locked refuses to be touched.
 
-## WSL notes
-
+## Cross-OS notes
+- macOS / BSD: nothing platform-specific to configure — same template, same
+  commands. First-run checks worth doing on real hardware: the Cargo lock guard
+  (`exec --reuse` must refuse while a build runs in the job dir, and
+  `evict --work-dirs` must skip it), hard links plus the copy+stamp fallback
+  across APFS volumes, and `epicenter doctor`. Stamps are whole-second, so
+  HFS+' 1-second mtime granularity is safe.
 - WSL users: projects on `/mnt/c` are fine, but keep the *cache* on the Linux
   side (the default does) — 10–30× faster I/O. `doctor` warns if the cache ever
   drifts onto a Windows-mounted drive.
@@ -264,4 +283,5 @@ ownership, diagnostics.
 
 ## License
 
-The project is licensed under the GPLv3.
+Licensed under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html)
+(`GPL-3.0-or-later`). See [`LICENSE`](LICENSE).

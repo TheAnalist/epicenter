@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use epicenter::{config, doctor, exec, prune, status, util, vault};
+use epicenter_cli::{config, doctor, exec, prune, status, util, vault};
 
 #[derive(Parser)]
 #[command(
@@ -114,7 +114,7 @@ enum Command {
         /// What an eviction touches: `all` (default: store + every view),
         /// `store` (the vault only), or `view` (build dir + job dirs only).
         #[arg(long, value_enum, default_value = "all")]
-        tier: epicenter::evict::Tier,
+        tier: epicenter_cli::evict::Tier,
         /// Also include units on the current toolchain generation.
         #[arg(long)]
         force: bool,
@@ -223,8 +223,8 @@ fn run() -> Result<()> {
             y,
         } => cmd_prune(&older_than, dry_run, yes, y),
         Command::Doctor => cmd_doctor(),
-        Command::Who { unit } => epicenter::who::run(&config::cache_root()?, unit.as_deref()),
-        Command::Why { unit } => epicenter::who::explain(&config::cache_root()?, &unit),
+        Command::Who { unit } => epicenter_cli::who::run(&config::cache_root()?, unit.as_deref()),
+        Command::Why { unit } => epicenter_cli::who::explain(&config::cache_root()?, &unit),
         Command::Evict {
             unit,
             stale,
@@ -241,7 +241,7 @@ fn run() -> Result<()> {
             yes,
             y,
         } => {
-            let opts = epicenter::evict::Options {
+            let opts = epicenter_cli::evict::Options {
                 unit: unit.as_deref(),
                 stale,
                 rustc_key: rustc_key.as_deref(),
@@ -255,7 +255,7 @@ fn run() -> Result<()> {
                 force,
                 delete: !dry_run && yes || y,
             };
-            epicenter::evict::run(&config::cache_root()?, &opts)
+            epicenter_cli::evict::run(&config::cache_root()?, &opts)
         }
         Command::Harvest { unit, dry_run } => cmd_harvest(unit.as_deref(), dry_run),
         Command::Restore {

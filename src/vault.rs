@@ -711,7 +711,7 @@ fn set_stamp(path: &Path, stamp: u64) -> Result<()> {
 /// Copy a file into a view as a **private** inode: writable, and stamped
 /// with the canonical group time. Required for everything cargo writes in
 /// place (`O_TRUNC`) — a shared inode would either hit the read-only store
-/// file (EACCES) or mutate the store (which §11 forbids).
+/// file (EACCES) or mutate the store.
 fn copy_private(src: &Path, dst: &Path, stamp: u64) -> std::io::Result<()> {
     fs::copy(src, dst)?;
     make_writable(dst)?;
@@ -781,7 +781,7 @@ pub struct RestoreReport {
 /// atomically. Fingerprint state and build-script trees become private
 /// writable copies, because cargo and build scripts write those *in place*:
 /// a shared inode would either hit the read-only store file (EACCES) or
-/// mutate the store (§11). Hard links share the store's canonical stamp;
+/// mutate the store. Hard links share the store's canonical stamp;
 /// private copies are stamped after copying. Never overwrites a file that
 /// already exists, never touches sources, and a partial vault is fine:
 /// Cargo recompiles whatever is missing.
@@ -1634,9 +1634,9 @@ mod tests {
         Ok(())
     }
 
-    /// Two units with a resolved dependency edge: `serde` → `serde_core`
-    /// (the live-verified pair). `dep_at`/`unit_at` are the stamps the
-    /// files carry, so harvest stores exactly that ordering.
+    /// Two units with a resolved dependency edge: `serde` → `serde_core`.
+    /// `dep_at`/`unit_at` are the stamps the files carry, so harvest stores
+    /// exactly that ordering.
     fn synthetic_edge_dir(root: &Path, dep_at: u64, unit_at: u64) -> Result<()> {
         fs::create_dir_all(root.join("debug/deps"))?;
         let core = root.join("debug/.fingerprint/serde_core-b468be6fa8c1f936");
