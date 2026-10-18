@@ -284,4 +284,4 @@ ownership, diagnostics.
 ## License
 
 Licensed under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html)
-(`GPL-3.0-or-later`). See [`LICENSE`](LICENSE).
+(`GPL-3.0-or-later`). See the `LICENSE` file in the repository.

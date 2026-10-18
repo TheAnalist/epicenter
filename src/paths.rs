@@ -1,4 +1,4 @@
-//! Where things live on this machine.
+//! Where things live: `$HOME`, `$CARGO_HOME`, and the shared cache root.
 //!
 //! Everything epicenter touches derives from two roots:
 //! - Cargo's home (`$CARGO_HOME` or `~/.cargo`): global `config.toml`,

@@ -1,4 +1,4 @@
-//! `epicenter` — one central build cache for every Rust project on this machine.
+//! `epicenter` — the state layer for Cargo builds (CLI entry point).
 //!
 //! CLI entry point: argument definitions and dispatch into the library
 //! modules (`config`, `doctor`, `evict`, `exec`, `prune`, `status`, `vault`,
