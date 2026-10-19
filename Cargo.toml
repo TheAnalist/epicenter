@@ -9,6 +9,7 @@ readme = "README.md"
 keywords = ["cargo", "build-cache", "compilation", "vault", "cli"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
 exclude = ["src/benchmark.rs"]
+repository = "https://github.com/TheAnalist/epicenter"
 
 [[bin]]
 name = "epicenter"
