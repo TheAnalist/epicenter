@@ -60,15 +60,15 @@ so epicenter can compile it once and the other projects reuse it.
 In addition it measures the vault tier (`epicenter harvest` + `epicenter exec`),
 where a cold per-job build dir is seeded from the durable store instead of recompiling.
 
-![Cumulative build time](./chart-cumulative.svg)
+![Cumulative build time](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-cumulative.svg)
 
-![Disk usage](./chart-disk.svg)
+![Disk usage](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-disk.svg)
 
-![Epicenter shared projects save](./chart-variants.svg)
+![Epicenter shared projects save](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-variants.svg)
 
-![Build time per project](./chart-per-project.svg)
+![Build time per project](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-per-project.svg)
 
-![Cold start in a per-job work dir](./chart-vault.svg)
+![Cold start in a per-job work dir](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-vault.svg)
 
 ## Quickstart
 
