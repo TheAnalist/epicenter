@@ -41,8 +41,11 @@ spawned**.
 
 These benchmarks are done against 5 projects with 37 identical dependencies each.
 
-All five projects declare the same platform stack. This is the monorepo / "one platform crate" case. 
-Every non-local Cargo unit is byte-for-byte identical across projects, 
+**Five cold builds: 71.3 s → 15.3 s (4.7× faster). Disk: 3.65 GiB → 0.91 GiB
+(−75%). A cold per-job `work/` dir seeded from the vault: 0.33 s.**
+
+All five projects declare the same platform stack. This is the monorepo / "one platform crate" case.
+Every non-local Cargo unit is byte-for-byte identical across projects,
 so epicenter can compile it once and the other projects reuse it.
 
 ### What is measured
@@ -54,16 +57,16 @@ so epicenter can compile it once and the other projects reuse it.
 | measurement | wall clock around `cargo build --locked --offline` | same |
 | reset before every run | `rm -rf` every `target/` | `rm -rf` every `target/` + the whole `epicenter/` cache |
 
-In addition it measures the vault tier (`epicenter harvest` + `epicenter exec`), 
+In addition it measures the vault tier (`epicenter harvest` + `epicenter exec`),
 where a cold per-job build dir is seeded from the durable store instead of recompiling.
- 
-![chart comulative](./chart-cumulative.svg)
 
-![cart disk](./chart-disk.svg)
+![Cumulative build time](./chart-cumulative.svg)
 
-![chart per project](./chart-per-project.svg) 
+![Disk usage](./chart-disk.svg)
 
-![chart vault](./chart-vault.svg)
+![Build time per project](./chart-per-project.svg)
+
+![Cold start in a per-job work dir](./chart-vault.svg)
 
 ## Quickstart
 
