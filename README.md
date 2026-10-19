@@ -64,6 +64,8 @@ where a cold per-job build dir is seeded from the durable store instead of recom
 
 ![Disk usage](./chart-disk.svg)
 
+![Epicenter shared projects save](./chart-variants.svg)
+
 ![Build time per project](./chart-per-project.svg)
 
 ![Cold start in a per-job work dir](./chart-vault.svg)
