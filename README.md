@@ -37,6 +37,34 @@ which decides freshness and therefore recompilation. A unit restored from the
 vault is `Fresh` to Cargo in milliseconds, with **zero `rustc` processes
 spawned**.
 
+## Benchmarks
+
+These benchmarks are done against 5 projects with 37 identical dependencies each.
+
+All five projects declare the same platform stack. This is the monorepo / "one platform crate" case. 
+Every non-local Cargo unit is byte-for-byte identical across projects, 
+so epicenter can compile it once and the other projects reuse it.
+
+### What is measured
+
+| | baseline | epicenter |
+|---|---|---|
+| config | no `build-dir` key | `epicenter setup` → `[build] build-dir = '{cargo-cache-home}/epicenter/build'` |
+| where dependencies compile | `<project>/target/` (one copy each) | one shared build dir |
+| measurement | wall clock around `cargo build --locked --offline` | same |
+| reset before every run | `rm -rf` every `target/` | `rm -rf` every `target/` + the whole `epicenter/` cache |
+
+In addition it measures the vault tier (`epicenter harvest` + `epicenter exec`), 
+where a cold per-job build dir is seeded from the durable store instead of recompiling.
+ 
+![chart comulative](./chart-cumulative.svg)
+
+![cart disk](./chart-disk.svg)
+
+![chart per project](./chart-per-project.svg) 
+
+![chart vault](./chart-vault.svg)
+
 ## Quickstart
 
 ```bash
