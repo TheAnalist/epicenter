@@ -147,7 +147,8 @@ pub struct Options<'a> {
     pub cwd: Option<PathBuf>,
     /// Store the units the job produced back into the vault.
     pub harvest_back: bool,
-    /// Remove the work dir after a successful run.
+    /// Remove the work dir after the run — success or failure. Without it
+    /// the dir is kept for inspection.
     pub remove_on_success: bool,
     /// Continue in an existing job dir instead of refusing (restore is
     /// idempotent; a dir a live build holds is still refused).
@@ -284,7 +285,14 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     } else {
         None
     };
-    let removed = opts.remove_on_success && code == 0 && std::fs::remove_dir_all(&work_dir).is_ok();
+    let mut removed = false;
+    let mut remove_error = None;
+    if opts.remove_on_success {
+        match force_remove_dir(&work_dir) {
+            Ok(()) => removed = true,
+            Err(err) => remove_error = Some(err),
+        }
+    }
 
     eprintln!("{}", util::dim("  ── end ──"));
     let mark = if code == 0 {
@@ -311,18 +319,45 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     }
     if removed {
         eprintln!(
-            "  {} {} (--rm, successful run)",
+            "  {} {} (--rm)",
             util::dim(&format!("{:<11}", "work dir")),
             util::dim("removed")
         );
-    } else {
+    } else if let Some(err) = &remove_error {
         eprintln!(
-            "  {} {}",
+            "  {} {} — could not remove it: {err}",
             util::dim(&format!("{:<11}", "work dir")),
             work_dir.display()
         );
+    } else {
+        eprintln!(
+            "  {} {} {}",
+            util::dim(&format!("{:<11}", "work dir")),
+            work_dir.display(),
+            util::dim("(kept — pass --rm to remove)")
+        );
     }
     Ok(code)
+}
+
+/// Remove a job dir robustly: read-only files (a wrapper's store, copied
+/// state) block `remove_dir_all` on Windows, so clear the flag and retry
+/// once; report the original error if the retry fails too.
+fn force_remove_dir(path: &Path) -> std::io::Result<()> {
+    let first = match std::fs::remove_dir_all(path) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    for entry in WalkDir::new(path) {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(entry.path(), perms);
+        }
+    }
+    std::fs::remove_dir_all(path).map_err(|_| first)
 }
 
 /// Signals use the shell convention: 128 + signal number.
@@ -469,7 +504,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exec_removes_only_successful_jobs() -> Result<()> {
+    fn exec_rm_removes_the_job_dir_either_way() -> Result<()> {
         let (_build, store) = seeded_store()?;
         let work = tempfile::tempdir()?;
 
@@ -486,6 +521,8 @@ mod tests {
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
         assert!(!work.path().join("j-ok").exists(), "success -> removed");
 
+        // `--rm` is explicit: a failing build is removed too (the fixed
+        // rmeta-era failure mode used to leave dirs piling up here).
         let bad: Vec<String> = vec!["false".into()];
         let opts = Options {
             job_id: Some("j-bad"),
@@ -497,7 +534,27 @@ mod tests {
             command: &bad,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 1);
-        assert!(work.path().join("j-bad").exists(), "failure -> kept");
+        assert!(
+            !work.path().join("j-bad").exists(),
+            "--rm -> removed on failure too"
+        );
+
+        // Without --rm the dir stays for inspection.
+        let kept: Vec<String> = vec!["true".into()];
+        let opts = Options {
+            job_id: Some("j-keep"),
+            cwd: None,
+            harvest_back: false,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            command: &kept,
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+        assert!(
+            work.path().join("j-keep").exists(),
+            "no --rm -> kept for inspection"
+        );
         Ok(())
     }
 

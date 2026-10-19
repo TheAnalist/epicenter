@@ -175,7 +175,7 @@ enum Command {
         /// paths resolve against the working directory).
         #[arg(long, num_args = 0..=1, default_missing_value = "job", value_name = "DIR")]
         target_dir: Option<String>,
-        /// Remove the work dir after a successful run (kept on failure).
+        /// Remove the work dir after the run — success or failure (default: keep it for inspection).
         #[arg(long)]
         rm: bool,
         /// The command to run — everything after the first non-option argument.

@@ -83,7 +83,7 @@ epicenter doctor                 # verify everything is healthy
 | `epicenter doctor` | health check with plain-language verdicts: config, wrapper, filesystem, toolchain, mtime ordering |
 | `epicenter vault` | show the vault: generations (toolchain + flags), sizes, links into the build view |
 | `epicenter harvest [--unit <q>] [--dry-run]` | store built unit groups from the shared build dir into the vault |
-| `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | seed a working dir from the vault (default: the shared build dir) — artifacts hard-linked, fingerprint state copied |
+| `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | seed a working dir from the vault (default: the shared build dir) — `deps/` rlibs and `.so` hard-linked; `.rmeta` + fingerprint state copied |
 | `epicenter verify` | audit the vault: file sizes, canonical stamps, hash contents, dependency ordering — and name the job dirs under `work/` |
 | `epicenter exec [--harvest] [--rm] [--reuse] [--target-dir [DIR]] [--id <id>] [--cwd <dir>] -- <cmd>` | run a command in a fresh per-job build dir seeded from the vault (CI/agents) |
 
@@ -184,13 +184,14 @@ cargo build                    # Cargo sees fresh fingerprints: zero recompiles
 
 Measured under WSL on ext4: wiping one unit and restoring it takes milliseconds,
 after which `cargo build -v` reports `Fresh … in 0.01s` with **zero rustc
-processes**. Restore hard-links `deps/` artifacts — a thousand jobs share one
-copy of every rlib — and copies the fingerprint state and build-script trees,
-because Cargo rewrites those in place (a shared inode would either hit the
-read-only store file or corrupt the store). Files carry one canonical
-timestamp per unit group; hard links share the store's stamp, private copies
-are stamped after copying. Everything is fail-open: a partial vault just means
-Cargo recompiles what is missing, never a broken build.
+processes**. Restore hard-links `deps/` link outputs — a thousand jobs share
+one copy of every rlib — and copies `.rmeta` plus the fingerprint state and
+build-script trees, because rustc and cargo rewrite those in place (a shared
+inode would either break a rebuild or corrupt the store). Each unit group
+carries one canonical timestamp: the moment its `.rmeta` landed, so nothing
+is ever older than what it compiled against — `epicenter verify` audits that
+order. Everything is fail-open: a partial vault just means Cargo recompiles
+what is missing, never a broken build.
 
 Generations are keyed by `<rustc-release>-<commit>-<host>-<flag-digest>`: a
 toolchain upgrade opens a new generation instead of invalidating one, and
@@ -205,7 +206,7 @@ command in it — no shim, no daemon, no config change:
 ```bash
 epicenter exec -- cargo test                    # warm start, nothing kept
 epicenter exec --harvest -- cargo build         # …and store the units this job produced
-epicenter exec --rm --id nightly -- cargo test  # delete the job dir on success
+epicenter exec --rm --id nightly -- cargo test  # delete the job dir after the run
 ```
 
 For long-lived agents, a job dir is a home:

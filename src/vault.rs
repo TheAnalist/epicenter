@@ -22,9 +22,11 @@
 //!
 //! Timestamps are the only lever besides the hash in Cargo's freshness
 //! check, so every file of a unit group carries ONE canonical second
-//! (`stamp`), chosen at harvest as the ceiling of the group's newest file.
-//! Restore never stamps: hard-linked files share the store's inode, and a
-//! `touch` on a restored file would rewrite the store itself.
+//! (`stamp`): the ceiling of the group's metadata output (`.rmeta`) when it
+//! has one — the moment dependents can compile against it — else of its
+//! newest file, and always ≥ every dependency's stamp (harvest clamps the
+//! store). Restore never stamps hard links: they share the store's inode,
+//! and a `touch` on a restored file would rewrite the store itself.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -436,6 +438,16 @@ pub fn harvest(
         units: Vec::new(),
     });
 
+    // ── pass 1: collect the groups to store and their base stamps ──────────
+    struct GroupPlan {
+        unit: Unit,
+        files: Vec<(PathBuf, String, String, String)>,
+        memo: String,
+        hash: String,
+        base: u64,
+    }
+    let mut plans: Vec<GroupPlan> = Vec::new();
+
     for (unit, arts) in &rows {
         if let Some(query) = unit_filter {
             if !unit_name_matches(&unit.dir_name, query) {
@@ -524,8 +536,89 @@ pub fn harvest(
             continue;
         }
 
-        let stamp = group_stamp(&files)?;
-        let hash = unit.memo_hash.clone().unwrap_or_default();
+        plans.push(GroupPlan {
+            base: group_stamp(&files)?,
+            memo,
+            hash: unit.memo_hash.clone().unwrap_or_default(),
+            files,
+            unit: unit.clone(),
+        });
+    }
+
+    // ── pass 2: enforce `T(unit) ≥ every dependency's T` (§11) ─────────────
+    //
+    // Base stamps restore the natural order inside one build view; a store
+    // fed from several views can still invert edges (a dependency harvested
+    // later than its dependent — e.g. a fragmented multi-project cache).
+    // Resolve the edges (a dependency's memo hash → the unit that owns it)
+    // and raise dependents until nothing is older than what it consumed.
+    // `verify`'s ordering audit stays the guard for anything left over.
+    let stored_stamps: std::collections::HashMap<String, u64> = manifest
+        .units
+        .iter()
+        .map(|entry| (entry.hash.clone(), entry.stamp))
+        .collect();
+    let index: std::collections::HashMap<&str, usize> = plans
+        .iter()
+        .enumerate()
+        .map(|(position, plan)| (plan.hash.as_str(), position))
+        .collect();
+    let mut plan_deps: Vec<Vec<usize>> = Vec::with_capacity(plans.len());
+    let mut stamps: Vec<u64> = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        let mut deps = Vec::new();
+        let mut stamp = plan.base;
+        for dep in plan
+            .unit
+            .json
+            .as_ref()
+            .map(|json| json.deps.as_slice())
+            .unwrap_or(&[])
+        {
+            let Some(hash) = dep.memo_hash() else { continue };
+            if let Some(&at) = index.get(hash.as_str()) {
+                deps.push(at);
+            } else if let Some(known) = stored_stamps.get(hash.as_str()) {
+                stamp = stamp.max(*known);
+            }
+        }
+        plan_deps.push(deps);
+        stamps.push(stamp);
+    }
+    // Dependencies before dependents; a cycle (never observed) keeps its base
+    // order and the ordering audit reports whatever is left.
+    let mut order: Vec<usize> = Vec::with_capacity(plans.len());
+    let mut settled = vec![false; plans.len()];
+    loop {
+        let mut progressed = false;
+        for at in 0..plans.len() {
+            if settled[at] || !plan_deps[at].iter().all(|&dep| settled[dep]) {
+                continue;
+            }
+            settled[at] = true;
+            order.push(at);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    for at in 0..plans.len() {
+        if !settled[at] {
+            order.push(at);
+        }
+    }
+    for &at in &order {
+        for dep in &plan_deps[at] {
+            stamps[at] = stamps[at].max(stamps[*dep]);
+        }
+    }
+
+    // ── pass 3: store (or refresh) one group at a time ─────────────────────
+    for (at, plan) in plans.iter().enumerate() {
+        let unit = &plan.unit;
+        let files = &plan.files;
+        let stamp = stamps[at];
         let group_dir = units_dir(store_root, &parity).join(&unit.dir_name);
 
         // Unchanged = same hash, profile and stamp, same (path, role) file
@@ -546,7 +639,7 @@ pub fn harvest(
                     .map(|file| (file.path.as_str(), file.role.as_str()))
                     .collect();
                 stored.sort_unstable();
-                entry.hash == hash
+                entry.hash == plan.hash
                     && entry.profile == unit.profile
                     && entry.stamp == stamp
                     && stored == new_entries
@@ -574,14 +667,14 @@ pub fn harvest(
         }
 
         let mut entries = Vec::with_capacity(files.len());
-        store_group(store_root, &parity, &unit.dir_name, stamp, &files, &mut entries)
+        store_group(store_root, &parity, &unit.dir_name, stamp, files, &mut entries)
             .with_context(|| format!("storing unit {}", unit.dir_name))?;
 
         let entry = UnitEntry {
             name: unit.dir_name.clone(),
             profile: unit.profile.clone(),
-            memo,
-            hash,
+            memo: plan.memo.clone(),
+            hash: plan.hash.clone(),
             stamp,
             files: entries,
         };
@@ -667,15 +760,24 @@ fn store_group(
 /// look newer than its own group.
 fn group_stamp(files: &[(PathBuf, String, String, String)]) -> Result<u64> {
     let mut newest: Option<SystemTime> = None;
-    for (src, _, _, _) in files {
+    let mut metadata: Option<SystemTime> = None;
+    for (src, path, _, _) in files {
         let modified = fs::metadata(src)
             .and_then(|meta| meta.modified())
             .with_context(|| format!("reading mtime of {}", src.display()))?;
         if newest.map_or(true, |current| modified > current) {
             newest = Some(modified);
         }
+        if path.ends_with(".rmeta") && metadata.map_or(true, |current| modified > current) {
+            metadata = Some(modified);
+        }
     }
-    Ok(match newest {
+    // The metadata output, when present, is the moment dependents can compile
+    // against this unit: rustc writes `.rmeta` first and `.rlib` last, and a
+    // dependent routinely finishes before its dependency's `.rlib` exists.
+    // Stamping with the `.rlib` would make the group look newer than its own
+    // dependents and force spurious rebuilds after a restore.
+    Ok(match metadata.or(newest) {
         Some(time) => ceil_secs(time),
         None => now_secs(),
     })
@@ -777,14 +879,14 @@ pub struct RestoreReport {
 
 /// Link matching unit groups from the vault into a working dir.
 ///
-/// `deps/` artifacts are hard-linked — rustc only ever replaces them
-/// atomically. Fingerprint state and build-script trees become private
-/// writable copies, because cargo and build scripts write those *in place*:
-/// a shared inode would either hit the read-only store file (EACCES) or
-/// mutate the store. Hard links share the store's canonical stamp;
-/// private copies are stamped after copying. Never overwrites a file that
-/// already exists, never touches sources, and a partial vault is fine:
-/// Cargo recompiles whatever is missing.
+/// `deps/` link outputs (`.rlib`, proc-macro `.so`) are hard-linked — rustc
+/// only ever replaces those atomically. Fingerprint state, build-script
+/// trees and `deps/*.rmeta` become private writable copies: rustc writes
+/// `.rmeta` in place, so a read-only link turns any rebuild of that unit
+/// into `output file … .rmeta is not writeable`. Hard links share the
+/// store's canonical stamp; private copies are stamped after copying. Never
+/// overwrites a file that already exists, never touches sources, and a
+/// partial vault is fine: Cargo recompiles whatever is missing.
 pub fn restore(
     view_root: &Path,
     store_root: &Path,
@@ -831,10 +933,11 @@ pub fn restore(
                 report.files_existing += 1;
                 continue;
             }
-            // Only `deps/` artifacts may share the store inode (rustc
-            // replaces them atomically). Everything else is written in
-            // place by cargo or by build scripts: private copies only.
-            let shared = file.path.starts_with("deps/");
+            // Only `deps/` link outputs (`.rlib`, `.so`) may share the
+            // store inode — rustc replaces those atomically. `.rmeta` and
+            // everything else are written in place by rustc, cargo or build
+            // scripts: private copies only.
+            let shared = file.path.starts_with("deps/") && !file.path.ends_with(".rmeta");
             if dry_run {
                 unit_touched = true;
                 if shared {
@@ -1157,6 +1260,10 @@ mod tests {
             [7u8; 64],
         )?;
         fs::write(
+            root.join("debug/deps/libserde-102a33f055a8d229.rmeta"),
+            [6u8; 48],
+        )?;
+        fs::write(
             root.join("debug/deps/serde-102a33f055a8d229.d"),
             b"side file",
         )?;
@@ -1311,7 +1418,7 @@ mod tests {
         fs::write(
             build
                 .path()
-                .join("debug/deps/libserde-102a33f055a8d229.rmeta"),
+                .join("debug/deps/libserde-102a33f055a8d229.so"),
             [1u8; 16],
         )?;
         let report = harvest(build.path(), store.path(), Some("102a33f0"), false)?;
@@ -1325,7 +1432,7 @@ mod tests {
             .map(|file| file.path.as_str())
             .collect();
         assert!(
-            paths.contains(&"deps/libserde-102a33f055a8d229.rmeta"),
+            paths.contains(&"deps/libserde-102a33f055a8d229.so"),
             "{paths:?}"
         );
         Ok(())
@@ -1606,7 +1713,10 @@ mod tests {
         let artifact = view
             .path()
             .join("debug/deps/libserde-102a33f055a8d229.rlib");
-        assert!(state.is_file() && artifact.is_file());
+        let metadata = view
+            .path()
+            .join("debug/deps/libserde-102a33f055a8d229.rmeta");
+        assert!(state.is_file() && artifact.is_file() && metadata.is_file());
 
         let parity = parity_key()?;
         let manifest = load_manifest(store.path(), &parity)?.expect("manifest");
@@ -1630,6 +1740,11 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             assert!(fs::metadata(&artifact)?.nlink() >= 2, "artifact shares the store inode");
             assert_eq!(fs::metadata(&state)?.nlink(), 1, "state is a private copy");
+            assert_eq!(
+                fs::metadata(&metadata)?.nlink(),
+                1,
+                ".rmeta is a private copy (rustc opens it for write)"
+            );
         }
         Ok(())
     }
@@ -1668,12 +1783,85 @@ mod tests {
     }
 
     #[test]
-    fn verify_flags_units_older_than_a_dependency() -> Result<()> {
+    fn harvest_clamps_a_dependent_to_its_dependency() -> Result<()> {
         let build = tempfile::tempdir()?;
         let store = tempfile::tempdir()?;
         let now = now_secs();
+        // The view itself is inverted (a fragmented cache: the dependency was
+        // rebuilt after its dependent) — harvest must clamp the dependent up.
         synthetic_edge_dir(build.path(), now, now - 3600)?;
         harvest(build.path(), store.path(), None, false)?;
+
+        let manifest = load_manifest(store.path(), &parity_key()?)?.expect("manifest");
+        let dependent = manifest
+            .units
+            .iter()
+            .find(|entry| entry.name == "serde-746d173581f1a314")
+            .expect("dependent stored");
+        let dependency = manifest
+            .units
+            .iter()
+            .find(|entry| entry.name == "serde_core-b468be6fa8c1f936")
+            .expect("dependency stored");
+        assert!(
+            dependent.stamp >= dependency.stamp,
+            "clamped: {} >= {}",
+            dependent.stamp,
+            dependency.stamp
+        );
+
+        let reports = verify(store.path())?;
+        assert!(reports[0].is_clean(), "{:?}", reports[0].problems);
+        assert!(reports[0].ordering.is_empty(), "{:?}", reports[0].ordering);
+        Ok(())
+    }
+
+    #[test]
+    fn harvest_stamps_groups_by_the_metadata_output() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        let now = now_secs();
+        // Rustc writes `.rmeta` first and `.rlib` last: the consumable
+        // moment — and therefore the stamp — is the metadata.
+        set_stamp(
+            &build.path().join("debug/deps/libserde-102a33f055a8d229.rmeta"),
+            now - 30,
+        )?;
+        set_stamp(
+            &build.path().join("debug/deps/libserde-102a33f055a8d229.rlib"),
+            now,
+        )?;
+        harvest(build.path(), store.path(), Some("102a33f0"), false)?;
+
+        let manifest = load_manifest(store.path(), &parity_key()?)?.expect("manifest");
+        assert_eq!(manifest.units[0].stamp, now - 30);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_flags_an_inverted_store_stamp() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let now = now_secs();
+        synthetic_edge_dir(build.path(), now - 3600, now)?;
+        harvest(build.path(), store.path(), None, false)?;
+
+        // Simulate a store written before the clamp existed: re-stamp the
+        // dependent (files and manifest) older than its dependency.
+        let parity = parity_key()?;
+        let mut manifest = load_manifest(store.path(), &parity)?.expect("manifest");
+        let units = units_dir(store.path(), &parity);
+        let entry = manifest
+            .units
+            .iter_mut()
+            .find(|entry| entry.name == "serde-746d173581f1a314")
+            .expect("dependent stored");
+        entry.stamp = now - 7200;
+        for file in &entry.files {
+            set_stamp(&units.join(&entry.name).join(&file.path), now - 7200)?;
+        }
+        save_manifest(store.path(), &parity, &manifest)?;
 
         let reports = verify(store.path())?;
         assert!(reports[0].is_clean(), "{:?}", reports[0].problems);
