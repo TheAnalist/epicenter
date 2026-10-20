@@ -288,7 +288,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let mut removed = false;
     let mut remove_error = None;
     if opts.remove_on_success {
-        match force_remove_dir(&work_dir) {
+        match util::force_remove_dir(&work_dir) {
             Ok(()) => removed = true,
             Err(err) => remove_error = Some(err),
         }
@@ -338,26 +338,6 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         );
     }
     Ok(code)
-}
-
-/// Remove a job dir robustly: read-only files (a wrapper's store, copied
-/// state) block `remove_dir_all` on Windows, so clear the flag and retry
-/// once; report the original error if the retry fails too.
-fn force_remove_dir(path: &Path) -> std::io::Result<()> {
-    let first = match std::fs::remove_dir_all(path) {
-        Ok(()) => return Ok(()),
-        Err(err) => err,
-    };
-    for entry in WalkDir::new(path) {
-        let Ok(entry) = entry else { continue };
-        let Ok(meta) = entry.metadata() else { continue };
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(entry.path(), perms);
-        }
-    }
-    std::fs::remove_dir_all(path).map_err(|_| first)
 }
 
 /// Signals use the shell convention: 128 + signal number.

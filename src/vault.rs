@@ -399,6 +399,12 @@ pub fn harvest(
         ..Default::default()
     };
 
+    // Self-heal debris from a crashed or failed store run (dot-dirs whose
+    // copies may have inherited read-only sources) before planning.
+    if !dry_run {
+        sweep_staging(&units_dir(store_root, &parity));
+    }
+
     let rows: Vec<(Unit, ArtifactInfo)> = fingerprint::read_units(build_root)?
         .into_iter()
         .map(|unit| {
@@ -721,26 +727,15 @@ fn store_group(
     let final_dir = units.join(name);
     let tmp = units.join(format!(".{name}.tmp-{}", std::process::id()));
     if tmp.is_dir() {
-        fs::remove_dir_all(&tmp)?;
+        crate::util::force_remove_dir(&tmp)?;
     }
     fs::create_dir_all(&tmp)?;
 
-    for (src, path, dest, role) in files {
-        let dst = tmp.join(path);
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(src, &dst)
-            .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
-        set_stamp(&dst, stamp)?;
-        make_read_only(&dst)?;
-        let size = fs::metadata(&dst).map(|meta| meta.len()).unwrap_or(0);
-        entries.push(FileEntry {
-            path: path.clone(),
-            dest: dest.clone(),
-            size,
-            role: role.clone(),
-        });
+    if let Err(err) = stage_group(&tmp, files, stamp, entries) {
+        // Never leave a half-written staging dir behind: it would keep a
+        // failed unit's bytes on disk and hide the failure from the next run.
+        let _ = crate::util::force_remove_dir(&tmp);
+        return Err(err);
     }
 
     let old = units.join(format!(".{name}.old-{}", std::process::id()));
@@ -752,6 +747,67 @@ fn store_group(
         let _ = fs::remove_dir_all(&old);
     }
     Ok(())
+}
+
+/// Copy one unit group's files into its staging dir. Every file is made
+/// writable before it is stamped and read-only again (on Unix) once the group
+/// is in place.
+///
+/// `fs::copy` carries the source's attributes along. A read-only source — a
+/// wrapper's hard-linked store file, a file restored from a backup — makes
+/// `File::set_modified` fail with "access denied" on Windows even though the
+/// copy lives in our own staging dir.
+fn stage_group(
+    tmp: &Path,
+    files: &[(PathBuf, String, String, String)],
+    stamp: u64,
+    entries: &mut Vec<FileEntry>,
+) -> Result<()> {
+    for (src, path, dest, role) in files {
+        let dst = tmp.join(path);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, &dst)
+            .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
+        make_writable(&dst).with_context(|| format!("making {} writable", dst.display()))?;
+        set_stamp(&dst, stamp)?;
+        make_read_only(&dst)?;
+        let size = fs::metadata(&dst).map(|meta| meta.len()).unwrap_or(0);
+        entries.push(FileEntry {
+            path: path.clone(),
+            dest: dest.clone(),
+            size,
+            role: role.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Remove staging leftovers (`.{unit}.tmp-{pid}`, `.{unit}.old-{pid}`) that a
+/// crashed or failed run left in the units dir. Fresh dirs are left alone: a
+/// concurrent harvest may be filling them right now.
+fn sweep_staging(units: &Path) {
+    let Ok(entries) = fs::read_dir(units) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.contains(".tmp-") || name.contains(".old-")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > Duration::from_secs(600));
+        if stale {
+            let _ = crate::util::force_remove_dir(&entry.path());
+        }
+    }
 }
 
 /// The canonical stamp of a group: the ceiling (whole seconds) of its
@@ -1836,6 +1892,98 @@ mod tests {
 
         let manifest = load_manifest(store.path(), &parity_key()?)?.expect("manifest");
         assert_eq!(manifest.units[0].stamp, now - 30);
+        Ok(())
+    }
+
+    #[test]
+    fn harvest_stores_read_only_sources() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        // Wrappers (kache) and backup tools leave read-only files in the build
+        // dir; `fs::copy` carries that attribute along, and stamping the copy
+        // must not depend on the source's permissions (Windows: access denied).
+        let source = build
+            .path()
+            .join("debug/.fingerprint/serde-102a33f055a8d229/dep-lib-serde");
+        let mut perms = fs::metadata(&source)?.permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&source, perms)?;
+
+        let report = harvest(build.path(), store.path(), Some("102a33f0"), false)?;
+        assert_eq!(report.stored, 1);
+
+        let parity = parity_key()?;
+        let manifest = load_manifest(store.path(), &parity)?.expect("manifest");
+        let stored = units_dir(store.path(), &parity)
+            .join(&manifest.units[0].name)
+            .join("dep-lib-serde");
+        assert!(stored.is_file(), "the state file is stored");
+        assert_eq!(
+            ceil_secs(fs::metadata(&stored)?.modified()?),
+            manifest.units[0].stamp,
+            "the stored copy carries the canonical stamp"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_store_drops_its_staging_dir() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        if fs::metadata(build.path())?.uid() == 0 {
+            return Ok(()); // root reads a 000 file anyway — nothing to inject
+        }
+        let artifact = build
+            .path()
+            .join("debug/deps/libserde-102a33f055a8d229.rlib");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&artifact, fs::Permissions::from_mode(0o000))?;
+        }
+
+        let result = harvest(build.path(), store.path(), Some("102a33f0"), false);
+        assert!(result.is_err(), "an unreadable artifact aborts the store");
+
+        let units = units_dir(store.path(), &parity_key()?);
+        if units.is_dir() {
+            for entry in fs::read_dir(&units)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                assert!(!name.contains(".tmp-"), "staging leftover: {name}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harvest_sweeps_stale_staging_dirs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        let units = units_dir(store.path(), &parity_key()?);
+
+        // A crashed store run from yesterday: dot-dir, read-only leftovers.
+        let stale = units.join(".serde-102a33f055a8d229.tmp-99999");
+        fs::create_dir_all(&stale)?;
+        let leftover = stale.join("dep-lib-serde");
+        fs::write(&leftover, b"x")?;
+        fs::set_permissions(&leftover, fs::Permissions::from_mode(0o444))?;
+        set_stamp(&stale, now_secs() - 7200)?;
+
+        // A concurrent harvest's staging dir must survive the sweep.
+        let fresh = units.join(".serde-102a33f055a8d229.tmp-11111");
+        fs::create_dir_all(&fresh)?;
+
+        harvest(build.path(), store.path(), Some("102a33f0"), false)?;
+        assert!(!stale.exists(), "stale staging dir swept");
+        assert!(fresh.exists(), "fresh staging dir left alone");
         Ok(())
     }
 

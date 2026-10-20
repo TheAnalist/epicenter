@@ -1,11 +1,12 @@
 //! Small formatting/parsing helpers shared by the other modules.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
+use walkdir::WalkDir;
 
 // ── terminal colors ─────────────────────────────────────────────────────────
 //
@@ -214,6 +215,26 @@ pub fn which_path(program: &str) -> Option<PathBuf> {
 /// Is `program` installed at all (PATH or cargo bin dir)?
 pub fn which(program: &str) -> bool {
     which_path(program).is_some()
+}
+
+/// Remove a tree robustly: read-only files (a wrapper's store, copies that
+/// inherited the read-only attribute) block `remove_dir_all` on Windows, so
+/// clear the flag and retry once; report the original error if it still fails.
+pub fn force_remove_dir(path: &Path) -> std::io::Result<()> {
+    let first = match std::fs::remove_dir_all(path) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    for entry in WalkDir::new(path) {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(entry.path(), perms);
+        }
+    }
+    std::fs::remove_dir_all(path).map_err(|_| first)
 }
 
 #[cfg(test)]
