@@ -3,7 +3,6 @@
 //! checks are grouped into sections for printing.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -61,7 +60,7 @@ pub fn run() -> Result<Vec<Check>> {
 
     // Everything hangs on resolving the cache dir; if it fails, say so in
     // check language instead of crashing the whole report.
-    let root = match crate::config::cache_root() {
+    let root = match crate::config::trusted_cache_root() {
         Ok(root) => root,
         Err(e) => {
             return Ok(vec![check(
@@ -92,6 +91,7 @@ pub fn run() -> Result<Vec<Check>> {
 
     // Template cleanliness + drift (global build-dir vs cargo's answer).
     checks.push(check_build_dir(&root));
+    checks.push(check_cache_permissions(&root));
 
     // Ancestor configs shadowing keys per-key.
     checks.extend(check_ancestor_configs());
@@ -237,6 +237,56 @@ fn check_build_dir(root: &Path) -> Check {
     }
 }
 
+/// Cache root ownership/mode: a shared, foreign-owned, or group/world-
+/// writable cache is a poisoning/secret-leak vector.
+fn check_cache_permissions(root: &Path) -> Check {
+    let section: &'static str = SEC_CACHE;
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return check(
+                section,
+                Level::Fail,
+                format!("could not inspect cache root: {err}"),
+            );
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return check(
+            section,
+            Level::Fail,
+            "cache root is a symlink or not a directory",
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !crate::util::owned_by_us(&meta) {
+            return check(
+                section,
+                Level::Fail,
+                format!(
+                    "cache root owned by uid {} (not uid {}) — never share a mutable vault between users",
+                    meta.uid(),
+                    crate::util::euid()
+                ),
+            );
+        }
+        if meta.mode() & 0o077 != 0 {
+            return check(
+                section,
+                Level::Fail,
+                format!(
+                    "cache root mode {:o} is accessible by other users — run `chmod 700 {}`",
+                    meta.mode() & 0o777,
+                    root.display()
+                ),
+            );
+        }
+    }
+    check(section, Level::Pass, "cache root is private (owner-only)")
+}
+
 /// Ancestor scan: from the CWD upward, any `.cargo/config.toml` that sets a
 /// key DIFFERENTLY from the global one wins silently (deep config wins
 /// per-key) — how a Windows literal once bricked WSL builds.
@@ -263,10 +313,10 @@ fn check_ancestor_configs() -> Vec<Check> {
                 if home_value.as_deref() != Some(ancestor.as_str()) {
                     out.push(check(
                         section,
-                        Level::Warn,
+                        Level::Fail,
                         format!(
                             "{} sets {key} = '{ancestor}' differently from the global config \
-                             (deep config wins per-key) — the shadowing poison vector",
+                             (deep config wins per-key) — epicenter refuses project-controlled state",
                             candidate.display()
                         ),
                     ));
@@ -439,7 +489,9 @@ fn strip_volume_prefix(canonical: &str) -> Option<String> {
 /// rustc version + the upgrade-prune hint.
 fn check_rustc() -> Check {
     let section: &'static str = SEC_TC;
-    match Command::new("rustc").arg("--version").output() {
+    let output = crate::util::command_for("rustc")
+        .and_then(|mut command| Ok(command.arg("--version").output()?));
+    match output {
         Ok(out) if out.status.success() => {
             let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
             check(
@@ -557,7 +609,9 @@ fn check_mtime_ordering(rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
         return vec![check(
             SEC_MTIME,
             Level::Pass,
-            format!("every unit is at least as new as its dependencies ({checked} edge(s) checked)"),
+            format!(
+                "every unit is at least as new as its dependencies ({checked} edge(s) checked)"
+            ),
         )];
     }
 
@@ -646,9 +700,9 @@ fn toolchain_mtime() -> Option<SystemTime> {
 }
 
 fn toolchain_is_nightly() -> bool {
-    Command::new("rustc")
-        .arg("--version")
-        .output()
+    crate::util::command_for("rustc")
+        .and_then(|mut command| Ok(command.arg("--version").output()?))
+        .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).contains("nightly"))
         .unwrap_or(false)
 }
@@ -677,20 +731,35 @@ mod tests {
         // "active"; the other must surface as a reclaim warning.
         let root = tempfile::tempdir()?;
         let make_unit = |pkg: &str, hex: &str, rustc: &str, artifact: &str| -> Result<()> {
-            let dir = root.path().join("debug/.fingerprint").join(format!("{pkg}-{hex}"));
+            let dir = root
+                .path()
+                .join("debug/.fingerprint")
+                .join(format!("{pkg}-{hex}"));
             fs::create_dir_all(&dir)?;
             fs::write(dir.join(format!("lib-{pkg}")), "0011223344556677")?;
             fs::write(
                 dir.join(format!("lib-{pkg}.json")),
-                format!(r#"{{"rustc":{rustc},"features":"[]","declared_features":"[]","deps":[]}}"#),
+                format!(
+                    r#"{{"rustc":{rustc},"features":"[]","declared_features":"[]","deps":[]}}"#
+                ),
             )?;
             fs::create_dir_all(root.path().join("debug/deps"))?;
             fs::write(root.path().join("debug/deps").join(artifact), [0u8; 8])?;
             Ok(())
         };
-        make_unit("oldcrate", "aaaaaaaaaaaaaaaa", "111", "liboldcrate-aaaaaaaaaaaaaaaa.rlib")?;
+        make_unit(
+            "oldcrate",
+            "aaaaaaaaaaaaaaaa",
+            "111",
+            "liboldcrate-aaaaaaaaaaaaaaaa.rlib",
+        )?;
         std::thread::sleep(std::time::Duration::from_millis(20));
-        make_unit("newcrate", "bbbbbbbbbbbbbbbb", "222", "libnewcrate-bbbbbbbbbbbbbbbb.rlib")?;
+        make_unit(
+            "newcrate",
+            "bbbbbbbbbbbbbbbb",
+            "222",
+            "libnewcrate-bbbbbbbbbbbbbbbb.rlib",
+        )?;
 
         let rows = who::collect(root.path())?;
         let checks = check_toolchain_generation(&rows);
@@ -699,7 +768,11 @@ mod tests {
             .find(|c| c.message.contains("older toolchain generations"))
             .expect("reclaim warning expected");
         assert_eq!(reclaim.level as u8, Level::Warn as u8);
-        assert!(reclaim.message.contains("1 unit(s)"), "got: {}", reclaim.message);
+        assert!(
+            reclaim.message.contains("1 unit(s)"),
+            "got: {}",
+            reclaim.message
+        );
         Ok(())
     }
 
@@ -709,7 +782,10 @@ mod tests {
     fn edge_build_dir(root: &Path, dep_at: u64, unit_at: u64) -> Result<()> {
         let stamp = |path: &Path, secs: u64| -> Result<()> {
             let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-            fs::File::options().write(true).open(path)?.set_modified(time)?;
+            fs::File::options()
+                .write(true)
+                .open(path)?
+                .set_modified(time)?;
             Ok(())
         };
         fs::create_dir_all(root.join("debug/deps"))?;
@@ -740,8 +816,16 @@ mod tests {
         edge_build_dir(root.path(), 1_700_000_600, 1_700_000_000)?;
         let rows = who::collect(root.path())?;
         let checks = check_mtime_ordering(&rows);
-        assert!(matches!(checks[0].level, Level::Warn), "{:?}", checks[0].message);
-        assert!(checks[0].message.contains("recompile once"), "got: {}", checks[0].message);
+        assert!(
+            matches!(checks[0].level, Level::Warn),
+            "{:?}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("recompile once"),
+            "got: {}",
+            checks[0].message
+        );
         assert_eq!(checks.len(), 2, "one example follows the count");
         assert!(checks[1].message.contains("serde-746d173581f1a314"));
         assert!(checks[1].message.contains("serde_core-b468be6fa8c1f936"));
@@ -755,7 +839,11 @@ mod tests {
         let rows = who::collect(root.path())?;
         let checks = check_mtime_ordering(&rows);
         assert!(matches!(checks[0].level, Level::Pass));
-        assert!(checks[0].message.contains("at least as new"), "got: {}", checks[0].message);
+        assert!(
+            checks[0].message.contains("at least as new"),
+            "got: {}",
+            checks[0].message
+        );
         assert_eq!(checks.len(), 1);
         Ok(())
     }

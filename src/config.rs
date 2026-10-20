@@ -11,17 +11,68 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::{self, DEFAULT_BUILD_DIR};
 
-/// The effective shared-cache root: cargo's own runtime answer
-/// (`cargo metadata` merges every config layer exactly like a real build),
-/// falling back to the configured build-dir value (or the canonical default)
-/// when cargo cannot be asked.
+/// The effective shared-cache root. This is the **global** trust anchor
+/// (`$CARGO_HOME/config.toml`, or the canonical default); project configs are
+/// read only to detect and refuse a shadowing `build-dir`. `cargo metadata`
+/// is deliberately not executed (it would trust/execute project config).
 pub fn cache_root() -> Result<PathBuf> {
-    if let Some(dir) = paths::cargo_metadata_build_dir() {
-        return Ok(paths::normalize_host_separators(dir));
+    // Security: never ask `cargo metadata` in the current directory. In a
+    // repository, project `.cargo/config.toml` (including `build.rustc`)
+    // is attacker-controlled and would both redirect the vault and execute
+    // code during resolution. The global `$CARGO_HOME/config.toml` is the
+    // only trust anchor.
+    let trusted = trusted_cache_root()?;
+    if let Some((path, value)) = project_build_dir_override()? {
+        let global =
+            cargo_configured("build-dir")?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
+        if value != global {
+            anyhow::bail!(
+                "refusing a project-controlled cache root: {} sets build-dir = {:?}, but the trusted global build-dir is {:?}. Move the decision to $CARGO_HOME/config.toml; epicenter never uses a project-controlled vault.",
+                path.display(),
+                value,
+                global
+            );
+        }
     }
-    let value = cargo_configured("build-dir")?
-        .unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
+    Ok(trusted)
+}
+
+/// The effective project config is the deepest ancestor `.cargo/config*`.
+/// Read it as text (never execute it); a differing `build-dir` is refused.
+fn project_build_dir_override() -> Result<Option<(PathBuf, String)>> {
+    let global = cargo_config_path().ok();
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    for dir in cwd.ancestors() {
+        for name in ["config.toml", "config"] {
+            let candidate = dir.join(".cargo").join(name);
+            if global.as_ref() == Some(&candidate) || !candidate.is_file() {
+                continue;
+            }
+            let Ok(text) = crate::util::read_small_text_follow(&candidate, 1024 * 1024) else {
+                continue;
+            };
+            if let Some(value) = read_build_key(&text, "build-dir") {
+                return Ok(Some((candidate, value)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The trusted root: the global `$CARGO_HOME/config.toml` `build-dir` value,
+/// or the canonical default template. Never reads a project config.
+pub fn trusted_cache_root() -> Result<PathBuf> {
+    let value = cargo_configured("build-dir")?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
     paths::resolve_template(&value)
+}
+
+/// Config values are written inside single-quoted TOML strings. Reject the
+/// characters that can break out of the literal or start a new key/line.
+fn validate_config_value(value: &str, what: &str) -> Result<()> {
+    if value.contains(['\n', '\r', '\0', '\'']) {
+        anyhow::bail!("{what} contains a forbidden character (newline, NUL or single quote)");
+    }
+    Ok(())
 }
 
 /// Cargo's *global* config file: `$CARGO_HOME/config.toml`.
@@ -107,18 +158,65 @@ fn set_build_key(text: &str, key: &str, value: &str) -> (String, CargoEdit) {
 
 /// delete `key = ...` from the `[build]` table, if present.
 fn remove_build_key(text: &str, key: &str) -> (String, CargoEdit) {
-    if text.contains("[build]") && text.contains(key) {
-        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-        lines.retain(|line| !line.contains(key));
-        (lines.join("\n") + "\n", CargoEdit::Removed)
+    let mut out: Vec<String> = Vec::new();
+    let mut in_build = false;
+    let mut removed = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_build = trimmed.replace([' ', '\t'], "") == "[build]";
+            out.push(line.to_string());
+            continue;
+        }
+        if in_build
+            && trimmed
+                .split_once('=')
+                .map_or(false, |(candidate, _)| candidate.trim() == key)
+        {
+            removed = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if removed {
+        (out.join("\n") + "\n", CargoEdit::Removed)
     } else {
         (text.to_string(), CargoEdit::AlreadySet)
     }
 }
-
 /// Parse the value of `key` out of the `[build]` table.
 fn read_build_key(text: &str, key: &str) -> Option<String> {
     read_table_key(text, "build", key)
+}
+
+/// Strip a trailing `#` comment while respecting single/double quoted values.
+fn strip_toml_comment(value: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '#' {
+                    return &value[..index];
+                }
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                }
+            }
+        }
+    }
+    value
 }
 
 /// Parse `key = value` out of any `[table]` of a cargo config text.
@@ -141,8 +239,13 @@ pub fn read_table_key(text: &str, table: &str, key: &str) -> Option<String> {
             if candidate.trim() != key {
                 continue;
             }
-            let value = value.split('#').next().unwrap_or("").trim();
-            return Some(value.trim_matches(['"', '\'']).trim().to_string());
+            let value = strip_toml_comment(value).trim();
+            let value = value
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+                .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+                .unwrap_or(value);
+            return Some(value.trim().to_string());
         }
     }
     None
@@ -154,7 +257,7 @@ pub fn cargo_configured_in(table: &str, key: &str) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)?;
+    let text = crate::util::read_small_text_follow(&path, 1024 * 1024)?;
     Ok(read_table_key(&text, table, key))
 }
 
@@ -164,14 +267,14 @@ pub fn cargo_configured(key: &str) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)?;
+    let text = crate::util::read_small_text_follow(&path, 1024 * 1024)?;
     Ok(read_build_key(&text, key))
 }
 
 /// Read a `[build]` key from ANY cargo config file — doctor uses this to scan
 /// the ancestor `.cargo/config.toml` chain for shadowing values. Read-only.
 pub fn read_build_table_key(path: &Path, key: &str) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
+    let text = crate::util::read_small_text_follow(path, 1024 * 1024).ok()?;
     read_build_key(&text, key)
 }
 
@@ -237,14 +340,15 @@ pub fn setup(
         cargo_configured("build-dir")?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
     };
 
+    validate_config_value(&build_dir_value, "build-dir")?;
+    if let Some(name) = with_wrapper {
+        validate_config_value(name, "rustc-wrapper")?;
+    }
+
     // The filesystem view must always be RESOLVED (a template is not a path).
-    let root = if root_arg.is_some() || use_default {
-        paths::resolve_template(&build_dir_value)?
-    } else {
-        paths::resolve_template(&build_dir_value)
-            .or_else(|_| paths::cargo_resolved_build_dir())?
-    };
-    fs::create_dir_all(&root).with_context(|| format!("creating cache dir {}", root.display()))?;
+    let root = paths::resolve_template(&build_dir_value)?;
+    crate::util::create_private_dir_all(&root)
+        .with_context(|| format!("creating cache dir {}", root.display()))?;
 
     // No epicenter side-file: the decision itself is the cargo config below.
     let cargo_cfg = cargo_config_path()?;
@@ -262,7 +366,7 @@ pub fn setup(
         fs::write(&cargo_cfg, text)?;
         (CargoEdit::Created, wrapper_edit, None)
     } else {
-        let text = fs::read_to_string(&cargo_cfg)
+        let text = crate::util::read_small_text_follow(&cargo_cfg, 1024 * 1024)
             .with_context(|| format!("reading {}", cargo_cfg.display()))?;
         let (text, build_dir_edit) = set_build_key(&text, "build-dir", &build_dir_value);
         let (text, wrapper_edit) = match with_wrapper {
@@ -302,8 +406,24 @@ pub fn setup(
 fn backup_file(path: &Path) -> Result<PathBuf> {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".epicenter-bak");
-    let backup = path.with_file_name(name);
-    fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
+    let base = path.with_file_name(name);
+    // Never write through a pre-existing symlink; pick a fresh name instead.
+    let mut backup = base.clone();
+    let mut suffix = 0u32;
+    while fs::symlink_metadata(&backup).is_ok() {
+        suffix += 1;
+        let mut name = base.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{suffix}"));
+        backup = base.with_file_name(name);
+    }
+    // Follow a user's dotfile symlink deliberately, but create the backup
+    // itself with O_EXCL (never write through a planted backup symlink).
+    let source = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    crate::util::copy_file_hashed(&source, &backup)
+        .with_context(|| format!("backing up {}", path.display()))?;
+    if let Ok(meta) = fs::metadata(&source) {
+        let _ = fs::set_permissions(&backup, meta.permissions());
+    }
     Ok(backup)
 }
 
@@ -424,8 +544,36 @@ mod tests {
         );
         // A key mentioned in a comment elsewhere must not leak.
         assert_eq!(
-            read_table_key("[other]\n# fine-grain-locking = true\n", "unstable", "fine-grain-locking"),
+            read_table_key(
+                "[other]\n# fine-grain-locking = true\n",
+                "unstable",
+                "fine-grain-locking"
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn config_writes_reject_injection() {
+        assert!(validate_config_value("x'\nrustc-wrapper = '/tmp/evil' #", "build-dir").is_err());
+        assert!(validate_config_value("x\r\ny", "build-dir").is_err());
+        assert!(validate_config_value("x\0y", "build-dir").is_err());
+        assert!(validate_config_value("/tmp/cache", "build-dir").is_ok());
+    }
+
+    #[test]
+    fn removal_is_scoped_to_the_build_table() {
+        let src = "[build]\nbuild-dir = '/x'\n\n[target.x]\nrustc-wrapper = 'keep'\n";
+        let (out, edit) = remove_build_key(src, "rustc-wrapper");
+        assert_eq!(edit, CargoEdit::AlreadySet);
+        assert!(out.contains("rustc-wrapper = 'keep'"));
+    }
+
+    #[test]
+    fn comments_inside_quoted_values_are_preserved() {
+        assert_eq!(
+            read_build_key("[build]\nbuild-dir = '/tmp/a#b' # tail\n", "build-dir"),
+            Some("/tmp/a#b".to_string())
         );
     }
 

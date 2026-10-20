@@ -460,8 +460,12 @@ fn cmd_prune(older_than: &str, dry_run: bool, yes: bool, y: bool) -> Result<()> 
 /// icons colored by severity.
 fn cmd_doctor() -> Result<()> {
     let checks = doctor::run()?;
+    let mut failed = false;
     let mut current: Option<&'static str> = None;
     for check in checks {
+        if matches!(check.level, doctor::Level::Fail) {
+            failed = true;
+        }
         if current != Some(check.section) {
             if current.is_some() {
                 println!();
@@ -476,6 +480,9 @@ fn cmd_doctor() -> Result<()> {
             doctor::Level::Info => util::info(check.level.icon()),
         };
         println!("  {icon} {}", check.message);
+    }
+    if failed {
+        anyhow::bail!("doctor found failures (see ✕ above)");
     }
     Ok(())
 }
@@ -583,7 +590,12 @@ fn cmd_harvest(unit: Option<&str>, dry_run: bool) -> Result<()> {
 
 fn cmd_restore(into: Option<&std::path::Path>, unit: Option<&str>, dry_run: bool) -> Result<()> {
     let root = config::cache_root()?;
-    let view = into.map(std::path::Path::to_path_buf).unwrap_or(root);
+    let view = into
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(root.clone());
+    if into.is_none() && root.is_dir() {
+        util::ensure_private_dir(&root)?;
+    }
     if dry_run {
         println!(
             "{}",
@@ -638,6 +650,12 @@ fn cmd_restore(into: Option<&std::path::Path>, unit: Option<&str>, dry_run: bool
             "  {} {} (see messages above)",
             label("errors"),
             util::fail(&report.errors.to_string())
+        );
+    }
+    if report.fatal_errors > 0 {
+        anyhow::bail!(
+            "restore refused {} unverified file(s) — refusing to report success",
+            report.fatal_errors
         );
     }
     Ok(())
@@ -733,6 +751,7 @@ fn cmd_verify() -> Result<()> {
     let store = vault::store_root(&root);
     println!("{}", util::heading("epicenter verify — vault audit"));
     let reports = vault::verify(&store)?;
+    let mut failed = false;
     if reports.is_empty() {
         println!(
             "  {} no generations to audit — run `epicenter harvest` after a build",
@@ -740,6 +759,9 @@ fn cmd_verify() -> Result<()> {
         );
     }
     for report in &reports {
+        if !report.is_clean() {
+            failed = true;
+        }
         println!();
         println!("  {}", util::dim(&report.parity));
         if report.is_clean() {
@@ -797,6 +819,9 @@ fn cmd_verify() -> Result<()> {
                 );
             }
         }
+    }
+    if failed {
+        anyhow::bail!("vault verification found problems (see ✕ above)");
     }
     // Views are disposable by contract, so they are not vault state to audit;
     // name them when they exist instead of staying silently quiet about them.

@@ -99,9 +99,7 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
         .into_values()
         .map(|group| (group.key, group.bytes))
         .collect();
-    summary
-        .top_units
-        .sort_by_key(|(_, bytes)| Reverse(*bytes));
+    summary.top_units.sort_by_key(|(_, bytes)| Reverse(*bytes));
     summary.top_units.truncate(10);
 
     Ok(summary)
@@ -129,7 +127,11 @@ mod tests {
         assert_eq!(debug_bucket.bytes, 13);
         assert_eq!(debug_bucket.files, 2);
 
-        let root_bucket = summary.dirs.iter().find(|d| d.name == "(cache root)").unwrap();
+        let root_bucket = summary
+            .dirs
+            .iter()
+            .find(|d| d.name == "(cache root)")
+            .unwrap();
         assert_eq!(root_bucket.bytes, 2);
 
         // Only `liba-abc.rlib` is classifiable into a unit.

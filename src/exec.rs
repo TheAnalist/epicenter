@@ -13,9 +13,10 @@
 //! frame lines go to stderr, and the command's exit code becomes epicenter's
 //! exit code.
 
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::ExitStatus;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use walkdir::WalkDir;
@@ -73,7 +74,11 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
             bytes: 0,
             newest: None,
         };
-        for file in WalkDir::new(entry.path()).min_depth(1).into_iter().flatten() {
+        for file in WalkDir::new(entry.path())
+            .min_depth(1)
+            .into_iter()
+            .flatten()
+        {
             if !file.file_type().is_file() {
                 continue;
             }
@@ -106,19 +111,33 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
 /// build; the lock file itself survives idle builds, so only lock contention
 /// means "in use". Shared by `exec` (reuse refusal) and `evict` (view guards).
 pub(crate) fn dir_locked(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    // Cargo puts the lock at `<build>/<profile>/.cargo-build-lock` or, with
+    // `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
+    // bounded depth and test every lock, not just direct children.
+    let Ok(entries) = WalkDir::new(dir)
+        .min_depth(1)
+        .max_depth(3)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+    else {
         return true;
     };
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+    for entry in entries {
+        if entry.file_name().to_string_lossy() != ".cargo-build-lock" {
             continue;
         }
-        let lock = entry.path().join(".cargo-build-lock");
-        if lock.is_file() && lock_held(&lock) {
+        // A symlink/non-regular lock is treated as held (fail closed).
+        if !entry.file_type().is_file() || lock_held(entry.path()) {
             return true;
         }
     }
     false
+}
+
+/// Path of the per-job epicenter lock (outside the job dir, so `--rm` can
+/// delete the dir while the lock is held).
+pub(crate) fn job_lock_path(work_root: &Path, job_id: &str) -> PathBuf {
+    work_root.join(format!(".lock-{job_id}"))
 }
 
 /// A lock we cannot take is a lock somebody else holds.
@@ -187,17 +206,31 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         Some(id) => sanitize_job_id(id)?,
         None => default_job_id(),
     };
+    // Private work root + per-job epicenter lock (outside the job dir, so
+    // --rm can remove the dir while the lock is held).
+    crate::util::create_private_dir_all(work_root)?;
+    // Acquire the per-job lock BEFORE looking at/creating the dir: the bulk
+    // work-dir GC takes the same lock and must never see an unlocked empty dir.
+    let _job_lock = match crate::util::FileLock::try_acquire(&job_lock_path(work_root, &job_id))? {
+        Some(lock) => lock,
+        None => bail!(
+            "job {} is in use by another epicenter process — wait for it, or use another --id",
+            job_id
+        ),
+    };
     let work_dir = work_root.join(&job_id);
     let mut reused = false;
-    if work_dir.exists() {
+    if fs::symlink_metadata(&work_dir).is_ok() {
         if !opts.reuse {
             bail!(
                 "job dir {} already exists — pick another --id, pass --reuse to continue in it, or remove it",
                 work_dir.display()
             );
         }
-        if !work_dir.is_dir() {
-            bail!("{} exists and is not a directory", work_dir.display());
+        let meta = fs::symlink_metadata(&work_dir)
+            .with_context(|| format!("inspecting {}", work_dir.display()))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            bail!("{} exists and is not a real directory", work_dir.display());
         }
         if dir_locked(&work_dir) {
             bail!(
@@ -207,8 +240,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         }
         reused = true;
     } else {
-        std::fs::create_dir_all(&work_dir)
-            .with_context(|| format!("creating {}", work_dir.display()))?;
+        crate::util::create_private_dir_all(&work_dir)?;
     }
     let target_dir = opts
         .target_dir
@@ -229,9 +261,15 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         }
     );
 
-    // Fail-open seeding: an empty vault simply means a cold build. The hint
-    // is about THIS step (before the command) — `--harvest` stores afterwards.
+    // An empty vault is a cold build (fail-open), but a corrupt/tampered
+    // vault is not: never run the command over unverified artifacts.
     let restore = vault::restore(&work_dir, store_root, None, false)?;
+    if restore.fatal_errors > 0 {
+        bail!(
+            "vault restore refused {} unverified file(s) — refusing to run the command over unverified state",
+            restore.fatal_errors
+        );
+    }
     match &restore.note {
         Some(_) if opts.harvest_back => eprintln!(
             "  {} cold start — the vault has nothing for this generation yet; --harvest will store what this job builds",
@@ -265,7 +303,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let _ = std::io::stderr().flush();
 
     let started = Instant::now();
-    let mut child = Command::new(program);
+    let mut child = crate::util::command_for(program)?;
     child.args(&opts.command[1..]);
     child.env("CARGO_BUILD_BUILD_DIR", &work_dir);
     if let Some(target) = &target_dir {
@@ -406,6 +444,17 @@ fn sanitize_job_id(id: &str) -> Result<String> {
     {
         bail!("--id {id:?}: use letters, digits, `-`, `_` or `.`");
     }
+    if trimmed.ends_with('.') {
+        bail!("--id {id:?} must not end with '.' (Windows strips it)");
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        bail!("--id {id:?} is a reserved Windows device name");
+    }
     Ok(trimmed.to_string())
 }
 
@@ -431,6 +480,9 @@ mod tests {
         assert!(sanitize_job_id("a/b").is_err());
         assert!(sanitize_job_id(".hidden").is_err());
         assert!(sanitize_job_id("has space").is_err());
+        assert!(sanitize_job_id("CON").is_err());
+        assert!(sanitize_job_id("com1").is_err());
+        assert!(sanitize_job_id("trailing.").is_err());
     }
 
     /// One synthetic unit in a build dir, harvested into a temp vault.
@@ -476,7 +528,9 @@ mod tests {
         let code = run(store.path(), work.path(), &opts)?;
         assert_eq!(code, 7, "the command's exit code is the job's exit code");
         assert!(
-            job_dir.join("debug/.fingerprint/x-1122334455667788/lib-x").is_file(),
+            job_dir
+                .join("debug/.fingerprint/x-1122334455667788/lib-x")
+                .is_file(),
             "the vault seeded the job"
         );
         Ok(())
@@ -650,6 +704,30 @@ mod tests {
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
         assert!(err.to_string().contains("in use"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_target_lock_is_detected() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let job = home.path().join("job/debug");
+        fs::create_dir_all(&job)?;
+        let lock = job.join(".cargo-build-lock");
+        fs::write(&lock, b"")?;
+        let held = fs::OpenOptions::new().write(true).open(&lock)?;
+        held.try_lock().context("test holds the lock")?;
+        assert!(dir_locked(&home.path().join("job")), "direct profile lock");
+
+        let nested = home.path().join("cross/x86_64-unknown-linux-gnu/debug");
+        fs::create_dir_all(&nested)?;
+        let lock = nested.join(".cargo-build-lock");
+        fs::write(&lock, b"")?;
+        let held = fs::OpenOptions::new().write(true).open(&lock)?;
+        held.try_lock().context("test holds the nested lock")?;
+        assert!(
+            dir_locked(&home.path().join("cross")),
+            "target-triple lock must be found"
+        );
         Ok(())
     }
 

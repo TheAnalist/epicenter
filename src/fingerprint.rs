@@ -197,7 +197,10 @@ fn parse_fingerprint_json(json: &Value) -> FingerprintJson {
 
     FingerprintJson {
         rustc: parse_u64_field(json, "rustc"),
-        features: json.get("features").map(parse_string_array).unwrap_or_default(),
+        features: json
+            .get("features")
+            .map(parse_string_array)
+            .unwrap_or_default(),
         declared_features: json
             .get("declared_features")
             .map(parse_string_array)
@@ -227,25 +230,31 @@ pub fn parse_fingerprint(text: &str) -> Option<FingerprintJson> {
 /// Read every unit directory under all `.fingerprint/` roots inside the build dir.
 pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
     let mut units = Vec::new();
-    for profile_entry in fs::read_dir(build_root).with_context(|| {
-        format!("reading build dir {}", build_root.display())
-    })? {
+    for profile_entry in fs::read_dir(build_root)
+        .with_context(|| format!("reading build dir {}", build_root.display()))?
+    {
         let profile_entry = profile_entry?;
         if !profile_entry.file_type()?.is_dir() {
             continue;
         }
         let profile = profile_entry.file_name().to_string_lossy().into_owned();
         let fp_root = build_root.join(&profile).join(".fingerprint");
-        if !fp_root.is_dir() {
-            continue; // finals (CACHEDIR.TAG …), locks — no fingerprints here
+        let fp_meta = match fs::symlink_metadata(&fp_root) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !fp_meta.is_dir() || fp_meta.file_type().is_symlink() {
+            continue; // finals (CACHEDIR.TAG …), locks, symlinks — no fingerprints here
         }
-        for unit_entry in fs::read_dir(&fp_root).with_context(|| {
-            format!("reading {}", fp_root.display())
-        })? {
-            let unit_dir = unit_entry?.path();
-            if !unit_dir.is_dir() {
+        for unit_entry in
+            fs::read_dir(&fp_root).with_context(|| format!("reading {}", fp_root.display()))?
+        {
+            let unit_entry = unit_entry?;
+            // `file_type()` does not follow symlinks: a unit dir must be real.
+            if !unit_entry.file_type()?.is_dir() {
                 continue;
             }
+            let unit_dir = unit_entry.path();
             if let Some(unit) = read_unit_dir(&profile, &unit_dir) {
                 units.push(unit);
             }
@@ -303,6 +312,11 @@ fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
 
     for entry in fs::read_dir(unit_dir).ok()? {
         let entry = entry.ok()?;
+        // Only regular files: never read a FIFO/device/symlink planted by a
+        // build script (harvest would otherwise hang or copy a secret).
+        if !entry.file_type().ok()?.is_file() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("dep-") {
             dep_info = Some(entry.path());
@@ -315,7 +329,17 @@ fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
         if name == "invoked.timestamp" {
             continue;
         }
-        let content = fs::read_to_string(entry.path()).ok()?.trim().to_string();
+        if entry
+            .metadata()
+            .map(|meta| meta.len() > 4 * 1024 * 1024)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let content = crate::util::read_small_text(&entry.path(), 4 * 1024 * 1024)
+            .ok()?
+            .trim()
+            .to_string();
         candidates.push((name, content));
     }
 
@@ -323,7 +347,7 @@ fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
     let kind = classify_kind(&memo_file_name);
 
     let json = json_path
-        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|path| crate::util::read_small_text(&path, 4 * 1024 * 1024).ok())
         .and_then(|text| parse_fingerprint(&text));
 
     Some(Unit {
@@ -345,9 +369,7 @@ fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
 /// directory (`output-*`) — those are state, not fingerprints. When nothing
 /// looks like a hash the first candidate is used anyway, so a corrupted unit
 /// still shows up in forensics instead of disappearing.
-fn pick_memo(
-    mut candidates: Vec<(String, String)>,
-) -> Option<((String, String), Vec<String>)> {
+fn pick_memo(mut candidates: Vec<(String, String)>) -> Option<((String, String), Vec<String>)> {
     if candidates.is_empty() {
         return None;
     }
@@ -396,9 +418,27 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
     let mut paths = Vec::new();
 
     let deps_dir = profile_dir.join("deps");
+    let deps_real = fs::symlink_metadata(&deps_dir)
+        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false);
     if let Ok(entries) = fs::read_dir(&deps_dir) {
+        if !deps_real {
+            return ArtifactInfo {
+                paths: Vec::new(),
+                bytes: 0,
+                newest: None,
+            };
+        }
         let suffix = format!("-{}", unit.dir_suffix);
         for entry in entries.flatten() {
+            // Regular files only; a symlink/FIFO here must not be copied.
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             // Compare on the STEM so extensions don't hide the match:
             // `libserde-102a….rlib` → stem `libserde-102a…` ends with `-102a…`.
@@ -410,18 +450,17 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
                 continue;
             }
             if let Ok(meta) = entry.metadata() {
-                paths.push((
-                    entry.path(),
-                    meta.len(),
-                    meta.modified().ok(),
-                ));
+                paths.push((entry.path(), meta.len(), meta.modified().ok()));
             }
         }
     }
 
     if unit.kind != UnitKind::Lib {
         for candidate in build_anchor_dirs(build_root, unit) {
-            if !candidate.is_dir() {
+            let is_real_dir = fs::symlink_metadata(&candidate)
+                .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_real_dir {
                 continue;
             }
             for entry in WalkDir::new(&candidate).min_depth(1) {
@@ -446,7 +485,11 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
             }
         }
     }
-    ArtifactInfo { paths, bytes, newest }
+    ArtifactInfo {
+        paths,
+        bytes,
+        newest,
+    }
 }
 
 #[cfg(test)]
@@ -459,7 +502,9 @@ mod tests {
     #[test]
     fn reads_and_parses_synthetic_unit() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let unit_dir = root.path().join("debug/.fingerprint/serde-102a33f055a8d229");
+        let unit_dir = root
+            .path()
+            .join("debug/.fingerprint/serde-102a33f055a8d229");
         fs::create_dir_all(&unit_dir)?;
         // memo file: 16 hex chars, no trailing newline (verbatim format)
         fs::write(unit_dir.join("lib-serde"), "5d82713a7f2d05e2")?;
@@ -468,7 +513,8 @@ mod tests {
         fs::write(unit_dir.join("invoked.timestamp"), "")?;
         fs::create_dir_all(root.path().join("debug/deps"))?;
         fs::write(
-            root.path().join("debug/deps/libserde-102a33f055a8d229.rlib"),
+            root.path()
+                .join("debug/deps/libserde-102a33f055a8d229.rlib"),
             [0u8; 10],
         )?;
 
@@ -529,7 +575,9 @@ mod tests {
     #[test]
     fn cached_diagnostics_are_not_mistaken_for_the_memo() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let unit_dir = root.path().join("debug/.fingerprint/serde-102a33f055a8d229");
+        let unit_dir = root
+            .path()
+            .join("debug/.fingerprint/serde-102a33f055a8d229");
         fs::create_dir_all(&unit_dir)?;
         fs::write(unit_dir.join("lib-serde"), "5d82713a7f2d05e2")?;
         fs::write(unit_dir.join("dep-lib-serde"), [0u8; 8])?;
@@ -568,16 +616,21 @@ mod tests {
     #[test]
     fn dep_edges_join_the_graph_by_memo_hash() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let core = root.path().join("debug/.fingerprint/serde_core-b468be6fa8c1f936");
+        let core = root
+            .path()
+            .join("debug/.fingerprint/serde_core-b468be6fa8c1f936");
         fs::create_dir_all(&core)?;
         fs::write(core.join("lib-serde_core"), "71a9f323efa5ae82")?;
         fs::create_dir_all(root.path().join("debug/deps"))?;
         fs::write(
-            root.path().join("debug/deps/libserde_core-b468be6fa8c1f936.rlib"),
+            root.path()
+                .join("debug/deps/libserde_core-b468be6fa8c1f936.rlib"),
             [0u8; 4],
         )?;
 
-        let serde = root.path().join("debug/.fingerprint/serde-746d173581f1a314");
+        let serde = root
+            .path()
+            .join("debug/.fingerprint/serde-746d173581f1a314");
         fs::create_dir_all(&serde)?;
         fs::write(serde.join("lib-serde"), "5d82713a7f2d05e2")?;
         fs::write(
@@ -585,7 +638,8 @@ mod tests {
             r#"{"deps":[[11029742160753049355,"serde_core",false,9416646317397223793]]}"#,
         )?;
         fs::write(
-            root.path().join("debug/deps/libserde-746d173581f1a314.rlib"),
+            root.path()
+                .join("debug/deps/libserde-746d173581f1a314.rlib"),
             [0u8; 4],
         )?;
 
@@ -593,7 +647,10 @@ mod tests {
         assert_eq!(units.len(), 2);
         let edges = dep_edges(&units);
         let serde_at = units.iter().position(|u| u.package == "serde").unwrap();
-        let core_at = units.iter().position(|u| u.package == "serde_core").unwrap();
+        let core_at = units
+            .iter()
+            .position(|u| u.package == "serde_core")
+            .unwrap();
         assert_eq!(edges[serde_at], vec![core_at]);
         assert!(edges[core_at].is_empty());
         Ok(())

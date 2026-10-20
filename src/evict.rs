@@ -78,6 +78,16 @@ pub const DEFAULT_WORK_MAX_AGE: &str = "7d";
 
 /// `epicenter evict [unit] [--stale|--rustc-key|--husks|--older-than|--work-dirs|--work <view>] [--tier <t>] [--force] [--yes]`
 pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
+    // An empty selector is a wildcard (`contains("")`) — never delete by it.
+    for (name, value) in [
+        ("--unit", opts.unit),
+        ("--rustc-key", opts.rustc_key),
+        ("--crate", opts.crate_name),
+    ] {
+        if value.is_some_and(|value| value.is_empty()) {
+            bail!("{name} must not be empty — use an explicit selector or a dry run");
+        }
+    }
     if let Some(target) = opts.work_dir {
         if opts.work_dirs || opts.work.is_some() {
             bail!(
@@ -281,7 +291,10 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
             candidate.name,
             candidate.kind,
             human_bytes(candidate.bytes),
-            candidate.newest.map(human_age).unwrap_or_else(|| "?".into()),
+            candidate
+                .newest
+                .map(human_age)
+                .unwrap_or_else(|| "?".into()),
             labels.join(" + "),
             if candidate.current && opts.force {
                 util::dim("  (current — forced)")
@@ -334,7 +347,10 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
         );
     }
     if !opts.delete {
-        println!("  {}", util::dim("run again with -y or --yes to remove them"));
+        println!(
+            "  {}",
+            util::dim("run again with -y or --yes to remove them")
+        );
         return Ok(());
     }
 
@@ -463,16 +479,24 @@ struct WorkDir {
 fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     let work_root = crate::exec::work_root(build_root);
     let path = resolve_work_dir(&work_root, target)?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let job_lock =
+        match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(&work_root, &name))? {
+            Some(lock) => lock,
+            None => bail!(
+                "job dir {} is in use by an epicenter process — remove it when it finishes",
+                path.display()
+            ),
+        };
     if crate::exec::dir_locked(&path) {
         bail!(
             "job dir {} is in use by a live build — remove it when it finishes",
             path.display()
         );
     }
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let newest = dir_newest(&path);
     let (bytes, unique, shared, files) = dir_accounting(&path);
 
@@ -515,7 +539,20 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         println!("  {}", util::dim("run again with -y or --yes to remove it"));
         return Ok(());
     }
-    fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+    // Rename out of the way first: a hidden tombstone is not a job dir any
+    // later GC/exec can guess, and a build that races the check fails rather
+    // than writing into a directory being deleted.
+    let tombstone = work_root.join(format!(".{name}.deleting-{}", std::process::id()));
+    if fs::symlink_metadata(&tombstone).is_ok() {
+        let _ = crate::util::force_remove_dir(&tombstone);
+    }
+    fs::rename(&path, &tombstone).with_context(|| format!("isolating {}", path.display()))?;
+    if let Err(err) = fs::remove_dir_all(&tombstone) {
+        let _ = fs::rename(&tombstone, &path);
+        drop(job_lock);
+        return Err(err).with_context(|| format!("removing {}", path.display()));
+    }
+    drop(job_lock);
     println!();
     println!(
         "  {} {name} removed · {} actually freed · {} links released",
@@ -578,7 +615,10 @@ fn evict_work_dirs(
     let limit = parse_duration(age_text).context("invalid value for --older-than")?;
 
     if delete {
-        println!("{}", util::heading("epicenter evict --work-dirs — removing"));
+        println!(
+            "{}",
+            util::heading("epicenter evict --work-dirs — removing")
+        );
     } else {
         println!(
             "{}",
@@ -713,6 +753,19 @@ fn evict_work_dirs(
     let mut freed_unique = 0u64;
     let mut freed_shared = 0u64;
     for row in rows.iter().filter(|row| row.old_enough && !row.locked) {
+        let _job_lock = match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(
+            &work_root, &row.name,
+        ))? {
+            Some(lock) => lock,
+            None => {
+                report.in_use += 1;
+                continue;
+            }
+        };
+        if crate::exec::dir_locked(&row.path) {
+            report.in_use += 1;
+            continue;
+        }
         match fs::remove_dir_all(&row.path) {
             Ok(()) => {
                 report.removed += 1;
@@ -795,15 +848,36 @@ fn resolve_view(build_root: &Path, work: &str) -> Result<PathBuf> {
     }
     let work_root = crate::exec::work_root(build_root);
     let job = work_root.join(work.trim_start_matches("work/"));
-    if job.is_dir() {
+    if fs::symlink_metadata(&job)
+        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
         return Ok(job);
     }
     let path = PathBuf::from(work);
-    if path.is_dir() {
-        return Ok(path);
+    if fs::symlink_metadata(&path)
+        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let canonical = path.canonicalize()?;
+        let work_root_canonical = work_root.canonicalize().ok();
+        let build_canonical = build_root.canonicalize().ok();
+        let allowed = work_root_canonical
+            .iter()
+            .chain(build_canonical.iter())
+            .any(|root| canonical.starts_with(root));
+        if allowed {
+            return Ok(path);
+        }
+        bail!(
+            "view {} is outside {} and {} — refusing to delete outside the cache",
+            path.display(),
+            work_root.display(),
+            build_root.display()
+        );
     }
     bail!(
-        "no view named {work:?} — expected `build`, a job id under {}, or an existing directory",
+        "no view named {work:?} — expected `build`, a job id under {}, or a directory under it",
         work_root.display()
     );
 }
@@ -883,11 +957,14 @@ fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
             if !seen.insert(path.as_path()) {
                 continue;
             }
-            let Ok(meta) = fs::metadata(path) else { continue };
+            let Ok(meta) = fs::metadata(path) else {
+                continue;
+            };
             count += 1;
-            let entry = per_inode
-                .entry((meta.dev(), meta.ino()))
-                .or_insert((meta.len(), meta.nlink(), 0));
+            let entry =
+                per_inode
+                    .entry((meta.dev(), meta.ino()))
+                    .or_insert((meta.len(), meta.nlink(), 0));
             entry.2 += 1;
         }
         let mut nominal = 0u64;
@@ -1107,12 +1184,7 @@ fn view_list(views: &[String]) -> String {
     if views.is_empty() {
         return "no views".to_string();
     }
-    let mut text = views
-        .iter()
-        .take(4)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut text = views.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
     if views.len() > 4 {
         text.push_str(&format!(", … (+{} more)", views.len() - 4));
     }
@@ -1156,7 +1228,11 @@ fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<
             ))
         );
     }
-    println!("  {} {}", util::dim(&format!("{:<11}", "view")), root.display());
+    println!(
+        "  {} {}",
+        util::dim(&format!("{:<11}", "view")),
+        root.display()
+    );
     if chosen.is_empty() {
         println!("  nothing in this view matches — check `epicenter who --unit <q>`");
         return Ok(());
@@ -1259,7 +1335,10 @@ mod tests {
         fs::write(unit_dir.join("lib-pkg"), "0011223344556677")?;
         fs::write(unit_dir.join("dep-lib-pkg"), [0u8; 8])?;
         fs::create_dir_all(root.join("debug/deps"))?;
-        fs::write(root.join("debug/deps/libpkg-1122334455667788.rlib"), [0u8; 16])?;
+        fs::write(
+            root.join("debug/deps/libpkg-1122334455667788.rlib"),
+            [0u8; 16],
+        )?;
         Ok(())
     }
 
@@ -1306,7 +1385,11 @@ mod tests {
         };
         // A single unit IS the current cohort → stale selects nothing.
         run(&build, &opts)?;
-        assert!(build.join("debug/.fingerprint/pkg-1122334455667788").exists());
+        assert!(
+            build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists()
+        );
         Ok(())
     }
 
@@ -1321,11 +1404,15 @@ mod tests {
         };
         run(&build, &opts)?;
         assert!(
-            !build.join("debug/.fingerprint/pkg-1122334455667788").exists(),
+            !build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists(),
             "fingerprint dir must be gone"
         );
         assert!(
-            !build.join("debug/deps/libpkg-1122334455667788.rlib").exists(),
+            !build
+                .join("debug/deps/libpkg-1122334455667788.rlib")
+                .exists(),
             "artifact must be gone"
         );
         Ok(())
@@ -1556,11 +1643,15 @@ mod tests {
             "job artifact unlinked"
         );
         assert!(
-            build.join("debug/.fingerprint/pkg-1122334455667788").exists(),
+            build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists(),
             "build view untouched"
         );
         assert!(
-            build.join("debug/deps/libpkg-1122334455667788.rlib").exists(),
+            build
+                .join("debug/deps/libpkg-1122334455667788.rlib")
+                .exists(),
             "build artifact untouched"
         );
         assert!(!home.path().join("store").exists(), "no store was touched");
@@ -1578,7 +1669,11 @@ mod tests {
             ..no_selectors()
         };
         run(&build, &opts)?;
-        assert!(!build.join("debug/.fingerprint/pkg-1122334455667788").exists());
+        assert!(
+            !build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists()
+        );
         assert!(job.join("debug/.fingerprint/pkg-1122334455667788").exists());
         Ok(())
     }
@@ -1663,11 +1758,15 @@ mod tests {
             "store record gone"
         );
         assert!(
-            build.join("debug/.fingerprint/pkg-1122334455667788").exists(),
+            build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists(),
             "the view keeps its links"
         );
         assert!(
-            build.join("debug/deps/libpkg-1122334455667788.rlib").exists(),
+            build
+                .join("debug/deps/libpkg-1122334455667788.rlib")
+                .exists(),
             "the view keeps its artifact"
         );
         Ok(())
@@ -1685,7 +1784,11 @@ mod tests {
             ..no_selectors()
         };
         run(&build, &opts)?;
-        assert!(!build.join("debug/.fingerprint/pkg-1122334455667788").exists());
+        assert!(
+            !build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists()
+        );
         assert_eq!(
             crate::vault::stored_units(&store)?.len(),
             1,
@@ -1706,8 +1809,16 @@ mod tests {
         };
         run(&build, &opts)?;
         assert_eq!(crate::vault::stored_units(&store)?.len(), 0);
-        assert!(!build.join("debug/.fingerprint/pkg-1122334455667788").exists());
-        assert!(!build.join("debug/deps/libpkg-1122334455667788.rlib").exists());
+        assert!(
+            !build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists()
+        );
+        assert!(
+            !build
+                .join("debug/deps/libpkg-1122334455667788.rlib")
+                .exists()
+        );
         Ok(())
     }
 
@@ -1722,7 +1833,9 @@ mod tests {
         };
         run(&build, &opts)?;
         assert!(
-            build.join("debug/.fingerprint/pkg-1122334455667788").exists(),
+            build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists(),
             "current unit protected without --force"
         );
         assert_eq!(crate::vault::stored_units(&store)?.len(), 1);

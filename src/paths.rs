@@ -64,50 +64,6 @@ pub fn default_cache_root() -> Result<PathBuf> {
     Ok(PathBuf::from(DEFAULT_BUILD_DIR))
 }
 
-/// The directory cargo actually uses for the shared build cache — resolved
-/// from cargo itself, at runtime.
-///
-/// Order:
-/// 1. `cargo metadata` (run in the current context — it merges every config
-///    layer exactly like a real build and reports `build_directory`).
-///    Its reported separators are then normalized to the HOST separator,
-///    because cargo's on-disk layout is host-normalized while the metadata
-///    string can carry template-literal backslashes (verified on Linux).
-/// 2. Fallback when cargo can't answer (outside any project, broken env):
-///    local expansion of [`DEFAULT_BUILD_DIR`], same normalization — never
-///    written back into any config.
-pub fn cargo_resolved_build_dir() -> Result<PathBuf> {
-    if let Some(dir) = cargo_metadata_build_dir() {
-        return Ok(normalize_host_separators(dir));
-    }
-    resolve_template(DEFAULT_BUILD_DIR)
-}
-
-/// Ask cargo for its `build_directory` (`None` when cargo metadata fails,
-/// e.g. when not inside any Cargo workspace).
-pub fn cargo_metadata_build_dir() -> Option<PathBuf> {
-    let output = std::process::Command::new("cargo")
-        .arg("metadata")
-        .arg("--format-version")
-        .arg("1")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
-    parsed.get("build_directory")?.as_str().map(PathBuf::from)
-}
-
-/// Template-literal backslashes -> host separator (see [`cargo_resolved_build_dir`]).
-pub fn normalize_host_separators(path: PathBuf) -> PathBuf {
-    PathBuf::from(
-        path.to_string_lossy()
-            .replace('\\', &std::path::MAIN_SEPARATOR.to_string()),
-    )
-}
-
 /// Expand a cargo-style build-dir template value into a concrete path —
 /// for epicenter's local file operations only (never for writing configs).
 ///

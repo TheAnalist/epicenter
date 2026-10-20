@@ -134,7 +134,7 @@ pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
         let Some(key) = artifact_key(root, entry.path()) else {
             continue;
         };
-        let meta = entry.metadata()?;
+        let Ok(meta) = entry.metadata() else { continue };
         let group = groups.entry(key.clone()).or_insert_with(|| Group {
             key,
             files: Vec::new(),

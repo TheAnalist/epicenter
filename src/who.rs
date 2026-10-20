@@ -278,7 +278,7 @@ pub fn explain(build_root: &Path, query: &str) -> Result<()> {
                         unit.dir_name,
                         unit.kind.label(),
                         arts.newest.map(human_age).unwrap_or_else(|| "?".into()),
-                        &rustc_id[..rustc_id.len().min(8)],
+                        rustc_id.chars().take(8).collect::<String>(),
                     );
                 }
             }
@@ -308,7 +308,10 @@ fn explain_one(all: &[(Unit, ArtifactInfo)], picked: &(Unit, ArtifactInfo)) -> R
     let index = crate::fingerprint::memo_index(&units);
     let mut reasons: Vec<(usize, String)> = why_stale(all, unit, arts, &json.deps, &index);
     if stale_id {
-        reasons.push((usize::MAX, "stale toolchain generation (rustc key differs)".into()));
+        reasons.push((
+            usize::MAX,
+            "stale toolchain generation (rustc key differs)".into(),
+        ));
     }
     if arts.paths.is_empty() {
         reasons.push((usize::MAX, "no artifacts on disk".into()));
@@ -514,4 +517,28 @@ fn display_features(features: &[String]) -> String {
 /// Truncate a hash for display: first `width` chars.
 fn short(hash: &str, width: usize) -> String {
     hash.chars().take(width).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn explain_survives_multibyte_rustc_ids() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for name in ["foo-aaaaaaaaaaaaaaaa", "bar-aaaaaaaaaaaaaaaa"] {
+            let dir = root.path().join("debug/.fingerprint").join(name);
+            fs::create_dir_all(&dir)?;
+            let memo = format!("bin-{}", name.split('-').next().unwrap());
+            fs::write(dir.join(&memo), "0123456789abcdef")?;
+            fs::write(
+                dir.join(format!("{memo}.json")),
+                r#"{"rustc":"abcdefgé","features":"[]","declared_features":"[]","deps":[]}"#,
+            )?;
+        }
+        // Two matches, neither a lib → exercises the multi-match display path.
+        explain(root.path(), "aaaaaaaaaaaaaaaa")?;
+        Ok(())
+    }
 }
