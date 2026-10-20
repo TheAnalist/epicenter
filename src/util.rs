@@ -112,9 +112,9 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
     let (num, unit) = text.split_at(split);
     // Build the message explicitly: the raw integer-parse error ("cannot parse
     // integer from empty string") is noise for a CLI user.
-    let n: u64 = num.parse().map_err(|_| {
-        anyhow::anyhow!("invalid duration {text:?} (expected e.g. 30d, 2w, 12h)")
-    })?;
+    let n: u64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration {text:?} (expected e.g. 30d, 2w, 12h)"))?;
     let secs = match unit.to_ascii_lowercase().as_str() {
         "" | "s" => n,
         "m" => n * 60,
@@ -185,8 +185,7 @@ pub fn on_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path)
-        .any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+    std::env::split_paths(&path).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
 }
 
 /// Absolute path of `program` if discoverable — first on `PATH`, then as a
@@ -244,9 +243,18 @@ mod tests {
 
     #[test]
     fn parses_time_units() {
-        assert_eq!(parse_duration("30d").unwrap(), Duration::from_secs(30 * 86_400));
-        assert_eq!(parse_duration("2w").unwrap(), Duration::from_secs(2 * 604_800));
-        assert_eq!(parse_duration("12h").unwrap(), Duration::from_secs(12 * 3_600));
+        assert_eq!(
+            parse_duration("30d").unwrap(),
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(
+            parse_duration("2w").unwrap(),
+            Duration::from_secs(2 * 604_800)
+        );
+        assert_eq!(
+            parse_duration("12h").unwrap(),
+            Duration::from_secs(12 * 3_600)
+        );
         assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("5x").is_err());
@@ -278,12 +286,19 @@ mod tests {
 
     #[test]
     fn error_blocks_render_a_glyph_indent_and_causes() {
-        let plain = anyhow::anyhow!("nothing selected — pass one selector:\n--stale   older toolchains");
+        let plain =
+            anyhow::anyhow!("nothing selected — pass one selector:\n--stale   older toolchains");
         let block = error_block(&plain);
-        assert_eq!(block, "✕ nothing selected — pass one selector:\n  --stale   older toolchains");
+        assert_eq!(
+            block,
+            "\u{1b}[38;2;224;108;117m✕\u{1b}[0m nothing selected — pass one selector:\n  --stale   older toolchains"
+        );
 
         let chained = Err::<(), _>(anyhow::anyhow!("inner detail")).context("outer headline");
         let block = error_block(&chained.unwrap_err());
-        assert_eq!(block, "✕ outer headline\n  caused by: inner detail");
+        assert_eq!(
+            block,
+            "\u{1b}[38;2;224;108;117m✕\u{1b}[0m outer headline\n  \u{1b}[2mcaused by:\u{1b}[0m inner detail"
+        );
     }
 }
