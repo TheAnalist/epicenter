@@ -2339,6 +2339,38 @@ mod tests {
         Ok(())
     }
 
+    /// Windows-only regression: `File::open` yields a GENERIC_READ handle and
+    /// `SetFileTime` requires FILE_WRITE_ATTRIBUTES, so stamping failed with
+    /// "Accesso negato" (os error 5) even when the copy itself was writable.
+    #[cfg(windows)]
+    #[test]
+    fn set_stamp_sets_times_on_windows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("dep-lib-x");
+        fs::write(&file, b"x")?;
+
+        set_stamp(&file, 1_700_000_000)?;
+        assert_eq!(
+            ceil_secs(fs::metadata(&file)?.modified()?),
+            1_700_000_000,
+            "a writable copy must be stampable"
+        );
+
+        // The exact `stage_group` order for a copy that inherited a read-only
+        // source (kache hardlinks): make it writable, then stamp it.
+        let mut perms = fs::metadata(&file)?.permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&file, perms)?;
+        make_writable(&file)?;
+        set_stamp(&file, 1_700_000_100)?;
+        assert_eq!(
+            ceil_secs(fs::metadata(&file)?.modified()?),
+            1_700_000_100,
+            "a copy of a read-only source must be stampable"
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failed_store_drops_its_staging_dir() -> Result<()> {
