@@ -165,7 +165,7 @@ pub fn run() -> Result<Vec<Check>> {
 /// templated and must resolve to the dir cargo actually builds into.
 fn check_build_dir(root: &Path) -> Check {
     let section: &'static str = SEC_CONFIG;
-    let value = match crate::config::cargo_configured("build-dir") {
+    let value = match crate::paths::cargo_build_dir() {
         Ok(Some(value)) => value,
         Ok(None) => {
             return check(
@@ -251,11 +251,11 @@ fn check_cache_permissions(root: &Path) -> Check {
             );
         }
     };
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+    if meta.file_type().is_symlink() || crate::util::is_reparse_point(&meta) || !meta.is_dir() {
         return check(
             section,
             Level::Fail,
-            "cache root is a symlink or not a directory",
+            "cache root is a symlink/reparse point or not a directory",
         );
     }
     #[cfg(unix)]
@@ -284,6 +284,18 @@ fn check_cache_permissions(root: &Path) -> Check {
             );
         }
     }
+    #[cfg(windows)]
+    {
+        if let Err(err) = crate::util::ensure_windows_user_path(root, "cache root") {
+            return check(section, Level::Fail, format!("{err:#}"));
+        }
+        return check(
+            section,
+            Level::Warn,
+            "cache root is under %USERPROFILE%, but Windows ACLs are not inspected — single-user cache only",
+        );
+    }
+    #[cfg(not(windows))]
     check(section, Level::Pass, "cache root is private (owner-only)")
 }
 
@@ -301,9 +313,17 @@ fn check_ancestor_configs() -> Vec<Check> {
 
     let mut found = false;
     loop {
-        let candidate = dir.join(".cargo").join("config.toml");
-        let is_home = home_cfg.as_ref().map_or(false, |h| *h == candidate);
-        if candidate.exists() && !is_home {
+        for name in ["config.toml", "config"] {
+            let candidate = dir.join(".cargo").join(name);
+            let is_home = home_cfg.as_ref().map_or(false, |h| *h == candidate)
+                || home_cfg
+                    .as_ref()
+                    .and_then(|h| h.parent())
+                    .map(|p| p.join("config") == candidate)
+                    .unwrap_or(false);
+            if !candidate.exists() || is_home {
+                continue;
+            }
             found = true;
             for key in ["build-dir", "rustc-wrapper"] {
                 let Some(ancestor) = crate::config::read_build_table_key(&candidate, key) else {
@@ -313,10 +333,10 @@ fn check_ancestor_configs() -> Vec<Check> {
                 if home_value.as_deref() != Some(ancestor.as_str()) {
                     out.push(check(
                         section,
-                        Level::Fail,
+                        Level::Warn,
                         format!(
                             "{} sets {key} = '{ancestor}' differently from the global config \
-                             (deep config wins per-key) — epicenter refuses project-controlled state",
+                             (cargo applies it to builds) — epicenter ignores it for its own state",
                             candidate.display()
                         ),
                     ));
@@ -342,7 +362,7 @@ fn check_ancestor_configs() -> Vec<Check> {
         out.push(check(
             section,
             Level::Pass,
-            "no ancestor .cargo/config.toml shadows the global config",
+            "no ancestor .cargo/config(.toml) shadows the global config",
         ));
     }
     out
@@ -472,7 +492,7 @@ fn device_id(path: &Path) -> Option<u64> {
 fn strip_volume_prefix(canonical: &str) -> Option<String> {
     let rest = canonical.strip_prefix(r"\\?\")?;
     let mut chars = rest.chars();
-    let (first, second) = (chars.next()?, chars.next()?);
+    let (_first, second) = (chars.next()?, chars.next()?);
     if second == ':' {
         Some(rest[..2].to_string()) // drive letter
     } else if rest.starts_with("UNC\\") {

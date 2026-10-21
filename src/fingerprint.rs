@@ -243,7 +243,10 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        if !fp_meta.is_dir() || fp_meta.file_type().is_symlink() {
+        if !fp_meta.is_dir()
+            || fp_meta.file_type().is_symlink()
+            || crate::util::is_reparse_point(&fp_meta)
+        {
             continue; // finals (CACHEDIR.TAG …), locks, symlinks — no fingerprints here
         }
         for unit_entry in
@@ -314,7 +317,11 @@ fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
         let entry = entry.ok()?;
         // Only regular files: never read a FIFO/device/symlink planted by a
         // build script (harvest would otherwise hang or copy a secret).
-        if !entry.file_type().ok()?.is_file() {
+        let entry_meta = fs::symlink_metadata(entry.path()).ok()?;
+        if !entry_meta.is_file()
+            || entry_meta.file_type().is_symlink()
+            || crate::util::is_reparse_point(&entry_meta)
+        {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -419,7 +426,9 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
 
     let deps_dir = profile_dir.join("deps");
     let deps_real = fs::symlink_metadata(&deps_dir)
-        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .map(|meta| {
+            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
+        })
         .unwrap_or(false);
     if let Ok(entries) = fs::read_dir(&deps_dir) {
         if !deps_real {
@@ -458,7 +467,11 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
     if unit.kind != UnitKind::Lib {
         for candidate in build_anchor_dirs(build_root, unit) {
             let is_real_dir = fs::symlink_metadata(&candidate)
-                .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                .map(|meta| {
+                    meta.is_dir()
+                        && !meta.file_type().is_symlink()
+                        && !crate::util::is_reparse_point(&meta)
+                })
                 .unwrap_or(false);
             if !is_real_dir {
                 continue;

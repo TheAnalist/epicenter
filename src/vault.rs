@@ -37,12 +37,13 @@ use anyhow::{Context, Result};
 
 use crate::util::{self, FileLock};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::fingerprint::{self, ArtifactInfo, Unit};
 
 /// Seed for the flag digest, versioned: bumping it retires old generations.
-const PARITY_SEED: &str = "epicenter-parity-v2";
+const PARITY_SEED: &str = "epicenter-parity-v3";
 
 // ── toolchain identity ──────────────────────────────────────────────────────
 
@@ -161,7 +162,7 @@ fn flags_digest() -> String {
         input.push_str(&std::env::var(name).unwrap_or_default());
     }
     if let Ok(path) = crate::config::cargo_config_path() {
-        if let Ok(text) = fs::read_to_string(path) {
+        if let Ok(text) = crate::util::read_trusted_config(&path, 1024 * 1024) {
             for key in ["rustflags", "rustdocflags", "target", "rustc-wrapper"] {
                 if let Some(value) = crate::config::read_table_key(&text, "build", key) {
                     input.push('\0');
@@ -217,6 +218,7 @@ fn store_lock_path(store_root: &Path, parity: &str) -> PathBuf {
 }
 
 fn ensure_store_root(store_root: &Path) -> Result<()> {
+    util::ensure_windows_user_path(store_root, "store")?;
     match fs::symlink_metadata(store_root) {
         Ok(meta) => {
             if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -249,6 +251,10 @@ pub struct Manifest {
     /// Unix seconds of the last harvest.
     pub updated: u64,
     pub units: Vec<UnitEntry>,
+    /// HMAC-SHA256 over the manifest body (excluding this field), keyed by
+    /// the per-user vault key. An empty value is old/untrusted and refused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mac: String,
 }
 
 /// One stored unit group.
@@ -307,25 +313,192 @@ impl Manifest {
     }
 }
 
+/// Where the per-user vault MAC key lives. Outside the store on purpose:
+/// a store-write attacker must not be able to rewrite the key as well.
+fn manifest_key_path() -> Result<PathBuf> {
+    let path = crate::paths::cargo_home()?
+        .join("epicenter")
+        .join("manifest.key");
+    #[cfg(windows)]
+    crate::util::ensure_windows_user_path(&path, "vault key")?;
+    Ok(path)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > block.len() {
+        let digest = Sha256::digest(key);
+        block[..32].copy_from_slice(&digest);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    let mut outer = Sha256::new();
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for index in 0..64 {
+        ipad[index] ^= block[index];
+        opad[index] ^= block[index];
+    }
+    inner.update(ipad);
+    inner.update(data);
+    let inner = inner.finalize();
+    outer.update(opad);
+    outer.update(inner);
+    let out = outer.finalize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&out);
+    result
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn read_key_file(path: &Path) -> Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening vault key {}", path.display()))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || util::is_reparse_point(&meta) {
+        anyhow::bail!("vault key {} is not a regular file", path.display());
+    }
+    if !util::owned_by_us(&meta) {
+        anyhow::bail!("vault key {} is owned by another user", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "vault key {} is accessible by other users (mode {:o})",
+                path.display(),
+                meta.mode() & 0o777
+            );
+        }
+    }
+    let mut key = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut key)?;
+    if key.len() != 32 {
+        anyhow::bail!("vault key {} is malformed", path.display());
+    }
+    Ok(key)
+}
+
+fn manifest_key() -> Result<Vec<u8>> {
+    let path = manifest_key_path()?;
+    if let Ok(key) = read_key_file(&path) {
+        return Ok(key);
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent", path.display()))?;
+    util::create_private_dir_all(parent)?;
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|err| anyhow::anyhow!("generating vault key: {err}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(&key)?;
+            file.sync_all()?;
+            Ok(key.to_vec())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => read_key_file(&path),
+        Err(err) => Err(err).with_context(|| format!("creating vault key {}", path.display())),
+    }
+}
+
+fn manifest_mac(manifest: &Manifest) -> Result<String> {
+    let mut unsigned = manifest.clone();
+    unsigned.mac.clear();
+    let body = serde_json::to_vec(&unsigned)?;
+    Ok(hex32(&hmac_sha256(&manifest_key()?, &body)))
+}
+
 fn load_manifest(store_root: &Path, parity: &str) -> Result<Option<Manifest>> {
     let path = manifest_path(store_root, parity);
-    if !path.is_file() {
-        return Ok(None);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", path.display()));
+        }
+    };
+    // The manifest is the list of files that will be executed/linked. Never
+    // parse one that is a symlink, foreign-owned, or group/world-writable.
+    if !meta.is_file() || meta.file_type().is_symlink() || util::is_reparse_point(&meta) {
+        anyhow::bail!("{} is not a regular manifest file", path.display());
     }
-    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    if !util::owned_by_us(&meta) {
+        anyhow::bail!("{} is owned by another user", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o022 != 0 {
+            anyhow::bail!(
+                "{} is group/world-writable (mode {:o})",
+                path.display(),
+                meta.mode() & 0o777
+            );
+        }
+    }
+    let text = crate::util::read_trusted_config(&path, 16 * 1024 * 1024)
+        .with_context(|| format!("reading {}", path.display()))?;
     let manifest: Manifest =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if manifest.mac.len() != 64 {
+        anyhow::bail!(
+            "manifest {} is unsigned (re-harvest this generation)",
+            path.display()
+        );
+    }
+    let expected = manifest_mac(&manifest)?;
+    if !constant_time_eq(manifest.mac.as_bytes(), expected.as_bytes()) {
+        anyhow::bail!("manifest {} failed its MAC check", path.display());
+    }
     manifest
         .validate()
         .with_context(|| format!("validating {}", path.display()))?;
     Ok(Some(manifest))
 }
 
-fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest) -> Result<()> {
+pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest) -> Result<()> {
     util::validate_component(parity, "generation")?;
     let dir = store_root.join(parity);
     util::create_private_dir_all(&dir)?;
-    let what = serde_json::to_string_pretty(manifest)?;
+    let mut signed = manifest.clone();
+    signed.mac.clear();
+    signed.mac = manifest_mac(&signed)?;
+    let what = serde_json::to_string_pretty(&signed)?;
     // O_EXCL + a symlink-free path: never write through a planted temp link.
     let mut tmp = None;
     for attempt in 0..100u32 {
@@ -339,6 +512,11 @@ fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest) -> Result
             .open(&candidate)
         {
             Ok(file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+                }
                 tmp = Some((candidate, file));
                 break;
             }
@@ -403,6 +581,9 @@ pub struct StoredUnit {
 
 /// Every stored unit across all generations, manifest-driven.
 pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
     let mut out = Vec::new();
     for generation in generation_names(store_root)? {
         let Some(manifest) = load_manifest(store_root, &generation)? else {
@@ -424,7 +605,8 @@ pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
 /// The `rustc` identity recorded in a stored unit's Fingerprint JSON.
 pub fn stored_unit_rustc(unit: &StoredUnit) -> Option<String> {
     let dir_meta = fs::symlink_metadata(&unit.dir).ok()?;
-    if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
+    if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() || util::is_reparse_point(&dir_meta)
+    {
         return None;
     }
     let rel = PathBuf::from(format!("{}.json", unit.entry.memo));
@@ -443,11 +625,32 @@ pub fn stored_unit_rustc(unit: &StoredUnit) -> Option<String> {
 /// groups were dropped; groups that could not be removed stay recorded.
 pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Result<usize> {
     util::validate_component(generation, "generation")?;
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
     let _lock = FileLock::acquire(&store_lock_path(store_root, generation))?;
     let Some(mut manifest) = load_manifest(store_root, generation)? else {
         return Ok(0);
     };
     let units = units_dir(store_root, generation);
+    match fs::symlink_metadata(&units) {
+        Ok(meta)
+            if meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && !util::is_reparse_point(&meta) => {}
+        Ok(_) => {
+            anyhow::bail!(
+                "units dir {} is a symlink/reparse or not a directory",
+                units.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing to remove; the manifest may still be pruned.
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", units.display()));
+        }
+    }
     let mut kept = Vec::with_capacity(manifest.units.len());
     let mut dropped = 0;
     for entry in manifest.units.drain(..) {
@@ -458,19 +661,40 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
         util::validate_component(&entry.name, "unit name")?;
         let dir = units.join(&entry.name);
         match fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                eprintln!("could not remove symlinked unit {}: refused", dir.display());
+            Ok(meta) if meta.file_type().is_symlink() || util::is_reparse_point(&meta) => {
+                eprintln!(
+                    "could not remove symlinked/reparse unit {}: refused",
+                    dir.display()
+                );
                 kept.push(entry);
             }
-            Ok(meta) if meta.is_dir() => match fs::remove_dir_all(&dir) {
-                Ok(()) => {
-                    dropped += 1;
+            Ok(meta) if meta.is_dir() => {
+                // Defense in depth even after the component validator: the
+                // target must be a direct child of the units directory.
+                if let Ok(base) = fs::canonicalize(&units) {
+                    match fs::canonicalize(&dir) {
+                        Ok(canon) if canon.parent() == Some(base.as_path()) && canon != base => {}
+                        _ => {
+                            eprintln!(
+                                "could not remove {}: escapes {}",
+                                dir.display(),
+                                units.display()
+                            );
+                            kept.push(entry);
+                            continue;
+                        }
+                    }
                 }
-                Err(err) => {
-                    eprintln!("could not remove {}: {err}", dir.display());
-                    kept.push(entry);
+                match fs::remove_dir_all(&dir) {
+                    Ok(()) => {
+                        dropped += 1;
+                    }
+                    Err(err) => {
+                        eprintln!("could not remove {}: {err}", dir.display());
+                        kept.push(entry);
+                    }
                 }
-            },
+            }
             Ok(_) => {
                 eprintln!("could not remove {}: not a directory", dir.display());
                 kept.push(entry);
@@ -582,6 +806,7 @@ pub fn harvest(
         created: now_secs(),
         updated: 0,
         units: Vec::new(),
+        mac: String::new(),
     });
 
     // ── pass 1: collect the groups to store and their base stamps ──────────
@@ -913,9 +1138,12 @@ fn store_group(
 
     let old = units.join(format!(".{name}.old-{}-{}", std::process::id(), now_secs()));
     match fs::symlink_metadata(&final_dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
+        Ok(meta) if meta.file_type().is_symlink() || util::is_reparse_point(&meta) => {
             let _ = crate::util::force_remove_dir(&tmp);
-            anyhow::bail!("refusing symlinked store unit {}", final_dir.display());
+            anyhow::bail!(
+                "refusing symlinked/reparse store unit {}",
+                final_dir.display()
+            );
         }
         Ok(meta) if meta.is_dir() => fs::rename(&final_dir, &old)?,
         Ok(_) => {
@@ -927,7 +1155,9 @@ fn store_group(
     }
     fs::rename(&tmp, &final_dir)?;
     if fs::symlink_metadata(&old)
-        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .map(|meta| {
+            meta.is_dir() && !meta.file_type().is_symlink() && !util::is_reparse_point(&meta)
+        })
         .unwrap_or(false)
     {
         let _ = fs::remove_dir_all(&old);
@@ -990,7 +1220,7 @@ fn sweep_staging(units: &Path) {
             Err(_) => continue,
         };
         // Unlink a planted symlink itself; never traverse it.
-        if meta.file_type().is_symlink() {
+        if meta.file_type().is_symlink() || util::is_reparse_point(&meta) {
             let _ = fs::remove_file(entry.path());
             continue;
         }
@@ -1061,6 +1291,19 @@ fn now_secs() -> u64 {
 
 fn set_stamp(path: &Path, stamp: u64) -> Result<()> {
     let time = UNIX_EPOCH + Duration::from_secs(stamp);
+    // Unix allows futimens on a read-only fd owned by us; Windows requires a
+    // handle with FILE_WRITE_ATTRIBUTES (GENERIC_READ's set_modified is
+    // denied). A 0444 store file must still be stampable on Windows.
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .access_mode(0x0100) // FILE_WRITE_ATTRIBUTES
+            .open(path)
+            .or_else(|_| fs::OpenOptions::new().write(true).open(path))
+            .with_context(|| format!("opening {} to stamp it", path.display()))?
+    };
+    #[cfg(not(windows))]
     let file =
         fs::File::open(path).with_context(|| format!("opening {} to stamp it", path.display()))?;
     file.set_modified(time)
@@ -1128,6 +1371,92 @@ pub struct RestoreReport {
     pub note: Option<String>,
 }
 
+#[cfg(unix)]
+enum RestoreOutcome {
+    Existing,
+    Missing,
+    Linked,
+    Copied,
+}
+
+/// fd-relative restore on Unix: destination parents are opened with
+/// openat(O_NOFOLLOW), the source inode is opened once, and the final name is
+/// installed with linkat. No path component can be swapped for a symlink
+/// after the check.
+#[cfg(unix)]
+fn restore_file_at(
+    view_root: &Path,
+    dest_rel: &Path,
+    src: &Path,
+    stamp: u64,
+    file: &FileEntry,
+    shared: bool,
+) -> Result<RestoreOutcome> {
+    let parent_rel = dest_rel.parent().unwrap_or_else(|| Path::new(""));
+    let dst_name = dest_rel
+        .file_name()
+        .with_context(|| format!("destination {} has no file name", dest_rel.display()))?;
+    let parent = util::open_dir_chain_at(view_root, parent_rel)?;
+    if parent.exists(dst_name)? {
+        return Ok(RestoreOutcome::Existing);
+    }
+    let mut source = match util::open_file_nofollow(src) {
+        Ok(file) => file,
+        Err(err)
+            if err
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(RestoreOutcome::Missing);
+        }
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(RestoreOutcome::Missing);
+        }
+        Err(err) => return Err(err),
+    };
+    let meta = source.metadata()?;
+    if !meta.is_file() || !util::owned_by_us(&meta) {
+        anyhow::bail!("stored file {} is not a regular owned file", src.display());
+    }
+    if meta.len() != file.size {
+        anyhow::bail!(
+            "stored file {} size drift (recorded {}, found {})",
+            src.display(),
+            file.size,
+            meta.len()
+        );
+    }
+    if shared {
+        if file.sha256.is_empty() {
+            anyhow::bail!("{} has no recorded SHA-256", src.display());
+        }
+        let found = util::sha256_file_fd(&mut source)?;
+        if found != file.sha256 {
+            anyhow::bail!("{} failed its SHA-256 check", src.display());
+        }
+        parent.link_path(src, dst_name)?;
+        Ok(RestoreOutcome::Linked)
+    } else {
+        // Write the private copy directly at the final name with O_EXCL. The
+        // destination name is created once, at the held parent fd; on any
+        // integrity/stamp failure the partial file is removed. No temp-path
+        // lookup is needed, which keeps this portable on non-Linux Unix.
+        let mut tmp = parent.create_excl(dst_name, 0o600)?;
+        let result = util::copy_fd_verified(&mut source, &mut tmp, file.size, &file.sha256)
+            .and_then(|_| util::set_stamp_fd(&tmp, stamp).map_err(anyhow::Error::from));
+        if let Err(err) = result {
+            let _ = parent.unlink(dst_name);
+            return Err(err);
+        }
+        Ok(RestoreOutcome::Copied)
+    }
+}
+
 /// Link matching unit groups from the vault into a working dir.
 ///
 /// `deps/` link outputs (`.rlib`, proc-macro `.so`) are hard-linked — rustc
@@ -1150,6 +1479,11 @@ pub fn restore(
         target: view_root.to_path_buf(),
         ..Default::default()
     };
+    // Verify store ownership/mode before parsing its manifest. A fresh store
+    // is allowed to be absent (cold start); a present-but-unsafe one is not.
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
     let Some(manifest) = load_manifest(store_root, &parity)? else {
         report.note = Some(
             "the vault holds no units for this generation yet — run `epicenter harvest` after a build"
@@ -1157,7 +1491,6 @@ pub fn restore(
         );
         return Ok(report);
     };
-    check_store_trust(store_root)?;
     if !dry_run {
         prepare_view_root(view_root)?;
     }
@@ -1189,10 +1522,13 @@ pub fn restore(
             let dst = view_root.join(&dest_rel);
             match fs::symlink_metadata(&dst) {
                 Ok(meta) => {
-                    if meta.file_type().is_symlink() {
+                    if meta.file_type().is_symlink() || util::is_reparse_point(&meta) {
                         report.errors += 1;
                         report.fatal_errors += 1;
-                        eprintln!("restore: refusing symlink destination {}", dst.display());
+                        eprintln!(
+                            "restore: refusing symlink/reparse destination {}",
+                            dst.display()
+                        );
                     } else {
                         report.files_existing += 1;
                     }
@@ -1220,52 +1556,88 @@ pub fn restore(
                 report.bytes += file.size;
                 continue;
             }
-            if let Some(parent) = dest_rel.parent() {
-                if let Err(err) = util::create_dir_chain_nofollow(view_root, parent) {
-                    report.errors += 1;
-                    eprintln!("restore: creating {}: {err}", parent.display());
-                    continue;
-                }
-            }
             let src = units.join(&entry.name).join(&file.path);
             let rel = Path::new(&entry.name).join(&file.path);
-            match fs::symlink_metadata(&src) {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    // Fail-open: a partial vault means Cargo rebuilds it.
-                    report.files_missing += 1;
-                    continue;
-                }
-                Err(err) => {
-                    report.errors += 1;
-                    report.fatal_errors += 1;
-                    eprintln!("restore: inspecting {}: {err}", src.display());
-                    continue;
-                }
-            }
-            let result = if shared {
-                util::check_regular_chain(&units, &rel)
-                    .and_then(|_| verify_store_file(&src, file))
-                    .and_then(|_| fs::hard_link(&src, &dst).map_err(Into::into))
-            } else {
-                util::check_regular_chain(&units, &rel)
-                    .and_then(|_| install_private_copy(&src, &dst, entry.stamp, file))
-            };
-            match result {
-                Ok(()) => {
-                    if shared {
-                        report.files_linked += 1;
-                    } else {
-                        report.files_copied += 1;
-                    }
-                    report.bytes += file.size;
-                    unit_touched = true;
-                }
-                Err(err) => {
+            #[cfg(unix)]
+            {
+                if let Err(err) = util::check_regular_chain(&units, &rel) {
                     report.errors += 1;
                     report.fatal_errors += 1;
                     eprintln!("restore: writing {}: {err:#}", dst.display());
                     continue;
+                }
+                match restore_file_at(view_root, &dest_rel, &src, entry.stamp, file, shared) {
+                    Ok(RestoreOutcome::Existing) => {
+                        report.files_existing += 1;
+                    }
+                    Ok(RestoreOutcome::Missing) => {
+                        report.files_missing += 1;
+                    }
+                    Ok(RestoreOutcome::Linked) => {
+                        report.files_linked += 1;
+                        report.bytes += file.size;
+                        unit_touched = true;
+                    }
+                    Ok(RestoreOutcome::Copied) => {
+                        report.files_copied += 1;
+                        report.bytes += file.size;
+                        unit_touched = true;
+                    }
+                    Err(err) => {
+                        report.errors += 1;
+                        report.fatal_errors += 1;
+                        eprintln!("restore: writing {}: {err:#}", dst.display());
+                    }
+                }
+                continue;
+            }
+            #[cfg(not(unix))]
+            {
+                if let Some(parent) = dest_rel.parent() {
+                    if let Err(err) = util::create_dir_chain_nofollow(view_root, parent) {
+                        report.errors += 1;
+                        report.fatal_errors += 1;
+                        eprintln!("restore: creating {}: {err}", parent.display());
+                        continue;
+                    }
+                }
+                match fs::symlink_metadata(&src) {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Fail-open: a partial vault means Cargo rebuilds it.
+                        report.files_missing += 1;
+                        continue;
+                    }
+                    Err(err) => {
+                        report.errors += 1;
+                        report.fatal_errors += 1;
+                        eprintln!("restore: inspecting {}: {err}", src.display());
+                        continue;
+                    }
+                }
+                let result = if shared {
+                    util::check_regular_chain(&units, &rel)
+                        .and_then(|_| verify_store_file(&src, file))
+                        .and_then(|_| fs::hard_link(&src, &dst).map_err(Into::into))
+                } else {
+                    util::check_regular_chain(&units, &rel)
+                        .and_then(|_| install_private_copy(&src, &dst, entry.stamp, file))
+                };
+                match result {
+                    Ok(()) => {
+                        if shared {
+                            report.files_linked += 1;
+                        } else {
+                            report.files_copied += 1;
+                        }
+                        report.bytes += file.size;
+                        unit_touched = true;
+                    }
+                    Err(err) => {
+                        report.errors += 1;
+                        report.fatal_errors += 1;
+                        eprintln!("restore: writing {}: {err:#}", dst.display());
+                    }
                 }
             }
         }
@@ -1280,9 +1652,10 @@ pub fn restore(
 /// group/world-writable store. A root process must not consume a user-owned
 /// vault (that is the hard-link privesc this fix closes).
 fn check_store_trust(store_root: &Path) -> Result<()> {
+    util::ensure_windows_user_path(store_root, "store")?;
     let meta = fs::symlink_metadata(store_root)
         .with_context(|| format!("inspecting store {}", store_root.display()))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
+    if !meta.is_dir() || meta.file_type().is_symlink() || util::is_reparse_point(&meta) {
         anyhow::bail!("store {} is not a real directory", store_root.display());
     }
     if !util::owned_by_us(&meta) {
@@ -1301,7 +1674,7 @@ fn check_store_trust(store_root: &Path) -> Result<()> {
 fn prepare_view_root(view_root: &Path) -> Result<()> {
     match fs::symlink_metadata(view_root) {
         Ok(meta) => {
-            if !meta.is_dir() || meta.file_type().is_symlink() {
+            if !meta.is_dir() || meta.file_type().is_symlink() || util::is_reparse_point(&meta) {
                 anyhow::bail!("view {} is not a real directory", view_root.display());
             }
             if !util::owned_by_us(&meta) {
@@ -1309,6 +1682,17 @@ fn prepare_view_root(view_root: &Path) -> Result<()> {
                     "view {} is owned by another user — refusing to write into it",
                     view_root.display()
                 );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.mode() & 0o022 != 0 {
+                    anyhow::bail!(
+                        "view {} is group/world-writable (mode {:o}) — refusing a shared restore target; use a 0700 dir",
+                        view_root.display(),
+                        meta.mode() & 0o777
+                    );
+                }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1318,13 +1702,20 @@ fn prepare_view_root(view_root: &Path) -> Result<()> {
             return Err(err).with_context(|| format!("inspecting view {}", view_root.display()));
         }
     }
+    // Do NOT chmod an explicitly supplied view root here: `restore --into /`
+    // or `--into ~` must never change the mode of a system/home directory.
+    // New view roots are created 0700; the default cache root is repaired by
+    // `cmd_restore` (which knows it is the shared cache), and per-job work
+    // dirs are created 0700 by `exec`.
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn verify_store_file(src: &Path, file: &FileEntry) -> Result<()> {
     let meta = fs::symlink_metadata(src)
         .with_context(|| format!("inspecting stored file {}", src.display()))?;
-    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() || util::is_reparse_point(&meta)
+    {
         anyhow::bail!("{} is not a regular file", src.display());
     }
     if !util::owned_by_us(&meta) {
@@ -1348,6 +1739,7 @@ fn verify_store_file(src: &Path, file: &FileEntry) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn install_private_copy(src: &Path, dst: &Path, stamp: u64, file: &FileEntry) -> Result<()> {
     let parent = dst
         .parent()
@@ -1371,12 +1763,7 @@ fn install_private_copy(src: &Path, dst: &Path, stamp: u64, file: &FileEntry) ->
 
 /// Read a small regular file without following a symlink.
 fn read_small_regular(path: &Path) -> Option<String> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.file_type().is_symlink() || meta.len() > 4 * 1024 * 1024
-    {
-        return None;
-    }
-    fs::read_to_string(path).ok()
+    util::read_small_text(path, 4 * 1024 * 1024).ok()
 }
 
 // ── verify ──────────────────────────────────────────────────────────────────
@@ -1449,9 +1836,9 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                         continue;
                     }
                 };
-                if meta.file_type().is_symlink() {
+                if meta.file_type().is_symlink() || util::is_reparse_point(&meta) {
                     report.problems.push(format!(
-                        "symlink in store (refused): {}",
+                        "symlink/reparse in store (refused): {}",
                         display_join(&path, &units)
                     ));
                     continue;
@@ -1541,6 +1928,42 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                 }
             }
         }
+        // Reject extra files in recorded unit dirs too: a manifest hash
+        // list is only meaningful if the set of files is exact.
+        for entry in &manifest.units {
+            let unit_dir = units.join(&entry.name);
+            let expected: std::collections::BTreeSet<String> =
+                entry.files.iter().map(|file| file.path.clone()).collect();
+            let walk = match WalkDir::new(&unit_dir)
+                .min_depth(1)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(walk) => walk,
+                Err(err) => {
+                    report
+                        .problems
+                        .push(format!("unreadable unit dir: units/{} ({err})", entry.name));
+                    continue;
+                }
+            };
+            for file in walk {
+                if !file.file_type().is_file() {
+                    continue;
+                }
+                let rel = file
+                    .path()
+                    .strip_prefix(&unit_dir)
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                if !expected.contains(&rel) {
+                    report
+                        .problems
+                        .push(format!("unrecorded file: units/{}/{}", entry.name, rel));
+                }
+            }
+        }
+
         // Ordering audit: a unit must be at least as new as its
         // dependencies, or cargo recompiles it after a restore ("the
         // dependency `X` was rebuilt"). Edges come from the stored
@@ -1583,6 +2006,23 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
         report.units = manifest.units.len();
 
         // Unit groups on disk that the manifest doesn't record.
+        match fs::symlink_metadata(&units) {
+            Ok(meta)
+                if meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && !util::is_reparse_point(&meta) => {}
+            Ok(_) => {
+                report.problems.push(format!(
+                    "units directory {} is a symlink/reparse or not a directory",
+                    units.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => report.problems.push(format!(
+                "unreadable units directory {}: {err}",
+                units.display()
+            )),
+        }
         if units.is_dir() {
             let known: std::collections::BTreeSet<&str> = manifest
                 .units
@@ -1599,8 +2039,12 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                     continue; // in-flight temp dirs of a crashed harvest
                 }
                 if !known.contains(name.as_str()) {
+                    // An unrecorded group can be an orphan from a lost
+                    // harvest or an injected file set. Treat it as a problem,
+                    // not a cosmetic warning: `verify` must fail before a
+                    // consumer trusts the generation.
                     report
-                        .warnings
+                        .problems
                         .push(format!("unrecorded unit group: units/{name}"));
                 }
             }
@@ -2079,12 +2523,13 @@ mod tests {
         let reports = verify(store.path())?;
         assert!(
             reports[0]
-                .warnings
+                .problems
                 .iter()
                 .any(|line| line.contains("stray-0000000000000000")),
             "{:?}",
-            reports[0].warnings
+            reports[0].problems
         );
+        assert!(!reports[0].is_clean());
         Ok(())
     }
 
@@ -2485,6 +2930,7 @@ mod tests {
             created: 1,
             updated: 1,
             units: vec![],
+            mac: String::new(),
         };
         for unit in [
             unit("../escape", "debug", "deps/x", "deps/x"),
@@ -2492,6 +2938,9 @@ mod tests {
             unit("ok", "debug", "/etc/passwd", "deps/x"),
             unit("ok", "debug", "deps/x", "/root/.ssh/authorized_keys"),
             unit("ok", "debug", "deps/../../x", "deps/x"),
+            unit(".. ", "debug", "deps/x", "deps/x"),
+            unit("...", "debug", "deps/x", "deps/x"),
+            unit("CON.txt", "debug", "deps/x", "deps/x"),
         ] {
             let manifest = Manifest {
                 units: vec![unit],
@@ -2542,7 +2991,10 @@ mod tests {
         }
         fs::write(&path, &bytes)?;
         let stamp = UNIX_EPOCH + Duration::from_secs(entry.stamp);
-        fs::File::open(&path)?.set_modified(stamp)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(stamp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

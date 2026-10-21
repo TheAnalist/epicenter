@@ -50,6 +50,20 @@ pub fn cargo_home() -> Result<PathBuf> {
     Ok(home()?.join(".cargo"))
 }
 
+/// The `[build] build-dir` value from the **global**
+/// `$CARGO_HOME/config.toml`. This is the only trusted source for epicenter
+/// state. A relative config path, or a symlinked `config.toml`, is refused.
+pub fn cargo_build_dir() -> Result<Option<String>> {
+    let config_path = crate::config::cargo_config_path()?;
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let text = crate::util::read_trusted_config(&config_path, 1024 * 1024)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    Ok(crate::config::read_table_key(&text, "build", "build-dir")
+        .filter(|value| !value.trim().is_empty()))
+}
+
 /// epicenter's (former) own directory — only kept for the doctor's
 /// legacy-file advisory; the shared-cache decision lives in
 /// `~/.cargo/config.toml` now.

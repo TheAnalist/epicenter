@@ -11,58 +11,20 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::{self, DEFAULT_BUILD_DIR};
 
-/// The effective shared-cache root. This is the **global** trust anchor
-/// (`$CARGO_HOME/config.toml`, or the canonical default); project configs are
-/// read only to detect and refuse a shadowing `build-dir`. `cargo metadata`
-/// is deliberately not executed (it would trust/execute project config).
+/// The effective shared-cache root: **only** the global
+/// `$CARGO_HOME/config.toml` (or the canonical default). Project configs are
+/// never consulted for state; `cargo metadata` is deliberately not executed.
 pub fn cache_root() -> Result<PathBuf> {
-    // Security: never ask `cargo metadata` in the current directory. In a
-    // repository, project `.cargo/config.toml` (including `build.rustc`)
-    // is attacker-controlled and would both redirect the vault and execute
-    // code during resolution. The global `$CARGO_HOME/config.toml` is the
-    // only trust anchor.
-    let trusted = trusted_cache_root()?;
-    if let Some((path, value)) = project_build_dir_override()? {
-        let global =
-            cargo_configured("build-dir")?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
-        if value != global {
-            anyhow::bail!(
-                "refusing a project-controlled cache root: {} sets build-dir = {:?}, but the trusted global build-dir is {:?}. Move the decision to $CARGO_HOME/config.toml; epicenter never uses a project-controlled vault.",
-                path.display(),
-                value,
-                global
-            );
-        }
-    }
-    Ok(trusted)
-}
-
-/// The effective project config is the deepest ancestor `.cargo/config*`.
-/// Read it as text (never execute it); a differing `build-dir` is refused.
-fn project_build_dir_override() -> Result<Option<(PathBuf, String)>> {
-    let global = cargo_config_path().ok();
-    let cwd = std::env::current_dir().context("resolving the current directory")?;
-    for dir in cwd.ancestors() {
-        for name in ["config.toml", "config"] {
-            let candidate = dir.join(".cargo").join(name);
-            if global.as_ref() == Some(&candidate) || !candidate.is_file() {
-                continue;
-            }
-            let Ok(text) = crate::util::read_small_text_follow(&candidate, 1024 * 1024) else {
-                continue;
-            };
-            if let Some(value) = read_build_key(&text, "build-dir") {
-                return Ok(Some((candidate, value)));
-            }
-        }
-    }
-    Ok(None)
+    let root = trusted_cache_root()?;
+    crate::util::ensure_windows_user_path(&root, "cache root")?;
+    Ok(root)
 }
 
 /// The trusted root: the global `$CARGO_HOME/config.toml` `build-dir` value,
-/// or the canonical default template. Never reads a project config.
+/// or the canonical default template. Never reads a project config and never
+/// executes `cargo metadata`.
 pub fn trusted_cache_root() -> Result<PathBuf> {
-    let value = cargo_configured("build-dir")?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
+    let value = paths::cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
     paths::resolve_template(&value)
 }
 
@@ -78,7 +40,88 @@ fn validate_config_value(value: &str, what: &str) -> Result<()> {
 /// Cargo's *global* config file: `$CARGO_HOME/config.toml`.
 /// Settings there apply to every project on the machine.
 pub fn cargo_config_path() -> Result<PathBuf> {
-    Ok(paths::cargo_home()?.join("config.toml"))
+    let cargo_home = paths::cargo_home()?;
+    if cargo_home.is_relative() {
+        anyhow::bail!(
+            "CARGO_HOME is relative ({}) — set an absolute CARGO_HOME",
+            cargo_home.display()
+        );
+    }
+    // The config file is only as trustworthy as its directory: a
+    // group/world-writable $CARGO_HOME lets another user swap the file after
+    // any path-only check. Check the directory, then the file; the actual
+    // read uses fstat on the opened descriptor (util::read_trusted_config).
+    match fs::symlink_metadata(&cargo_home) {
+        Ok(meta) => {
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "CARGO_HOME {} is a symlink or not a directory",
+                    cargo_home.display()
+                );
+            }
+            if !crate::util::owned_by_us(&meta) {
+                anyhow::bail!(
+                    "CARGO_HOME {} is owned by another user",
+                    cargo_home.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.mode() & 0o022 != 0 {
+                    anyhow::bail!(
+                        "CARGO_HOME {} is group/world-writable (mode {:o})",
+                        cargo_home.display(),
+                        meta.mode() & 0o777
+                    );
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", cargo_home.display()));
+        }
+    }
+    let path = cargo_home.join("config.toml");
+    if path.is_relative() {
+        anyhow::bail!(
+            "global cargo config path is relative ({}) — set an absolute CARGO_HOME",
+            path.display()
+        );
+    }
+    crate::util::ensure_windows_user_path(&path, "global cargo config")?;
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                anyhow::bail!(
+                    "global cargo config {} is a symlink or not a regular file",
+                    path.display()
+                );
+            }
+            if !crate::util::owned_by_us(&meta) {
+                anyhow::bail!(
+                    "global cargo config {} is owned by another user",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.mode() & 0o022 != 0 {
+                    anyhow::bail!(
+                        "global cargo config {} is group/world-writable (mode {:o})",
+                        path.display(),
+                        meta.mode() & 0o777
+                    );
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", path.display()));
+        }
+    }
+    Ok(path)
 }
 
 /// What an edit to Cargo's config changed.
@@ -225,12 +268,22 @@ fn strip_toml_comment(value: &str) -> &str {
 /// comment is stripped and surrounding quotes are removed.
 pub fn read_table_key(text: &str, table: &str, key: &str) -> Option<String> {
     let header = format!("[{table}]");
+    let dotted = format!("{table}.{key}");
     let mut in_table = false;
+    let mut at_root = true;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            at_root = false;
             in_table = trimmed.replace([' ', '\t'], "") == header;
             continue;
+        }
+        let candidate = trimmed.split_once('=').map(|(k, _)| k.trim());
+        // TOML allows `build.build-dir = ...` at the document root.
+        if at_root && candidate == Some(dotted.as_str()) {
+            if let Some((_, value)) = trimmed.split_once('=') {
+                return Some(clean_toml_value(value));
+            }
         }
         if !in_table {
             continue;
@@ -239,16 +292,20 @@ pub fn read_table_key(text: &str, table: &str, key: &str) -> Option<String> {
             if candidate.trim() != key {
                 continue;
             }
-            let value = strip_toml_comment(value).trim();
-            let value = value
-                .strip_prefix('\'')
-                .and_then(|v| v.strip_suffix('\''))
-                .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
-                .unwrap_or(value);
-            return Some(value.trim().to_string());
+            return Some(clean_toml_value(value));
         }
     }
     None
+}
+
+fn clean_toml_value(value: &str) -> String {
+    let value = strip_toml_comment(value).trim();
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+        .unwrap_or(value);
+    value.trim().to_string()
 }
 
 /// Look up a key in any table of Cargo's *global* config file.
@@ -257,7 +314,7 @@ pub fn cargo_configured_in(table: &str, key: &str) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = crate::util::read_small_text_follow(&path, 1024 * 1024)?;
+    let text = crate::util::read_trusted_config(&path, 1024 * 1024)?;
     Ok(read_table_key(&text, table, key))
 }
 
@@ -267,14 +324,14 @@ pub fn cargo_configured(key: &str) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = crate::util::read_small_text_follow(&path, 1024 * 1024)?;
+    let text = crate::util::read_trusted_config(&path, 1024 * 1024)?;
     Ok(read_build_key(&text, key))
 }
 
 /// Read a `[build]` key from ANY cargo config file — doctor uses this to scan
 /// the ancestor `.cargo/config.toml` chain for shadowing values. Read-only.
 pub fn read_build_table_key(path: &Path, key: &str) -> Option<String> {
-    let text = crate::util::read_small_text_follow(path, 1024 * 1024).ok()?;
+    let text = crate::util::read_small_text(path, 1024 * 1024).ok()?;
     read_build_key(&text, key)
 }
 
@@ -337,7 +394,7 @@ pub fn setup(
     } else if use_default {
         DEFAULT_BUILD_DIR.to_string()
     } else {
-        cargo_configured("build-dir")?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
+        paths::cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
     };
 
     validate_config_value(&build_dir_value, "build-dir")?;
@@ -347,6 +404,7 @@ pub fn setup(
 
     // The filesystem view must always be RESOLVED (a template is not a path).
     let root = paths::resolve_template(&build_dir_value)?;
+    crate::util::ensure_windows_user_path(&root, "cache root")?;
     crate::util::create_private_dir_all(&root)
         .with_context(|| format!("creating cache dir {}", root.display()))?;
 
@@ -354,7 +412,8 @@ pub fn setup(
     let cargo_cfg = cargo_config_path()?;
     let (build_dir_edit, wrapper_edit, backup) = if !cargo_cfg.exists() {
         if let Some(parent) = cargo_cfg.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            crate::util::create_private_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut text = format!("[build]\nbuild-dir = '{build_dir_value}'\n");
         let wrapper_edit = if let Some(name) = with_wrapper {
@@ -363,10 +422,10 @@ pub fn setup(
         } else {
             None
         };
-        fs::write(&cargo_cfg, text)?;
+        crate::util::write_atomic_private(&cargo_cfg, text.as_bytes())?;
         (CargoEdit::Created, wrapper_edit, None)
     } else {
-        let text = crate::util::read_small_text_follow(&cargo_cfg, 1024 * 1024)
+        let text = crate::util::read_trusted_config(&cargo_cfg, 1024 * 1024)
             .with_context(|| format!("reading {}", cargo_cfg.display()))?;
         let (text, build_dir_edit) = set_build_key(&text, "build-dir", &build_dir_value);
         let (text, wrapper_edit) = match with_wrapper {
@@ -387,8 +446,7 @@ pub fn setup(
                 .is_some_and(|e| *e != CargoEdit::AlreadySet);
         if changed {
             backup = Some(backup_file(&cargo_cfg)?);
-            fs::write(&cargo_cfg, text)
-                .with_context(|| format!("writing {}", cargo_cfg.display()))?;
+            crate::util::write_atomic_private(&cargo_cfg, text.as_bytes())?;
         }
         (build_dir_edit, wrapper_edit, backup)
     };
@@ -416,9 +474,9 @@ fn backup_file(path: &Path) -> Result<PathBuf> {
         name.push(format!(".{suffix}"));
         backup = base.with_file_name(name);
     }
-    // Follow a user's dotfile symlink deliberately, but create the backup
-    // itself with O_EXCL (never write through a planted backup symlink).
-    let source = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Create the backup with O_EXCL; the source is opened O_NOFOLLOW by
+    // copy_file_hashed so a swapped symlink cannot redirect the copy.
+    let source = path.to_path_buf();
     crate::util::copy_file_hashed(&source, &backup)
         .with_context(|| format!("backing up {}", path.display()))?;
     if let Ok(meta) = fs::metadata(&source) {
@@ -570,6 +628,14 @@ mod tests {
     }
 
     #[test]
+    fn dotted_build_dir_is_detected() {
+        assert_eq!(
+            read_build_key("build.build-dir = '/tmp/dotted'\n", "build-dir"),
+            Some("/tmp/dotted".to_string())
+        );
+    }
+
+    #[test]
     fn comments_inside_quoted_values_are_preserved() {
         assert_eq!(
             read_build_key("[build]\nbuild-dir = '/tmp/a#b' # tail\n", "build-dir"),
@@ -584,10 +650,15 @@ mod tests {
             normalize_root_input("{cargo-cache-home}/custom").unwrap(),
             PathBuf::from("{cargo-cache-home}/custom"),
         );
-        // Absolute stays absolute.
+        // Absolute stays absolute (use a host-absolute path).
+        let absolute = if cfg!(windows) {
+            r"C:\cache"
+        } else {
+            "/tmp/cache"
+        };
         assert_eq!(
-            normalize_root_input("/tmp/cache").unwrap(),
-            PathBuf::from("/tmp/cache"),
+            normalize_root_input(absolute).unwrap(),
+            PathBuf::from(absolute),
         );
         // `~` expands to the home directory.
         let home = paths::home().unwrap();

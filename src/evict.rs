@@ -78,6 +78,8 @@ pub const DEFAULT_WORK_MAX_AGE: &str = "7d";
 
 /// `epicenter evict [unit] [--stale|--rustc-key|--husks|--older-than|--work-dirs|--work <view>] [--tier <t>] [--force] [--yes]`
 pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
+    #[cfg(windows)]
+    crate::util::ensure_windows_user_path(&crate::exec::work_root(build_root), "work root")?;
     // An empty selector is a wildcard (`contains("")`) — never delete by it.
     for (name, value) in [
         ("--unit", opts.unit),
@@ -235,6 +237,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                     candidate,
                     Place::View {
                         label: label.clone(),
+                        root: root.clone(),
                         unit_dir: root
                             .join(&unit.profile)
                             .join(".fingerprint")
@@ -384,12 +387,43 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
         for place in &candidate.places {
             if let Place::View {
                 label,
+                root,
                 unit_dir,
                 anchors,
                 artifacts,
                 ..
             } = place
             {
+                // The scan happened earlier; a build may have started since.
+                // Re-check the live lock and take the per-job epicenter lock.
+                let _job_lock = match label.strip_prefix("work/") {
+                    Some(name) => match crate::util::FileLock::try_acquire(
+                        &crate::exec::job_lock_path(
+                            &crate::exec::work_root(&crate::vault::store_root(
+                                &crate::config::trusted_cache_root()?,
+                            )),
+                            name,
+                        ),
+                    ) {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => {
+                            errors += 1;
+                            eprintln!("view {label} is in use by an epicenter process — skipped");
+                            continue;
+                        }
+                        Err(err) => {
+                            errors += 1;
+                            eprintln!("view {label} lock failed: {err:#} — skipped");
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                if crate::exec::dir_locked(root) {
+                    errors += 1;
+                    eprintln!("view {label} is in use by a live build — skipped");
+                    continue;
+                }
                 remove_dir(unit_dir, &mut errors);
                 for anchor in anchors {
                     if anchor.is_dir() {
@@ -491,12 +525,15 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
                 path.display()
             ),
         };
-    if crate::exec::dir_locked(&path) {
+    // Hold Cargo's own lock files through the rename/delete. A boolean check
+    // here would release the locks immediately and let a build start in the
+    // window before `rename`.
+    let Some(_cargo_locks) = crate::exec::cargo_locks(&path)? else {
         bail!(
             "job dir {} is in use by a live build — remove it when it finishes",
             path.display()
         );
-    }
+    };
     let newest = dir_newest(&path);
     let (bytes, unique, shared, files) = dir_accounting(&path);
 
@@ -582,7 +619,11 @@ fn resolve_work_dir(work_root: &Path, target: &str) -> Result<PathBuf> {
     } else {
         PathBuf::from(target)
     };
-    if !candidate.is_dir() {
+    let candidate_meta = fs::symlink_metadata(&candidate)?;
+    if !candidate_meta.is_dir()
+        || candidate_meta.file_type().is_symlink()
+        || crate::util::is_reparse_point(&candidate_meta)
+    {
         bail!("no job dir named {target:?} — `epicenter vault` shows the work tier");
     }
     let inside = candidate
@@ -647,6 +688,12 @@ fn evict_work_dirs(
             continue;
         }
         let path = entry.path();
+        if fs::symlink_metadata(&path)
+            .map(|meta| crate::util::is_reparse_point(&meta))
+            .unwrap_or(true)
+        {
+            continue;
+        }
         let newest = dir_newest(&path);
         let locked = crate::exec::dir_locked(&path);
         let (bytes, unique, shared, files) = dir_accounting(&path);
@@ -762,10 +809,10 @@ fn evict_work_dirs(
                 continue;
             }
         };
-        if crate::exec::dir_locked(&row.path) {
+        let Some(_cargo_locks) = crate::exec::cargo_locks(&row.path)? else {
             report.in_use += 1;
             continue;
-        }
+        };
         match fs::remove_dir_all(&row.path) {
             Ok(()) => {
                 report.removed += 1;
@@ -847,16 +894,32 @@ fn resolve_view(build_root: &Path, work: &str) -> Result<PathBuf> {
         return Ok(build_root.to_path_buf());
     }
     let work_root = crate::exec::work_root(build_root);
-    let job = work_root.join(work.trim_start_matches("work/"));
-    if fs::symlink_metadata(&job)
-        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Ok(job);
+    // Only a plain job id (or `work/<id>`) may use the join shortcut. An
+    // absolute path or `../x` would replace the base in `Path::join` and
+    // bypass the containment check below.
+    let job_id = work.strip_prefix("work/").unwrap_or(work);
+    if crate::util::validate_component(job_id, "job id").is_ok() {
+        let job = work_root.join(job_id);
+        if let Ok(meta) = fs::symlink_metadata(&job) {
+            if meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && !crate::util::is_reparse_point(&meta)
+            {
+                // Apply containment to the join shortcut too: a junction
+                // inside work/ must not point outside the work root.
+                if let (Ok(root), Ok(canon)) = (work_root.canonicalize(), job.canonicalize()) {
+                    if canon != root && canon.starts_with(&root) {
+                        return Ok(job);
+                    }
+                }
+            }
+        }
     }
     let path = PathBuf::from(work);
     if fs::symlink_metadata(&path)
-        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .map(|meta| {
+            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
+        })
         .unwrap_or(false)
     {
         let canonical = path.canonicalize()?;
@@ -1015,6 +1078,7 @@ enum Place {
     },
     View {
         label: String,
+        root: PathBuf,
         unit_dir: PathBuf,
         anchors: Vec<PathBuf>,
         artifacts: Vec<PathBuf>,
@@ -1086,6 +1150,12 @@ fn known_views(build_root: &Path) -> Vec<(String, PathBuf)> {
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
+                continue;
+            }
+            if fs::symlink_metadata(entry.path())
+                .map(|meta| crate::util::is_reparse_point(&meta))
+                .unwrap_or(true)
+            {
                 continue;
             }
             views.push((format!("work/{name}"), entry.path()));
@@ -1197,12 +1267,13 @@ fn view_list(views: &[String]) -> String {
 /// what was merely released (units the vault still holds).
 fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<()> {
     let root = resolve_view(build_root, work)?;
-    if crate::exec::dir_locked(&root) {
+    // Hold the lock descriptors for the entire unlink operation.
+    let Some(_cargo_locks) = crate::exec::cargo_locks(&root)? else {
         bail!(
             "view {} is in use by a live build — unlink when it finishes",
             root.display()
         );
-    }
+    };
     let vaulted: std::collections::BTreeSet<String> =
         crate::vault::stored_units(&crate::vault::store_root(build_root))?
             .into_iter()
@@ -1281,6 +1352,12 @@ fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<
     }
 
     let mut errors = 0u64;
+    if crate::exec::dir_locked(&root) {
+        bail!(
+            "view {} became busy — refusing to unlink from a live build",
+            root.display()
+        );
+    }
     for (unit, arts) in &chosen {
         remove_view_unit(&root, unit, arts, &mut errors);
     }
@@ -1370,6 +1447,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_view_rejects_paths_outside_the_cache() -> Result<()> {
+        let home = tier_home()?;
+        let build = home.path().join("build");
+        let job = home.path().join("work/ci-1");
+        fs::create_dir_all(&job)?;
+        assert_eq!(resolve_view(&build, "ci-1")?, job);
+        let outside = tempfile::tempdir()?;
+        assert!(resolve_view(&build, outside.path().to_str().unwrap()).is_err());
+        assert!(resolve_view(&build, "../escape").is_err());
+        assert!(resolve_view(&build, "/tmp/escape").is_err());
+        assert!(resolve_view(&build, ".. ").is_err());
+        assert!(resolve_view(&build, "CON.txt").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn requires_at_least_one_selector() -> Result<()> {
         let (_home, build) = synthetic_home()?;
         assert!(run(&build, &no_selectors()).is_err());
@@ -1436,7 +1529,10 @@ mod tests {
         fs::write(&artifact, [0u8; 64])?;
         if age_days > 0 {
             let when = SystemTime::now() - Duration::from_secs(age_days * 86_400);
-            fs::File::open(&artifact)?.set_modified(when)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)?
+                .set_modified(when)?;
         }
         Ok(home.join("work").join(name))
     }
@@ -1472,7 +1568,10 @@ mod tests {
         fs::write(&lock_path, b"")?;
         // The lock file was also written a month ago, so age alone would collect it.
         let when = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        fs::File::open(&lock_path)?.set_modified(when)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)?
+            .set_modified(when)?;
 
         let held = fs::OpenOptions::new().write(true).open(&lock_path)?;
         held.try_lock().context("test holds the lock")?;
@@ -1513,8 +1612,14 @@ mod tests {
         // One artifact also lives in the store → its bytes are not freed here.
         fs::hard_link(&shared, home.path().join("store-copy.rlib"))?;
         let when = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        fs::File::open(&unique)?.set_modified(when)?;
-        fs::File::open(&shared)?.set_modified(when)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&unique)?
+            .set_modified(when)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&shared)?
+            .set_modified(when)?;
 
         let report = evict_work_dirs(&home.path().join("build"), None, false)?;
         assert_eq!(report.unique_bytes, 100);
@@ -1850,9 +1955,31 @@ mod tests {
         let unit = old.join("units/oldpkg-0000111122223333");
         fs::create_dir_all(&unit)?;
         fs::write(unit.join("lib-old"), "aaaaaaaabbbbbbbb")?;
-        fs::write(
-            old.join("manifest.json"),
-            r#"{"parity_key":"0.0.0-deadbeef-x86_64-unknown-linux-gnu-00000000","toolchain":"rustc 0.0.0","created":1,"updated":1,"units":[{"name":"oldpkg-0000111122223333","profile":"debug","memo":"lib-old","hash":"aaaaaaaabbbbbbbb","stamp":1,"files":[{"path":"lib-old","dest":".fingerprint/oldpkg-0000111122223333/lib-old","size":16,"role":"memo"}]}]}"#,
+        let manifest = crate::vault::Manifest {
+            parity_key: "0.0.0-deadbeef-x86_64-unknown-linux-gnu-00000000".into(),
+            toolchain: "rustc 0.0.0".into(),
+            created: 1,
+            updated: 1,
+            units: vec![crate::vault::UnitEntry {
+                name: "oldpkg-0000111122223333".into(),
+                profile: "debug".into(),
+                memo: "lib-old".into(),
+                hash: "aaaaaaaabbbbbbbb".into(),
+                stamp: 1,
+                files: vec![crate::vault::FileEntry {
+                    path: "lib-old".into(),
+                    dest: ".fingerprint/oldpkg-0000111122223333/lib-old".into(),
+                    size: 16,
+                    sha256: "0".repeat(64),
+                    role: "memo".into(),
+                }],
+            }],
+            mac: String::new(),
+        };
+        crate::vault::save_manifest(
+            &store,
+            "0.0.0-deadbeef-x86_64-unknown-linux-gnu-00000000",
+            &manifest,
         )?;
 
         let opts = Options {
