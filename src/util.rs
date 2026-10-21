@@ -331,13 +331,18 @@ fn strip_verbatim(path: &str) -> String {
 }
 
 #[cfg(windows)]
+fn normalize_windows_path_text(path: &str) -> String {
+    strip_verbatim(path)
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+#[cfg(windows)]
 pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
     let profile = std::env::var_os("USERPROFILE")
         .with_context(|| format!("{what}: USERPROFILE is not set"))?;
     let profile = fs::canonicalize(&profile).unwrap_or_else(|_| PathBuf::from(profile));
-    let profile_text = strip_verbatim(&profile.to_string_lossy())
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
+    let profile_text = normalize_windows_path_text(&profile.to_string_lossy());
 
     let full = if path.is_absolute() {
         path.to_path_buf()
@@ -372,7 +377,7 @@ pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
         }
     }
 
-    let full_text = strip_verbatim(&full.to_string_lossy()).to_ascii_lowercase();
+    let full_text = normalize_windows_path_text(&full.to_string_lossy());
     let inside = |candidate: &str| {
         candidate == profile_text || candidate.starts_with(&format!("{profile_text}\\"))
     };
@@ -386,7 +391,7 @@ pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
     // A path that already exists can contain a junction deeper than the
     // lexical components; the canonical target must also stay inside.
     let canonical = fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
-    let canonical_text = strip_verbatim(&canonical.to_string_lossy()).to_ascii_lowercase();
+    let canonical_text = normalize_windows_path_text(&canonical.to_string_lossy());
     if !inside(&canonical_text) {
         anyhow::bail!(
             "{what} {} resolves outside %USERPROFILE% ({}); Windows shared caches are unsupported",
@@ -394,7 +399,11 @@ pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
             profile.display()
         );
     }
-    if full_text == profile_text {
+    // The profile itself is not a cache root. Compare both the lexical and
+    // canonical forms: `%USERPROFILE%\`, `%USERPROFILE%\.`, and
+    // `%USERPROFILE%\.\.` all resolve to the profile even though their raw
+    // strings differ.
+    if full_text == profile_text || canonical_text == profile_text {
         anyhow::bail!(
             "{what} {} is %USERPROFILE% itself — choose a dedicated subdirectory",
             full.display()
@@ -1352,10 +1361,30 @@ mod windows_path_tests {
     #[test]
     fn non_existent_in_profile_paths_are_accepted() {
         // tempdir is under %TEMP% (inside %USERPROFILE%); these children do
-        // not exist yet, which is exactly the W-9 setup/harvest/exec case.
+        // not exist yet, which is exactly the fresh setup/harvest/exec case.
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("cache").join("build");
         ensure_windows_user_path(&target, "cache root").unwrap();
+    }
+
+    #[test]
+    fn profile_aliases_are_rejected() {
+        let profile = std::env::var_os("USERPROFILE").expect("USERPROFILE");
+        let profile = std::path::PathBuf::from(profile);
+        let mut trailing = profile.as_os_str().to_os_string();
+        trailing.push("\\");
+        for target in [
+            std::path::PathBuf::from(trailing),
+            profile.join("."),
+            profile.join(".").join("."),
+            profile.join(".").join(".."),
+        ] {
+            assert!(
+                ensure_windows_user_path(&target, "cache root").is_err(),
+                "profile alias was accepted: {:?}",
+                target
+            );
+        }
     }
 
     #[test]
