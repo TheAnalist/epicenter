@@ -88,6 +88,11 @@ enum Command {
         /// All units whose rustc fingerprint identity matches this (prefix).
         #[arg(long)]
         rustc_key: Option<String>,
+        /// Delete a whole parity-key vault generation (exact key or a
+        /// substring such as `1.97.1`): its units, manifest and lock.
+        /// With the default `--tier all`, matching view units are unlinked too.
+        #[arg(long)]
+        generation: Option<String>,
         /// Units whose artifacts are already missing (fingerprint husks).
         #[arg(long)]
         husks: bool,
@@ -156,6 +161,8 @@ enum Command {
     Verify,
     /// Run a command against a fresh per-job build dir seeded from the vault:
     /// one line for CI jobs and agent sandboxes (`epicenter exec -- cargo test`).
+    /// A `cargo +toolchain` child is seeded from that toolchain's generation,
+    /// including Cargo's new per-unit build-dir layout (nightly 1.99+ / 1.100).
     Exec {
         /// Job id / work-dir name (default: `job-<UTC timestamp>-<pid>`).
         #[arg(long)]
@@ -229,6 +236,7 @@ fn run() -> Result<()> {
             unit,
             stale,
             rustc_key,
+            generation,
             husks,
             older_than,
             work_dirs,
@@ -245,6 +253,7 @@ fn run() -> Result<()> {
                 unit: unit.as_deref(),
                 stale,
                 rustc_key: rustc_key.as_deref(),
+                generation: generation.as_deref(),
                 husks,
                 older_than: older_than.as_deref(),
                 work_dirs,
@@ -611,7 +620,7 @@ fn cmd_restore(into: Option<&std::path::Path>, unit: Option<&str>, dry_run: bool
         );
     }
     let store = vault::store_root(&config::cache_root()?);
-    let report = vault::restore(&view, &store, unit, dry_run)?;
+    let report = vault::restore(&view, &store, unit, None, dry_run)?;
     println!("  {} {}", label("parity"), report.parity);
     if let Some(note) = &report.note {
         println!("  {} {note}", util::info(util::GLYPH_INFO));

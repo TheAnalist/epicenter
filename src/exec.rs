@@ -13,6 +13,7 @@
 //! frame lines go to stderr, and the command's exit code becomes epicenter's
 //! exit code.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use walkdir::WalkDir;
 
 use anyhow::{Context, Result, bail};
 
+use crate::fingerprint;
 use crate::util::{self, GLYPH_FAIL, GLYPH_INFO, GLYPH_PASS, human_bytes, human_duration};
 use crate::vault;
 
@@ -210,6 +212,101 @@ fn resolve_target_dir(raw: &str, work_dir: &Path, cwd: Option<&Path>) -> PathBuf
     base.join(path)
 }
 
+/// The directory the child will run in, as an absolute path when possible.
+fn project_dir(opts: &Options<'_>) -> Option<PathBuf> {
+    match &opts.cwd {
+        Some(dir) if dir.is_absolute() => Some(dir.clone()),
+        Some(dir) => std::env::current_dir().ok().map(|cwd| cwd.join(dir)),
+        None => std::env::current_dir().ok(),
+    }
+}
+
+/// `+toolchain` and `cargo --version` of the child, when it is cargo.
+/// `(None, None)` for any other program (fail-open: the default generation).
+fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
+    let Some(program) = command.first() else {
+        return (None, None);
+    };
+    let is_cargo = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.eq_ignore_ascii_case("cargo"))
+        .unwrap_or(false);
+    if !is_cargo {
+        return (None, None);
+    }
+    // rustup's `+toolchain` must be the first argument after the program.
+    let selector = command
+        .get(1)
+        .and_then(|arg| arg.strip_prefix('+'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut probe = std::process::Command::new(program);
+    if let Some(selector) = &selector {
+        probe.arg(format!("+{selector}"));
+    }
+    let version = probe
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|text| text.starts_with("cargo "));
+    (selector, version)
+}
+
+/// Packages the project resolves to, from the nearest `Cargo.lock` (the
+/// workspace root). `None` means "cannot tell" — no lock yet, unreadable, or
+/// empty — and the caller keeps the whole-generation seed (fail-open).
+fn project_packages(cwd: &Path, command: &[String]) -> Option<HashSet<String>> {
+    let mut dir = manifest_arg(command)
+        .map(|manifest| {
+            let manifest = if manifest.is_absolute() {
+                manifest
+            } else {
+                cwd.join(manifest)
+            };
+            manifest
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf())
+        })
+        .unwrap_or_else(|| cwd.to_path_buf());
+    loop {
+        let lock = dir.join("Cargo.lock");
+        if lock.is_file() {
+            return parse_lock(&lock);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+}
+
+/// `--manifest-path <p>` or `--manifest-path=<p>` from the child's argv.
+fn manifest_arg(command: &[String]) -> Option<PathBuf> {
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--manifest-path=") {
+            return Some(PathBuf::from(value));
+        }
+        if arg == "--manifest-path" {
+            return args.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+/// Package names from a `Cargo.lock` (all formats: `[[package]] name = …`).
+fn parse_lock(path: &Path) -> Option<HashSet<String>> {
+    let lock: toml::Value = fs::read_to_string(path).ok()?.parse().ok()?;
+    let names: HashSet<String> = lock
+        .get("package")?
+        .as_array()?
+        .iter()
+        .filter_map(|package| package.get("name")?.as_str().map(str::to_owned))
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
 /// Run the job; returns the command's exit code.
 pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i32> {
     let Some(program) = opts.command.first() else {
@@ -282,7 +379,27 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
 
     // An empty vault is a cold build (fail-open), but a corrupt/tampered
     // vault is not: never run the command over unverified artifacts.
-    let restore = vault::restore(&work_dir, store_root, None, false)?;
+    // The store is one global generation, so seed only the packages this
+    // project resolves to: restoring all of it puts every other project's
+    // units in the job dir (214 fingerprints for a one-dependency project).
+    // A missing or unreadable lock keeps the whole-generation seed.
+    let packages = project_dir(opts).and_then(|cwd| project_packages(&cwd, opts.command));
+    // The child may select another toolchain (`cargo +nightly`), and Cargo
+    // 1.99-nightly+ writes the new build-dir layout. Both decide which vault
+    // generation/layout can actually be reused.
+    let (selector, cargo_version) = child_cargo(opts.command);
+    let layout = cargo_version
+        .as_deref()
+        .map(|version| fingerprint::layout_for_cargo(version, opts.command));
+    let restore = vault::restore_with(
+        &work_dir,
+        store_root,
+        None,
+        packages.as_ref(),
+        layout,
+        selector.as_deref(),
+        false,
+    )?;
     if restore.fatal_errors > 0 {
         bail!(
             "vault restore refused {} unverified file(s) — refusing to run the command over unverified state",
@@ -310,6 +427,14 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         "  {} CARGO_BUILD_BUILD_DIR (this job only; no config change)",
         util::dim(&format!("{:<11}", "build-dir"))
     );
+    if let (Some(layout), Some(version)) = (layout, cargo_version.as_deref()) {
+        eprintln!(
+            "  {} {} · {}",
+            util::dim(&format!("{:<11}", "layout")),
+            layout.label(),
+            util::dim(version)
+        );
+    }
     if let Some(target) = &target_dir {
         eprintln!(
             "  {} {}{}",
@@ -339,7 +464,14 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let code = exit_code(&status);
 
     let harvested = if opts.harvest_back {
-        Some(vault::harvest(&work_dir, store_root, None, false)?)
+        Some(vault::harvest_with(
+            &work_dir,
+            store_root,
+            None,
+            false,
+            selector.as_deref(),
+            layout,
+        )?)
     } else {
         None
     };
@@ -525,6 +657,13 @@ mod tests {
     fn exec_seeds_the_job_and_propagates_the_exit_code() -> Result<()> {
         let (_build, store) = seeded_store()?;
         let work = tempfile::tempdir()?;
+        // The synthetic store unit is for package `x`: name it in a lock so
+        // this test does not depend on whatever Cargo.lock exists above /tmp.
+        let project = tempfile::tempdir()?;
+        fs::write(
+            project.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n",
+        )?;
         let job_dir = work.path().join("jobtest");
         let command = vec![
             "sh".to_string(),
@@ -536,7 +675,7 @@ mod tests {
         ];
         let opts = Options {
             job_id: Some("jobtest"),
-            cwd: None,
+            cwd: Some(project.path().to_path_buf()),
             harvest_back: false,
             remove_on_success: false,
             reuse: false,
@@ -550,6 +689,56 @@ mod tests {
                 .join("debug/.fingerprint/x-1122334455667788/lib-x")
                 .is_file(),
             "the vault seeded the job"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exec_seeds_only_the_packages_in_the_project_lock() -> Result<()> {
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        let command: Vec<String> = vec!["true".into()];
+        let lock = project.path().join("Cargo.lock");
+
+        // The project's lock does not name the stored unit: do not seed it.
+        fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"unrelated\"\nversion = \"1.0.0\"\n",
+        )?;
+        let opts = Options {
+            job_id: Some("filtered"),
+            cwd: Some(project.path().to_path_buf()),
+            harvest_back: false,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+        assert!(
+            !work
+                .path()
+                .join("filtered/debug/.fingerprint/x-1122334455667788")
+                .exists(),
+            "a unit outside the lock is not seeded"
+        );
+
+        // Naming the package in the lock seeds exactly that unit.
+        fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n",
+        )?;
+        let opts = Options {
+            job_id: Some("seeded"),
+            ..opts
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+        assert!(
+            work.path()
+                .join("seeded/debug/.fingerprint/x-1122334455667788/lib-x")
+                .is_file(),
+            "a unit inside the lock is seeded"
         );
         Ok(())
     }

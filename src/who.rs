@@ -332,6 +332,11 @@ fn explain_one(all: &[(Unit, ArtifactInfo)], picked: &(Unit, ArtifactInfo)) -> R
         unit.dir_suffix
     );
     println!(
+        "    {} {}",
+        util::dim(&format!("{:<13}", "layout")),
+        unit.layout.label()
+    );
+    println!(
         "    {} {}  {}",
         util::dim(&format!("{:<13}", "memo hash")),
         unit.memo_hash.as_deref().unwrap_or("?"),

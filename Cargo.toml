@@ -1,6 +1,6 @@
 [package]
 name = "epicenter-cli"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 rust-version = "1.91"
 description = "The state layer for Cargo builds: shared cache, durable vault, per-job dirs"

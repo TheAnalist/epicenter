@@ -14,6 +14,19 @@
 //! `build-script-build` (compile build script), `run-build-script-build`
 //! (run build script), or the bin name.
 //!
+//! Cargo's new build-dir layout (nightly 1.99+ with `-Zbuild-dir-new-layout`,
+//! on by default there; stable 1.100+) writes one directory per unit instead:
+//! ```text
+//! <build>/<profile>/build/<package>/<16hex>/
+//!   fingerprint/   ← the same files as the classic `.fingerprint/<pkg>-<hex>/`
+//!   out/           ← the artifacts the classic layout kept in `<profile>/deps/`
+//!   run/           ← run-build-script state (classic `build/<anchor>/`)
+//! ```
+//! Both layouts can coexist in one build dir (a stable and a nightly build
+//! sharing the cache), so [`read_units`] discovers units by shape. The
+//! [`layout_for_cargo`] helper decides which layout a child build will write,
+//! which `exec` uses to seed the matching units.
+//!
 //! JSON schema — mostly opaque HASH NUMBERS plus two human facts:
 //! `{rustc, features, declared_features, target, profile, path, deps,
 //!  local, rustflags, config, compile_kind}` where `features` /
@@ -25,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -47,7 +61,145 @@ impl UnitKind {
     }
 }
 
-/// One parsed `.fingerprint/<package>-<16hex>/` directory.
+/// Which build-dir layout produced a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnitLayout {
+    /// Cargo 1.91–1.99 stable: `<profile>/.fingerprint/<pkg>-<hash>/` +
+    /// `<profile>/deps/`.
+    Classic,
+    /// Cargo nightly 1.99+ / stable 1.100+:
+    /// `<profile>/build/<pkg>/<hash>/{fingerprint,out}/`.
+    New,
+}
+
+impl UnitLayout {
+    pub fn label(self) -> &'static str {
+        match self {
+            UnitLayout::Classic => "classic",
+            UnitLayout::New => "new",
+        }
+    }
+}
+
+/// The per-unit directory of the new build-dir layout:
+/// ```text
+/// <build-dir>/<profile>/build/<package>/<hash>/
+///    fingerprint/   ↔ the classic `.fingerprint/<package>-<hash>/` contents
+///    out/           ↔ the artifacts classic kept in `deps/`
+/// ```
+/// `<hash>` is the unit hash — the classic fingerprint-dir suffix.
+#[derive(Debug, Clone)]
+pub struct NewUnitLayout {
+    /// `debug` / `release` …
+    profile: String,
+    /// `anyhow`, `serde_core`, …
+    package: String,
+    /// `9709d57b46b8d526`
+    hash: String,
+}
+
+impl NewUnitLayout {
+    pub fn new(profile: &str, package: &str, hash: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            package: package.to_string(),
+            hash: hash.to_string(),
+        }
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn package(&self) -> &str {
+        &self.package
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    /// `<build>/<profile>/build/<package>/<hash>`
+    pub fn unit_dir(&self, build_root: &Path) -> PathBuf {
+        build_root
+            .join(&self.profile)
+            .join("build")
+            .join(&self.package)
+            .join(&self.hash)
+    }
+
+    /// `<build>/<profile>/build/<package>/<hash>/fingerprint`
+    pub fn fingerprint_dir(&self, build_root: &Path) -> PathBuf {
+        self.unit_dir(build_root).join("fingerprint")
+    }
+
+    /// `<build>/<profile>/build/<package>/<hash>/out`
+    pub fn out_dir(&self, build_root: &Path) -> PathBuf {
+        self.unit_dir(build_root).join("out")
+    }
+}
+
+/// Which layout a cargo of this version writes. `version` is the output of
+/// `cargo --version` (e.g. `cargo 1.99.0-nightly (7c83d4cc0 …)`); `args` is
+/// the child argv, scanned for `-Zbuild-dir-new-layout`.
+///
+/// Rules (the feature is nightly-first):
+/// - stable/beta ≥ 1.100 → new (the new layout ships in 1.100);
+/// - nightly ≥ 1.99 → new (nightly 1.99 enables the flag by default);
+/// - nightly < 1.99 with `-Zbuild-dir-new-layout` → new;
+/// - everything else → classic (covers 1.91 … 1.99 stable).
+pub fn layout_for_cargo(version: &str, args: &[String]) -> UnitLayout {
+    let Some((major, minor)) = parse_cargo_version(version) else {
+        return UnitLayout::Classic;
+    };
+    let nightly = version.contains("-nightly");
+    if major > 1 || (major == 1 && minor >= 100) {
+        return UnitLayout::New;
+    }
+    if nightly && minor >= 99 {
+        return UnitLayout::New;
+    }
+    if nightly && has_new_layout_flag(args) {
+        return UnitLayout::New;
+    }
+    UnitLayout::Classic
+}
+
+/// `cargo 1.99.0-nightly (7c83d4cc0 …)` → `(1, 99)`.
+pub fn parse_cargo_version(text: &str) -> Option<(u64, u64)> {
+    let token = text
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// `-Zbuild-dir-new-layout` or `-Z build-dir-new-layout` in an argv.
+pub fn has_new_layout_flag(args: &[String]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "-Z" {
+            if let Some(next) = iter.next() {
+                if next == "build-dir-new-layout" || next.starts_with("build-dir-new-layout=") {
+                    return true;
+                }
+            }
+        } else if let Some(rest) = arg.strip_prefix("-Z") {
+            if rest == "build-dir-new-layout" || rest.starts_with("build-dir-new-layout=") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One parsed unit directory, in either build-dir layout.
 #[derive(Debug, Clone)]
 pub struct Unit {
     /// `serde-102a33f055a8d229`
@@ -59,6 +211,14 @@ pub struct Unit {
     /// `debug` / `release` …
     pub profile: String,
     pub kind: UnitKind,
+    /// Which build-dir layout this unit came from.
+    pub layout: UnitLayout,
+    /// Directory holding the memo/json/dep files:
+    /// classic `.fingerprint/<pkg>-<hash>`, new `build/<pkg>/<hash>/fingerprint`.
+    pub fingerprint_dir: PathBuf,
+    /// New-layout unit root (`<profile>/build/<pkg>/<hash>`); equal to
+    /// `fingerprint_dir` in the classic layout.
+    pub unit_dir: PathBuf,
     /// Name of the memo file (`lib-serde`, `build-script-build`, …)
     pub memo_file: String,
     /// Content of the memo file — the authoritative hash
@@ -67,6 +227,18 @@ pub struct Unit {
     pub dep_info: Option<PathBuf>,
     /// Files inside the unit dir (for forensics completeness).
     pub extra_files: Vec<String>,
+}
+
+impl Unit {
+    /// View-relative directory that holds this unit's fingerprint state.
+    pub fn fingerprint_rel(&self) -> String {
+        match self.layout {
+            UnitLayout::Classic => format!(".fingerprint/{}", self.dir_name),
+            UnitLayout::New => {
+                format!("build/{}/{}/fingerprint", self.package, self.dir_suffix)
+            }
+        }
+    }
 }
 
 /// Typed view of the serialized Fingerprint schema.
@@ -227,7 +399,10 @@ pub fn parse_fingerprint(text: &str) -> Option<FingerprintJson> {
         .map(|value| parse_fingerprint_json(&value))
 }
 
-/// Read every unit directory under all `.fingerprint/` roots inside the build dir.
+/// Read every unit directory in both build-dir layouts:
+/// `<profile>/.fingerprint/<pkg>-<hash>/` (classic) and
+/// `<profile>/build/<pkg>/<hash>/fingerprint/` (new). Both may coexist in
+/// one build dir, so this is shape-based rather than a single global mode.
 pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
     let mut units = Vec::new();
     for profile_entry in fs::read_dir(build_root)
@@ -238,28 +413,53 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
             continue;
         }
         let profile = profile_entry.file_name().to_string_lossy().into_owned();
-        let fp_root = build_root.join(&profile).join(".fingerprint");
-        let fp_meta = match fs::symlink_metadata(&fp_root) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if !fp_meta.is_dir()
-            || fp_meta.file_type().is_symlink()
-            || crate::util::is_reparse_point(&fp_meta)
-        {
-            continue; // finals (CACHEDIR.TAG …), locks, symlinks — no fingerprints here
-        }
-        for unit_entry in
-            fs::read_dir(&fp_root).with_context(|| format!("reading {}", fp_root.display()))?
-        {
-            let unit_entry = unit_entry?;
-            // `file_type()` does not follow symlinks: a unit dir must be real.
-            if !unit_entry.file_type()?.is_dir() {
-                continue;
+        let profile_dir = profile_entry.path();
+
+        // Classic layout: <profile>/.fingerprint/<pkg>-<hash>/
+        let fp_root = profile_dir.join(".fingerprint");
+        if is_real_dir(&fp_root) {
+            for unit_entry in
+                fs::read_dir(&fp_root).with_context(|| format!("reading {}", fp_root.display()))?
+            {
+                let unit_entry = unit_entry?;
+                if !unit_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                if let Some(unit) = read_classic_unit(&profile, &unit_entry.path()) {
+                    units.push(unit);
+                }
             }
-            let unit_dir = unit_entry.path();
-            if let Some(unit) = read_unit_dir(&profile, &unit_dir) {
-                units.push(unit);
+        }
+
+        // New layout: <profile>/build/<pkg>/<hash>/fingerprint/
+        let build_dir = profile_dir.join("build");
+        if is_real_dir(&build_dir) {
+            for package_entry in fs::read_dir(&build_dir)
+                .with_context(|| format!("reading {}", build_dir.display()))?
+            {
+                let package_entry = package_entry?;
+                if !package_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let package = package_entry.file_name().to_string_lossy().into_owned();
+                for hash_entry in fs::read_dir(package_entry.path())
+                    .with_context(|| format!("reading {}", package_entry.path().display()))?
+                {
+                    let hash_entry = hash_entry?;
+                    if !hash_entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let hash = hash_entry.file_name().to_string_lossy().into_owned();
+                    if !looks_like_hash(&hash) {
+                        continue;
+                    }
+                    if !is_real_dir(&hash_entry.path().join("fingerprint")) {
+                        continue;
+                    }
+                    if let Some(unit) = read_new_unit(build_root, &profile, &package, &hash) {
+                        units.push(unit);
+                    }
+                }
             }
         }
     }
@@ -305,10 +505,68 @@ pub fn dep_edges(units: &[Unit]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
+/// A directory we may read: real, not a symlink or a Windows reparse point.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| {
+            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
+        })
+        .unwrap_or(false)
+}
+
+fn read_classic_unit(profile: &str, unit_dir: &Path) -> Option<Unit> {
     let dir_name = unit_dir.file_name()?.to_string_lossy().into_owned();
     let (package, dir_suffix) = split_dir_name(&dir_name)?;
+    let parsed = parse_unit_files(unit_dir)?;
+    Some(Unit {
+        dir_name,
+        package,
+        dir_suffix,
+        profile: profile.to_string(),
+        kind: parsed.kind,
+        layout: UnitLayout::Classic,
+        fingerprint_dir: unit_dir.to_path_buf(),
+        unit_dir: unit_dir.to_path_buf(),
+        memo_file: parsed.memo_file,
+        memo_hash: Some(parsed.memo_hash),
+        json: parsed.json,
+        dep_info: parsed.dep_info,
+        extra_files: parsed.extra_files,
+    })
+}
 
+fn read_new_unit(build_root: &Path, profile: &str, package: &str, hash: &str) -> Option<Unit> {
+    let layout = NewUnitLayout::new(profile, package, hash);
+    let fingerprint_dir = layout.fingerprint_dir(build_root);
+    let parsed = parse_unit_files(&fingerprint_dir)?;
+    Some(Unit {
+        dir_name: format!("{package}-{hash}"),
+        package: package.to_string(),
+        dir_suffix: hash.to_string(),
+        profile: profile.to_string(),
+        kind: parsed.kind,
+        layout: UnitLayout::New,
+        unit_dir: layout.unit_dir(build_root),
+        fingerprint_dir,
+        memo_file: parsed.memo_file,
+        memo_hash: Some(parsed.memo_hash),
+        json: parsed.json,
+        dep_info: parsed.dep_info,
+        extra_files: parsed.extra_files,
+    })
+}
+
+struct ParsedUnit {
+    kind: UnitKind,
+    memo_file: String,
+    memo_hash: String,
+    json: Option<FingerprintJson>,
+    dep_info: Option<PathBuf>,
+    extra_files: Vec<String>,
+}
+
+/// Parse the contents of a fingerprint directory — identical in both layouts.
+fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
     let mut candidates: Vec<(String, String)> = Vec::new(); // (name, content)
     let mut dep_info: Option<PathBuf> = None;
     let mut json_path: Option<PathBuf> = None;
@@ -350,21 +608,15 @@ fn read_unit_dir(profile: &str, unit_dir: &Path) -> Option<Unit> {
         candidates.push((name, content));
     }
 
-    let ((memo_file_name, memo_hash), extra_files) = pick_memo(candidates)?;
-    let kind = classify_kind(&memo_file_name);
-
+    let ((memo_file, memo_hash), extra_files) = pick_memo(candidates)?;
+    let kind = classify_kind(&memo_file);
     let json = json_path
         .and_then(|path| crate::util::read_small_text(&path, 4 * 1024 * 1024).ok())
         .and_then(|text| parse_fingerprint(&text));
-
-    Some(Unit {
-        dir_name,
-        package,
-        dir_suffix,
-        profile: profile.to_string(),
+    Some(ParsedUnit {
         kind,
-        memo_file: memo_file_name,
-        memo_hash: Some(memo_hash),
+        memo_file,
+        memo_hash,
         json,
         dep_info,
         extra_files,
@@ -394,10 +646,13 @@ pub(crate) fn looks_like_hash(text: &str) -> bool {
     text.len() == 16 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Candidate `build/<package>-<hex>` anchor dirs for a build-script unit
-/// (dashes may be underscore-normalized in artifact paths — check both
-/// plus the bare-hash fallback). Shared by the reader and by `evict`.
+/// Directories that back a unit's artifacts (shared by the reader and by
+/// `evict`): classic `build/<package>-<hex>/` anchors (dash/underscore and
+/// bare-hash candidates), or the new per-unit root `build/<pkg>/<hash>/`.
 pub(crate) fn build_anchor_dirs(build_root: &Path, unit: &Unit) -> Vec<PathBuf> {
+    if unit.layout == UnitLayout::New {
+        return vec![unit.unit_dir.clone()];
+    }
     let build_dir = build_root.join(&unit.profile).join("build");
     let pkg_plain = &unit.package;
     let pkg_underscored = unit.package.replace('-', "_");
@@ -421,71 +676,10 @@ pub struct ArtifactInfo {
 }
 
 pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
-    let profile_dir = build_root.join(&unit.profile);
     let mut paths = Vec::new();
-
-    let deps_dir = profile_dir.join("deps");
-    let deps_real = fs::symlink_metadata(&deps_dir)
-        .map(|meta| {
-            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
-        })
-        .unwrap_or(false);
-    if let Ok(entries) = fs::read_dir(&deps_dir) {
-        if !deps_real {
-            return ArtifactInfo {
-                paths: Vec::new(),
-                bytes: 0,
-                newest: None,
-            };
-        }
-        let suffix = format!("-{}", unit.dir_suffix);
-        for entry in entries.flatten() {
-            // Regular files only; a symlink/FIFO here must not be copied.
-            if !entry
-                .file_type()
-                .map(|kind| kind.is_file())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Compare on the STEM so extensions don't hide the match:
-            // `libserde-102a….rlib` → stem `libserde-102a…` ends with `-102a…`.
-            let stem = Path::new(&name)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or(name.clone());
-            if !stem.ends_with(&suffix) {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                paths.push((entry.path(), meta.len(), meta.modified().ok()));
-            }
-        }
-    }
-
-    if unit.kind != UnitKind::Lib {
-        for candidate in build_anchor_dirs(build_root, unit) {
-            let is_real_dir = fs::symlink_metadata(&candidate)
-                .map(|meta| {
-                    meta.is_dir()
-                        && !meta.file_type().is_symlink()
-                        && !crate::util::is_reparse_point(&meta)
-                })
-                .unwrap_or(false);
-            if !is_real_dir {
-                continue;
-            }
-            for entry in WalkDir::new(&candidate).min_depth(1) {
-                let Ok(entry) = entry else { continue };
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                if let Ok(meta) = entry.metadata() {
-                    paths.push((entry.path().into(), meta.len(), meta.modified().ok()));
-                }
-            }
-        }
+    match unit.layout {
+        UnitLayout::Classic => collect_classic_artifacts(build_root, unit, &mut paths),
+        UnitLayout::New => collect_new_artifacts(unit, &mut paths),
     }
 
     let mut bytes = 0;
@@ -502,6 +696,97 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
         paths,
         bytes,
         newest,
+    }
+}
+
+fn collect_classic_artifacts(
+    build_root: &Path,
+    unit: &Unit,
+    paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>,
+) {
+    let profile_dir = build_root.join(&unit.profile);
+    let deps_dir = profile_dir.join("deps");
+    if is_real_dir(&deps_dir) {
+        let suffix = format!("-{}", unit.dir_suffix);
+        if let Ok(entries) = fs::read_dir(&deps_dir) {
+            for entry in entries.flatten() {
+                // Regular files only; a symlink/FIFO here must not be copied.
+                if !entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Compare on the STEM so extensions don't hide the match:
+                // `libserde-102a….rlib` → stem `libserde-102a…` ends with `-102a…`.
+                let stem = Path::new(&name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or(name.clone());
+                if !stem.ends_with(&suffix) {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    paths.push((entry.path(), meta.len(), meta.modified().ok()));
+                }
+            }
+        }
+    }
+
+    if unit.kind != UnitKind::Lib {
+        for candidate in build_anchor_dirs(build_root, unit) {
+            if !is_real_dir(&candidate) {
+                continue;
+            }
+            for entry in WalkDir::new(&candidate).min_depth(1) {
+                let Ok(entry) = entry else { continue };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    paths.push((entry.path().to_path_buf(), meta.len(), meta.modified().ok()));
+                }
+            }
+        }
+    }
+}
+
+/// New layout: artifacts live in the unit's `out/` (rustc link outputs,
+/// build-script binaries), `run/` (run-build-script state) and at the unit
+/// root (`output`, `stderr`, `stdout`, `root-output`, …). `fingerprint/` is
+/// handled separately by the vault.
+fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>) {
+    for sub in ["out", "run"] {
+        let dir = unit.unit_dir.join(sub);
+        if !is_real_dir(&dir) {
+            continue;
+        }
+        for entry in WalkDir::new(&dir).min_depth(1) {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                paths.push((entry.path().to_path_buf(), meta.len(), meta.modified().ok()));
+            }
+        }
+    }
+    let Ok(entries) = fs::read_dir(&unit.unit_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            paths.push((entry.path(), meta.len(), meta.modified().ok()));
+        }
     }
 }
 
@@ -556,6 +841,120 @@ mod tests {
         assert_eq!(arts.bytes, 10);
         assert!(arts.newest.is_some());
         Ok(())
+    }
+
+    #[test]
+    fn reads_new_layout_units() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let unit_dir = root.path().join("debug/build/anyhow/9709d57b46b8d526");
+        fs::create_dir_all(unit_dir.join("fingerprint"))?;
+        fs::create_dir_all(unit_dir.join("out"))?;
+        fs::write(unit_dir.join("fingerprint/lib-anyhow"), "5d82713a7f2d05e2")?;
+        fs::write(unit_dir.join("fingerprint/lib-anyhow.json"), SAMPLE_JSON)?;
+        fs::write(unit_dir.join("fingerprint/dep-lib-anyhow"), [0u8; 69])?;
+        fs::write(unit_dir.join("fingerprint/invoked.timestamp"), "")?;
+        fs::write(
+            unit_dir.join("out/libanyhow-9709d57b46b8d526.rlib"),
+            [0u8; 10],
+        )?;
+        fs::write(
+            unit_dir.join("out/libanyhow-9709d57b46b8d526.rmeta"),
+            [0u8; 5],
+        )?;
+        fs::write(unit_dir.join("out/anyhow-9709d57b46b8d526.d"), [0u8; 3])?;
+
+        let units = read_units(root.path())?;
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.layout, UnitLayout::New);
+        assert_eq!(unit.package, "anyhow");
+        assert_eq!(unit.dir_suffix, "9709d57b46b8d526");
+        assert_eq!(unit.dir_name, "anyhow-9709d57b46b8d526");
+        assert_eq!(unit.memo_hash.as_deref(), Some("5d82713a7f2d05e2"));
+        assert_eq!(unit.fingerprint_dir, unit_dir.join("fingerprint"));
+        assert_eq!(unit.unit_dir, unit_dir);
+        assert_eq!(
+            unit.fingerprint_rel(),
+            "build/anyhow/9709d57b46b8d526/fingerprint"
+        );
+
+        let arts = artifacts_for(root.path(), unit);
+        assert_eq!(arts.paths.len(), 3, "rlib + rmeta + d");
+        assert_eq!(arts.bytes, 18);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_mixed_layouts_in_one_build_dir() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let classic = root
+            .path()
+            .join("debug/.fingerprint/serde-102a33f055a8d229");
+        fs::create_dir_all(&classic)?;
+        fs::write(classic.join("lib-serde"), "5d82713a7f2d05e2")?;
+        fs::create_dir_all(root.path().join("debug/deps"))?;
+        fs::write(
+            root.path()
+                .join("debug/deps/libserde-102a33f055a8d229.rlib"),
+            [0u8; 4],
+        )?;
+
+        let new = root.path().join("release/build/anyhow/9709d57b46b8d526");
+        fs::create_dir_all(new.join("fingerprint"))?;
+        fs::create_dir_all(new.join("out"))?;
+        fs::write(new.join("fingerprint/lib-anyhow"), "aaaaaaaaaaaaaaaa")?;
+        fs::write(new.join("out/libanyhow-9709d57b46b8d526.rlib"), [0u8; 4])?;
+
+        let units = read_units(root.path())?;
+        assert_eq!(units.len(), 2);
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.layout == UnitLayout::Classic && unit.profile == "debug")
+        );
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.layout == UnitLayout::New && unit.profile == "release")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn layout_decision_follows_cargo_version_and_flags() {
+        let none: Vec<String> = Vec::new();
+        let new_flag = vec!["-Zbuild-dir-new-layout".to_string()];
+        let split_flag = vec!["-Z".to_string(), "build-dir-new-layout".to_string()];
+
+        assert_eq!(
+            layout_for_cargo("cargo 1.91.0 (000000000 2026-01-01)", &none),
+            UnitLayout::Classic
+        );
+        assert_eq!(
+            layout_for_cargo("cargo 1.99.0 (000000000 2026-01-01)", &none),
+            UnitLayout::Classic
+        );
+        assert_eq!(
+            layout_for_cargo("cargo 1.99.0-nightly (7c83d4cc0 2026-07-29)", &none),
+            UnitLayout::New
+        );
+        assert_eq!(
+            layout_for_cargo("cargo 1.98.0-nightly (000000000 2026-01-01)", &none),
+            UnitLayout::Classic
+        );
+        assert_eq!(
+            layout_for_cargo("cargo 1.98.0-nightly (000000000 2026-01-01)", &new_flag),
+            UnitLayout::New
+        );
+        assert_eq!(
+            layout_for_cargo("cargo 1.98.0-nightly (000000000 2026-01-01)", &split_flag),
+            UnitLayout::New
+        );
+        assert_eq!(
+            layout_for_cargo("cargo 1.100.0 (000000000 2026-01-01)", &none),
+            UnitLayout::New
+        );
+        assert_eq!(layout_for_cargo("garbage", &none), UnitLayout::Classic);
     }
 
     #[test]

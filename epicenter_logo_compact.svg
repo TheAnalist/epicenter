@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="40 80 620 520" width="128" height="108">
+  <defs>
+    <linearGradient id="fluo-orange" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FF3D00"/>
+      <stop offset="55%" stop-color="#FF6D00"/>
+      <stop offset="100%" stop-color="#FFAB00"/>
+    </linearGradient>
+  </defs>
+  <rect x="40" y="80" width="620" height="520" rx="72" fill="#0B0E0C"/>
+  <!-- 1. Anchored Left C-Rings (Epicenter Green #92D293) -->
+  <path d="M 382.23 407.01 A 114.00 114.00 0 1 1 382.23 272.99 L 356.34 291.80 A 82.00 82.00 0 1 0 356.34 388.20 Z" fill="#92D293" fill-opacity="1.0"/>
+  <path d="M 427.53 439.92 A 170.00 170.00 0 1 1 427.53 240.08 L 401.64 258.89 A 138.00 138.00 0 1 0 401.64 421.11 Z" fill="#92D293" fill-opacity="0.72"/>
+  <path d="M 472.84 472.84 A 226.00 226.00 0 1 1 472.84 207.16 L 446.95 225.97 A 194.00 194.00 0 1 0 446.95 454.03 Z" fill="#92D293" fill-opacity="0.42"/>
+
+  <!-- 2. Broken-Out Ring Segments Knocked Right by the Blast -->
+  <path d="M 432.68 279.59 A 114.00 114.00 0 0 1 448.27 320.20 L 416.75 325.76 A 82.00 82.00 0 0 0 405.54 296.55 Z" fill="#FFFFFF" fill-opacity="1.0"/>
+  <path d="M 448.27 359.80 A 114.00 114.00 0 0 1 432.68 400.41 L 405.54 383.45 A 82.00 82.00 0 0 0 416.75 354.24 Z" fill="#FFFFFF" fill-opacity="1.0"/>
+  <path d="M 403.61 297.50 A 85.00 85.00 0 0 1 413.44 323.78 L 406.57 325.12 A 78.00 78.00 0 0 0 397.55 301.00 Z" fill="#FF5500"/>
+  <path d="M 413.44 356.22 A 85.00 85.00 0 0 1 403.61 382.50 L 397.55 379.00 A 78.00 78.00 0 0 0 406.57 354.88 Z" fill="#FF5500"/>
+  <path d="M 506.17 249.91 A 170.00 170.00 0 0 1 529.42 310.48 L 497.90 316.04 A 138.00 138.00 0 0 0 479.03 266.87 Z" fill="#92D293" fill-opacity="1.0"/>
+  <path d="M 529.42 369.52 A 170.00 170.00 0 0 1 506.17 430.09 L 479.03 413.13 A 138.00 138.00 0 0 0 497.90 363.96 Z" fill="#92D293" fill-opacity="1.0"/>
+  <path d="M 478.11 269.50 A 141.00 141.00 0 0 1 494.41 313.10 L 487.54 314.43 A 134.00 134.00 0 0 0 472.05 273.00 Z" fill="#FF5500"/>
+  <path d="M 494.41 366.90 A 141.00 141.00 0 0 1 478.11 410.50 L 472.05 407.00 A 134.00 134.00 0 0 0 487.54 365.57 Z" fill="#FF5500"/>
+  <path d="M 579.66 220.24 A 226.00 226.00 0 0 1 610.57 300.76 L 579.05 306.31 A 194.00 194.00 0 0 0 552.52 237.20 Z" fill="#92D293" fill-opacity="0.85"/>
+  <path d="M 610.57 379.24 A 226.00 226.00 0 0 1 579.66 459.76 L 552.52 442.80 A 194.00 194.00 0 0 0 579.05 373.69 Z" fill="#92D293" fill-opacity="0.85"/>
+  <path d="M 552.61 241.50 A 197.00 197.00 0 0 1 575.38 302.41 L 568.51 303.75 A 190.00 190.00 0 0 0 546.54 245.00 Z" fill="#FF5500"/>
+  <path d="M 575.38 377.59 A 197.00 197.00 0 0 1 552.61 438.50 L 546.54 435.00 A 190.00 190.00 0 0 0 568.51 376.25 Z" fill="#FF5500"/>
+
+  <!-- 3. Fluo-Orange Diagonal Star Flare Spikes -->
+  <polygon points="246,296 290,333 334,296 297,340 334,384 290,347 246,384 283,340" fill="#FF5500"/>
+
+  <!-- 4. Fluo-Orange Outer Star Halo & Shockwave Spear Outline -->
+  <polygon points="290,272 308,322 589.0,322 637.0,340 589.0,358 308,358 290,408 272,358 222,340 272,322" fill="url(#fluo-orange)"/>
+
+  <!-- Fluo-Orange Kinetic Speed Lines Flanking the Spear -->
+  <polygon points="360,312 550.0,312 570.0,317 372,317" fill="#FF5500"/>
+  <polygon points="360,368 550.0,368 570.0,363 372,363" fill="#FF5500"/>
+
+  <!-- 5. White Hot Core Star & Piercing Spear -->
+  <polygon points="290,288 301,329 593.0,329 621.0,340 593.0,351 301,351 290,392 279,351 238,340 279,329" fill="#FFFFFF"/>
+
+  <!-- Innermost Fluo-Orange Hypocenter Spark -->
+  <polygon points="274,340 290,324 312,340 290,356" fill="#FF5500"/>
+  <circle cx="290" cy="340" r="5" fill="#FFFFFF"/>
+</svg>

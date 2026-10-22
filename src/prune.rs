@@ -63,6 +63,11 @@ fn name_hash(name: &str, strip_ext: bool) -> Option<String> {
     Some(format!("{}-{}", name.replace('-', "_"), hash))
 }
 
+/// A 16-hex unit hash (`9709d57b46b8d526`).
+fn is_hex16(text: &str) -> bool {
+    text.len() == 16 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Classify a file inside the cache into its build unit.
 pub fn artifact_key(root: &Path, path: &Path) -> Option<String> {
     if !path.starts_with(root) {
@@ -91,8 +96,17 @@ pub fn artifact_key(root: &Path, path: &Path) -> Option<String> {
                 let file = components.last()?;
                 return name_hash(file, true);
             }
-            // build|incremental|.fingerprint followed by <crate-hash>= anchor
-            "build" | "incremental" | ".fingerprint" => {
+            // New layout: build/<package>/<16hex>/… — one directory per unit.
+            "build" => {
+                let first = components.get(i + 1)?;
+                if let Some(hash) = components.get(i + 2).filter(|hash| is_hex16(hash)) {
+                    return Some(format!("{}-{}", first.replace('-', "_"), hash));
+                }
+                // Classic: build/<package>-<hash>/…
+                return name_hash(first, false);
+            }
+            // incremental/<crate-hash>/, .fingerprint/<crate-hash>/
+            "incremental" | ".fingerprint" => {
                 let anchor_dir = components.get(i + 1)?;
                 return name_hash(anchor_dir, false);
             }
@@ -110,9 +124,24 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
     let comps: Vec<Component> = rel.components().collect();
     for (i, comp) in comps.iter().enumerate() {
         let name = comp.as_os_str().to_str()?;
-        if matches!(name, "build" | "incremental" | ".fingerprint") {
-            let anchor: PathBuf = comps.iter().take(i + 2).collect();
-            return Some(root.join(anchor));
+        match name {
+            "build" => {
+                // New layout: build/<pkg>/<16hex> (do NOT collapse to
+                // build/<pkg> — that would delete sibling units).
+                let new_layout = comps
+                    .get(i + 2)
+                    .and_then(|c| c.as_os_str().to_str())
+                    .map(is_hex16)
+                    .unwrap_or(false);
+                let take = if new_layout { i + 3 } else { i + 2 };
+                let anchor: PathBuf = comps.iter().take(take).collect();
+                return Some(root.join(anchor));
+            }
+            "incremental" | ".fingerprint" => {
+                let anchor: PathBuf = comps.iter().take(i + 2).collect();
+                return Some(root.join(anchor));
+            }
+            _ => {}
         }
     }
     None
@@ -331,6 +360,41 @@ mod tests {
         assert_eq!(group.files.len(), 3);
         assert_eq!(group.bytes, 16);
         assert_eq!(group.anchor.as_deref(), Some(fingerprint.as_path()));
+        Ok(())
+    }
+
+    #[test]
+    fn scans_new_layout_units_per_unit_dir() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let one = root.path().join("debug/build/anyhow/9709d57b46b8d526");
+        let two = root.path().join("debug/build/anyhow/6d5788609cdad9a4");
+        for unit in [&one, &two] {
+            fs::create_dir_all(unit.join("fingerprint"))?;
+            fs::create_dir_all(unit.join("out"))?;
+            fs::write(unit.join("fingerprint/lib-anyhow"), "aaaaaaaabbbbbbbb")?;
+            fs::write(unit.join("out/libanyhow-9709d57b46b8d526.rlib"), [0u8; 10])?;
+        }
+
+        let groups = scan(root.path())?;
+        assert_eq!(
+            groups.len(),
+            2,
+            "two units of one package: {:?}",
+            groups.keys()
+        );
+        assert!(groups.keys().all(|key| key.starts_with("anyhow-")));
+        for (key, group) in &groups {
+            let unit = if key.ends_with("9709d57b46b8d526") {
+                &one
+            } else {
+                &two
+            };
+            assert_eq!(
+                group.anchor.as_deref(),
+                Some(unit.as_path()),
+                "anchor must stop at the unit dir, never build/<pkg>"
+            );
+        }
         Ok(())
     }
 

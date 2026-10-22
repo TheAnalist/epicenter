@@ -1,4 +1,4 @@
-# epicenter — the state layer for Cargo builds
+# <img src="epicenter_logo_compact.svg" width="44" align="center" alt="epicenter logo" /> epicenter - the state layer for Cargo builds
 
 *Requires Cargo with `build.build-dir` support — Rust 1.91+.*
 
@@ -89,7 +89,8 @@ epicenter doctor                 # verify everything is healthy
    them back so Cargo skips compilation completely.
 3. **Parallel agents & CI jobs (zero lock waits)** —
    `epicenter exec --id agent-1 --target-dir -- cargo test` seeds a private
-   per-job build dir from the vault in milliseconds. Ten agents can build the
+   per-job build dir from the vault in milliseconds — only the packages this
+   project resolves to, not every unit in the cache. Ten agents can build the
    same repo at the same time without waiting on Cargo's build-dir lock or
    duplicating rlibs on disk.
 
@@ -107,6 +108,7 @@ epicenter doctor                 # verify everything is healthy
 | `epicenter why <unit>` | one unit in depth: hashes, features, deps, artifact inventory, FRESH/DIRTY verdict |
 | `epicenter evict --unit <q>` | remove units deliberately (store + views): dry run by default, `--yes` to delete |
 | `epicenter evict --unit <q> --tier store` | trim the **vault only** — no `--force` needed, the vault is yours to trim |
+| `epicenter evict --generation <key>` | delete a whole parity-key generation (units, manifest, lock) — dry run unless `--yes`; the active generation needs `--force`; `--tier store` keeps views |
 | `epicenter evict --unit <q> --tier view` | unlink the working copies only (build dir + job dirs); vault untouched |
 | `epicenter evict --work <job\|build> --crate <name>` | surgical cache-bust: unlink one crate from ONE view; the vault is never touched |
 | `epicenter evict --stale` / `--husks` / `--older-than 90d` / `--rustc-key <h>` | bulk selectors, by default across the store and every known view |
@@ -115,10 +117,10 @@ epicenter doctor                 # verify everything is healthy
 | `epicenter prune [--older-than 30d]` | age-based housekeeping of the shared build dir (policy GC, default 30d). **Dry run by default** — pass `--yes` to delete |
 | `epicenter doctor` | health check with plain-language verdicts: config, wrapper, filesystem, toolchain, mtime ordering |
 | `epicenter vault` | show the vault: generations (toolchain + flags), sizes, links into the build view |
-| `epicenter harvest [--unit <q>] [--dry-run]` | store built unit groups from the shared build dir into the vault |
-| `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | seed a working dir from the vault (default: the shared build dir) — `deps/` rlibs and `.so` hard-linked; `.rmeta` + fingerprint state copied |
+| `epicenter harvest [--unit <q>] [--dry-run]` | store built unit groups from the shared build dir into the vault - only the layout of the toolchain it runs under (nightly units: `RUSTUP_TOOLCHAIN=nightly` or `exec --harvest`) |
+| `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | seed a working dir from the vault (default: the shared build dir) — `deps/`/`out/` rlibs and `.so` hard-linked; `.rmeta` + fingerprint state copied |
 | `epicenter verify` | audit the vault: file sizes, canonical stamps, hash contents, dependency ordering — and name the job dirs under `work/` |
-| `epicenter exec [--harvest] [--rm] [--reuse] [--target-dir [DIR]] [--id <id>] [--cwd <dir>] -- <cmd>` | run a command in a fresh per-job build dir seeded from the vault (CI/agents) |
+| `epicenter exec [--harvest] [--rm] [--reuse] [--target-dir [DIR]] [--id <id>] [--cwd <dir>] -- <cmd>` | run a command in a fresh per-job build dir seeded from the vault for the project's packages (CI/agents) |
 
 ## `prune` vs `evict` — housekeeping vs deliberate removal
 
@@ -217,7 +219,8 @@ cargo build                    # Cargo sees fresh fingerprints: zero recompiles
 
 Measured under WSL on ext4: wiping one unit and restoring it takes milliseconds,
 after which `cargo build -v` reports `Fresh … in 0.01s` with **zero rustc
-processes**. Restore hard-links `deps/` link outputs — a thousand jobs share
+processes**. Restore hard-links link outputs (`deps/` classically, `out/`
+in the new layout) — a thousand jobs share
 one copy of every rlib — and copies `.rmeta` plus the fingerprint state and
 build-script trees, because rustc and cargo rewrite those in place (a shared
 inode would either break a rebuild or corrupt the store). Each unit group
@@ -231,10 +234,40 @@ toolchain upgrade opens a new generation instead of invalidating one, and
 `epicenter vault` marks which generation is active. (Cross-arch sharing is not
 supported — one vault per platform.)
 
+`epicenter evict --generation <key>` removes a whole generation — units,
+manifest and lock — in one step. An eviction that empties a generation removes
+its parity-key directory and lock too, and a store sweep clears orphan locks
+and empty manifest-less directories: nothing is left for you to delete by hand.
+
+### Cargo's two build-dir layouts
+
+Epicenter reads both unit layouts Cargo writes, side by side:
+
+| Cargo | Layout | Unit shape |
+|---|---|---|
+| 1.91 – 1.99 stable | classic | `<profile>/.fingerprint/<pkg>-<hash>/` + `<profile>/deps/` |
+| 1.99 nightly · 1.100+ | new | `<profile>/build/<pkg>/<hash>/{fingerprint,out}/` |
+
+`who`, `why`, `status`, `prune`, `harvest` and `evict` discover units by shape,
+so a cache shared by a stable and a nightly toolchain is fully visible. `exec`
+resolves the child's `+toolchain` and `cargo --version`: nightly 1.99+ (and
+stable 1.100+) seed the new layout; older nightlies only when
+`-Zbuild-dir-new-layout` is passed; everything else stays classic.
+
+`harvest` follows the toolchain it runs under: in a cache that mixes stable and
+nightly units it stores only that toolchain's layout (the other units show up
+as "skipped"). Harvest nightly units with
+`epicenter exec --harvest -- cargo +nightly build`, or run
+`RUSTUP_TOOLCHAIN=nightly epicenter harvest`.
+
 ### One line for CI jobs and agents
 
 `exec` mints a fresh build dir per job, seeds it from the vault, and runs your
-command in it — no shim, no daemon, no config change:
+command in it — no shim, no daemon, no config change. The seed is scoped to the
+packages in the project's `Cargo.lock` (workspace included), so a small project
+does not inherit every other project's units — and it matches the build-dir
+layout the child cargo will write (classic vs the new per-unit layout).
+`restore` still seeds a whole generation by design:
 
 ```bash
 epicenter exec -- cargo test                    # warm start, nothing kept

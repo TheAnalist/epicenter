@@ -28,6 +28,8 @@ pub struct Options<'a> {
     pub stale: bool,
     /// Exact (or prefix) rustc fingerprint identity.
     pub rustc_key: Option<&'a str>,
+    /// Delete whole parity-key generations (exact key or substring).
+    pub generation: Option<&'a str>,
     /// Units whose artifacts are already missing (fingerprint husks).
     pub husks: bool,
     /// Units untouched for longer than this (e.g. `30d`).
@@ -84,12 +86,37 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
     for (name, value) in [
         ("--unit", opts.unit),
         ("--rustc-key", opts.rustc_key),
+        ("--generation", opts.generation),
         ("--crate", opts.crate_name),
     ] {
         if value.is_some_and(|value| value.is_empty()) {
             bail!("{name} must not be empty — use an explicit selector or a dry run");
         }
     }
+    if let Some(query) = opts.generation {
+        if opts.unit.is_some()
+            || opts.stale
+            || opts.rustc_key.is_some()
+            || opts.husks
+            || opts.older_than.is_some()
+            || opts.work_dirs
+            || opts.work_dir.is_some()
+            || opts.work.is_some()
+            || opts.crate_name.is_some()
+        {
+            bail!(
+                "--generation deletes whole parity-key generations — it takes no unit selectors:\n\
+                 e.g. `epicenter evict --generation 1.97.1` (dry run unless --yes)"
+            );
+        }
+        if opts.tier == Tier::View {
+            bail!(
+                "--generation is a vault operation — use --tier store, or the default all to also unlink matching view units"
+            );
+        }
+        return evict_generations(build_root, opts, query);
+    }
+
     if let Some(target) = opts.work_dir {
         if opts.work_dirs || opts.work.is_some() {
             bail!(
@@ -226,7 +253,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                 if !view_labels.contains(&label) {
                     view_labels.push(label.clone());
                 }
-                let files = view_unit_files(&root, &unit, &arts);
+                let files = view_unit_files(&unit, &arts);
                 let artifacts: Vec<PathBuf> =
                     arts.paths.iter().map(|(path, _, _)| path.clone()).collect();
                 let candidate = candidate_for(&mut candidates, &unit.dir_name);
@@ -238,10 +265,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                     Place::View {
                         label: label.clone(),
                         root: root.clone(),
-                        unit_dir: root
-                            .join(&unit.profile)
-                            .join(".fingerprint")
-                            .join(&unit.dir_name),
+                        unit_dir: unit.fingerprint_dir.clone(),
                         anchors: fingerprint::build_anchor_dirs(&root, &unit),
                         artifacts,
                         files,
@@ -380,6 +404,10 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                 eprintln!("could not prune the vault: {err}");
             }
         }
+    }
+    if opts.delete && opts.tier.touches_store() {
+        // Empty generations and orphan locks are removed with their units.
+        crate::vault::sweep_store_debris(&store_root);
     }
 
     let mut view_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -963,15 +991,9 @@ fn surgery_unit_matches(unit: &Unit, opts: &Options<'_>) -> bool {
 }
 
 /// Files a view-unit removal would unlink (for honest accounting).
-fn view_unit_files(root: &Path, unit: &Unit, arts: &ArtifactInfo) -> Vec<PathBuf> {
+fn view_unit_files(unit: &Unit, arts: &ArtifactInfo) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    collect_tree_files(
-        &root
-            .join(&unit.profile)
-            .join(".fingerprint")
-            .join(&unit.dir_name),
-        &mut files,
-    );
+    collect_tree_files(&unit.fingerprint_dir, &mut files);
     // `arts.paths` already covers the `build/<anchor>/` files.
     for (path, _, _) in &arts.paths {
         files.push(path.clone());
@@ -989,11 +1011,7 @@ fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Remove one unit from one view: fingerprint dir, build anchors, artifacts.
 fn remove_view_unit(root: &Path, unit: &Unit, arts: &ArtifactInfo, errors: &mut u64) {
-    let fingerprint_dir = root
-        .join(&unit.profile)
-        .join(".fingerprint")
-        .join(&unit.dir_name);
-    remove_dir(&fingerprint_dir, errors);
+    remove_dir(&unit.fingerprint_dir, errors);
     for anchor in fingerprint::build_anchor_dirs(root, unit) {
         if anchor.is_dir() {
             remove_dir(&anchor, errors);
@@ -1241,6 +1259,193 @@ fn view_selectors_hit(
     hit
 }
 
+/// `epicenter evict --generation <key>` — delete whole parity-key stores.
+fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Result<()> {
+    let store_root = crate::vault::store_root(build_root);
+    if store_root.exists() {
+        crate::vault::check_store_trust(&store_root)?;
+    }
+    let generations = crate::vault::generations(&store_root)?;
+    let chosen: Vec<&crate::vault::GenerationInfo> = generations
+        .iter()
+        .filter(|generation| generation.parity.contains(query))
+        .collect();
+    if chosen.is_empty() {
+        bail!("no vault generation matches {query:?} — `epicenter vault` lists them");
+    }
+    if !opts.force {
+        if let Some(generation) = chosen.iter().find(|generation| generation.active) {
+            bail!(
+                "the active vault generation {} is protected — pass --force to delete it (the next build starts cold)",
+                generation.parity
+            );
+        }
+    }
+
+    // Unit hashes are toolchain-specific, so a view unit with one of these
+    // names belongs to the generation even in a mixed-layout view.
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for generation in &chosen {
+        names.extend(crate::vault::generation_unit_names(
+            &store_root,
+            &generation.parity,
+        )?);
+        collect_tree_files(&store_root.join(&generation.parity), &mut files);
+    }
+
+    let mut views: Vec<(String, PathBuf, Vec<(Unit, ArtifactInfo)>)> = Vec::new();
+    let mut skipped_views = Vec::new();
+    if opts.tier.touches_view() {
+        for (label, root) in known_views(build_root) {
+            if crate::exec::dir_locked(&root) {
+                skipped_views.push(label);
+                continue;
+            }
+            let rows = who::collect(&root).with_context(|| format!("reading view {label}"))?;
+            let units: Vec<(Unit, ArtifactInfo)> = rows
+                .into_iter()
+                .filter(|(unit, _)| names.contains(&unit.dir_name))
+                .collect();
+            if units.is_empty() {
+                continue;
+            }
+            for (unit, arts) in &units {
+                files.extend(view_unit_files(unit, arts));
+            }
+            views.push((label, root, units));
+        }
+    }
+
+    let (nominal, freed, released, count) = account_files(&files);
+    println!(
+        "{}",
+        util::heading(if opts.delete {
+            "epicenter evict — generations"
+        } else {
+            "epicenter evict — generations (DRY RUN — pass --yes to delete)"
+        })
+    );
+    for generation in &chosen {
+        println!(
+            "  {} {:<52} {:>5} unit(s) · {:>9}",
+            util::dim("generation"),
+            generation.parity,
+            generation.units,
+            human_bytes(generation.bytes)
+        );
+    }
+    if !skipped_views.is_empty() {
+        println!(
+            "  {} {} view(s) in use by a live build — skipped",
+            util::warn(util::GLYPH_WARN),
+            skipped_views.len()
+        );
+    }
+    println!();
+    println!(
+        "  {} {} generation(s) · {} unit(s) · {} nominal",
+        util::dim("selection:"),
+        chosen.len(),
+        names.len(),
+        util::green(&human_bytes(nominal))
+    );
+    println!(
+        "  {} {} actually freed · {} links released (still held elsewhere, e.g. a locked view)",
+        util::dim("result:   "),
+        human_bytes(freed),
+        human_bytes(released)
+    );
+    println!(
+        "  {} {} file(s) · {} view(s) planned",
+        util::dim("files:    "),
+        count,
+        views.len()
+    );
+    if !opts.delete {
+        println!(
+            "  {}",
+            util::dim("run again with -y or --yes to delete these generations")
+        );
+        return Ok(());
+    }
+
+    let mut errors = 0u64;
+    let mut unlinked_views = 0usize;
+    for (label, root, units) in &views {
+        if crate::exec::dir_locked(root) {
+            errors += 1;
+            eprintln!("view {label} became busy — skipped");
+            continue;
+        }
+        let _job_lock = if let Some(name) = label.strip_prefix("work/") {
+            match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(
+                &crate::exec::work_root(build_root),
+                name,
+            )) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    errors += 1;
+                    eprintln!("view {label} is in use by an epicenter process — skipped");
+                    continue;
+                }
+                Err(err) => {
+                    errors += 1;
+                    eprintln!("view {label} lock failed: {err:#} — skipped");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        for (unit, arts) in units {
+            remove_view_unit(root, unit, arts, &mut errors);
+        }
+        unlinked_views += 1;
+    }
+
+    let mut deleted = 0usize;
+    for generation in &chosen {
+        match crate::vault::drop_generation(&store_root, &generation.parity) {
+            Ok(true) => deleted += 1,
+            Ok(false) => {
+                errors += 1;
+                eprintln!(
+                    "generation {} is in use by a live harvest — skipped",
+                    generation.parity
+                );
+            }
+            Err(err) => {
+                errors += 1;
+                eprintln!("could not remove generation {}: {err:#}", generation.parity);
+            }
+        }
+    }
+    crate::vault::sweep_store_debris(&store_root);
+
+    println!();
+    println!(
+        "  {} {} generation(s) deleted · {} view(s) unlinked · {} actually freed · {} links released",
+        util::green(util::GLYPH_PASS),
+        deleted,
+        unlinked_views,
+        human_bytes(freed),
+        human_bytes(released)
+    );
+    if errors > 0 {
+        println!(
+            "  {} {} (see messages above)",
+            util::fail(util::GLYPH_FAIL),
+            errors
+        );
+    }
+    println!(
+        "  {}",
+        util::dim("`epicenter vault` shows what the store holds now")
+    );
+    Ok(())
+}
+
 /// The `tier:` line of the selection report.
 fn tier_summary(tier: Tier, views: &[String]) -> String {
     match tier {
@@ -1311,7 +1516,7 @@ fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<
 
     let mut files = Vec::new();
     for (unit, arts) in &chosen {
-        files.extend(view_unit_files(&root, unit, arts));
+        files.extend(view_unit_files(unit, arts));
     }
     let (nominal, freed, released, count) = account_files(&files);
 
@@ -1352,12 +1557,9 @@ fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<
     }
 
     let mut errors = 0u64;
-    if crate::exec::dir_locked(&root) {
-        bail!(
-            "view {} became busy — refusing to unlink from a live build",
-            root.display()
-        );
-    }
+    // `_cargo_locks` has been held since the start: any live build is fenced
+    // out, and re-probing the same locks here would see *our* own guard and
+    // refuse forever (the "became busy" self-lock).
     for (unit, arts) in &chosen {
         remove_view_unit(&root, unit, arts, &mut errors);
     }
@@ -1419,6 +1621,45 @@ mod tests {
         Ok(())
     }
 
+    /// A new-layout unit (`debug/build/<pkg>/<hash>/{fingerprint,out}`).
+    fn write_synthetic_new_unit(root: &Path, package: &str, hash: &str) -> Result<PathBuf> {
+        let unit = root.join("debug/build").join(package).join(hash);
+        fs::create_dir_all(unit.join("fingerprint"))?;
+        fs::create_dir_all(unit.join("out"))?;
+        fs::write(
+            unit.join("fingerprint").join(format!("lib-{package}")),
+            "0011223344556677",
+        )?;
+        fs::write(
+            unit.join("out").join(format!("lib{package}-{hash}.rlib")),
+            [0u8; 16],
+        )?;
+        Ok(unit)
+    }
+
+    #[test]
+    fn removes_a_new_layout_unit_without_touching_siblings() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let one = write_synthetic_new_unit(root.path(), "anyhow", "1122334455667788")?;
+        let two = write_synthetic_new_unit(root.path(), "anyhow", "8877665544332211")?;
+
+        let units = crate::fingerprint::read_units(root.path())?;
+        let unit = units
+            .iter()
+            .find(|unit| unit.dir_suffix == "1122334455667788")
+            .expect("new-layout unit");
+        let arts = crate::fingerprint::artifacts_for(root.path(), unit);
+        let mut errors = 0;
+        remove_view_unit(root.path(), unit, &arts, &mut errors);
+        assert_eq!(errors, 0);
+        assert!(!one.exists(), "the selected unit dir is removed");
+        assert!(
+            two.is_dir(),
+            "a sibling unit of the same package must survive"
+        );
+        Ok(())
+    }
+
     /// `{home}/build` with one unit — hermetic, so the store sits in
     /// `{home}/store` and never touches anything outside the tempdir.
     fn synthetic_home() -> Result<(tempfile::TempDir, PathBuf)> {
@@ -1434,6 +1675,7 @@ mod tests {
             unit: None,
             stale: false,
             rustc_key: None,
+            generation: None,
             husks: false,
             older_than: None,
             work_dirs: false,
@@ -1764,6 +2006,28 @@ mod tests {
     }
 
     #[test]
+    fn work_surgery_holds_the_cargo_lock_without_self_contention() -> Result<()> {
+        let (home, job) = tiered_views()?;
+        // Cargo leaves `.cargo-build-lock` behind after a build. The surgery
+        // holds it for the whole unlink; it must not then probe the same
+        // lock and mistake its own guard for a live build.
+        fs::write(job.join("debug/.cargo-build-lock"), b"")?;
+        let build = home.path().join("build");
+        let opts = Options {
+            work: Some("ci-1"),
+            crate_name: Some("pkg"),
+            delete: true,
+            ..no_selectors()
+        };
+        run(&build, &opts)?;
+        assert!(
+            !job.join("debug/.fingerprint/pkg-1122334455667788").exists(),
+            "the unit is unlinked while the cargo lock is held"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn work_surgery_accepts_the_shared_build_view() -> Result<()> {
         let (home, job) = tiered_views()?;
         let build = home.path().join("build");
@@ -1862,6 +2126,15 @@ mod tests {
             0,
             "store record gone"
         );
+        let parity = crate::vault::parity_key()?;
+        assert!(
+            !store.join(&parity).exists(),
+            "the emptied parity-key store is removed"
+        );
+        assert!(
+            !store.join(format!(".lock-{parity}")).exists(),
+            "its generation lock is removed too"
+        );
         assert!(
             build
                 .join("debug/.fingerprint/pkg-1122334455667788")
@@ -1873,6 +2146,66 @@ mod tests {
                 .join("debug/deps/libpkg-1122334455667788.rlib")
                 .exists(),
             "the view keeps its artifact"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generation_selector_deletes_the_parity_dir_and_lock() -> Result<()> {
+        let (home, build) = harvested_home()?;
+        let store = home.path().join("store");
+        let parity = crate::vault::parity_key()?;
+        let generation = store.join(&parity);
+        let lock = store.join(format!(".lock-{parity}"));
+        assert!(
+            generation.is_dir() && lock.is_file(),
+            "harvested generation"
+        );
+
+        let opts = Options {
+            generation: Some(&parity),
+            force: true,
+            delete: true,
+            ..no_selectors()
+        };
+        run(&build, &opts)?;
+        assert!(!generation.exists(), "parity-key store deleted");
+        assert!(!lock.exists(), "generation lock deleted");
+        assert!(crate::vault::generations(&store)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn generation_selector_protects_the_active_generation() -> Result<()> {
+        let (home, build) = harvested_home()?;
+        let store = home.path().join("store");
+        let parity = crate::vault::parity_key()?;
+        let opts = Options {
+            generation: Some(&parity),
+            delete: true,
+            ..no_selectors()
+        };
+        let err = run(&build, &opts).unwrap_err();
+        assert!(err.to_string().contains("protected"), "{err}");
+        assert!(store.join(&parity).is_dir(), "nothing was deleted");
+        Ok(())
+    }
+
+    #[test]
+    fn debris_sweep_removes_orphan_locks_and_empty_generations() -> Result<()> {
+        let (home, _build) = harvested_home()?;
+        let store = home.path().join("store");
+        let parity = crate::vault::parity_key()?;
+        fs::write(store.join(".lock-9.9.9-deadbeef"), b"")?;
+        fs::create_dir_all(store.join("9.9.9-deadbeef/units"))?;
+
+        crate::vault::sweep_store_debris(&store);
+        assert!(!store.join(".lock-9.9.9-deadbeef").exists());
+        assert!(!store.join("9.9.9-deadbeef").exists());
+        assert!(store.join(&parity).is_dir(), "the live generation is kept");
+        assert!(
+            store.join(format!(".lock-{parity}")).is_file(),
+            "its lock is kept"
         );
         Ok(())
     }
@@ -1966,6 +2299,7 @@ mod tests {
                 memo: "lib-old".into(),
                 hash: "aaaaaaaabbbbbbbb".into(),
                 stamp: 1,
+                layout: None,
                 files: vec![crate::vault::FileEntry {
                     path: "lib-old".into(),
                     dest: ".fingerprint/oldpkg-0000111122223333/lib-old".into(),

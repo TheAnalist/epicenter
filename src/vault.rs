@@ -65,9 +65,18 @@ impl Toolchain {
     }
 }
 
-/// Parse `rustc -vV` (first line + `host:`).
+/// Parse `rustc -vV` (first line + `host:`) for the default toolchain.
 pub fn toolchain() -> Result<Toolchain> {
+    toolchain_of(None)
+}
+
+/// Parse `rustc -vV` for a rustup selector (`nightly`, `1.98.0`, …;
+/// `None` = the default toolchain). `exec` uses this for `cargo +nightly`.
+pub fn toolchain_of(selector: Option<&str>) -> Result<Toolchain> {
     let mut command = util::command_for("rustc")?;
+    if let Some(selector) = selector {
+        command.arg(format!("+{selector}"));
+    }
     let output = command.arg("-vV").output().context("running `rustc -vV`")?;
     if !output.status.success() {
         anyhow::bail!("`rustc -vV` failed — is a toolchain installed?");
@@ -108,7 +117,15 @@ pub fn toolchain() -> Result<Toolchain> {
 /// sysroot (falling back to the sysroot directory). This is the reference
 /// for "was this unit built by the installed toolchain?".
 pub fn toolchain_install_time() -> Option<SystemTime> {
+    toolchain_install_time_of(None)
+}
+
+/// Install time of `selector`'s toolchain (same shape as the default).
+pub fn toolchain_install_time_of(selector: Option<&str>) -> Option<SystemTime> {
     let mut command = util::command_for("rustc").ok()?;
+    if let Some(selector) = selector {
+        command.arg(format!("+{selector}"));
+    }
     let output = command.args(["--print", "sysroot"]).output().ok()?;
     if !output.status.success() {
         return None;
@@ -128,7 +145,17 @@ pub fn toolchain_install_time() -> Option<SystemTime> {
 /// One vault generation = toolchain + host + flag environment:
 /// `1.99.0-b940084d7-x86_64-unknown-linux-gnu-3f9a2c1b`.
 pub fn parity_key() -> Result<String> {
-    let tc = toolchain()?;
+    parity_key_of(None)
+}
+
+/// Parity key for a rustup selector (`exec` with a `+toolchain` child).
+pub fn parity_key_of(selector: Option<&str>) -> Result<String> {
+    let tc = toolchain_of(selector)?;
+    parity_key_with(&tc)
+}
+
+/// Parity key for an already-resolved toolchain (avoid a second `rustc`).
+fn parity_key_with(tc: &Toolchain) -> Result<String> {
     let key = format!(
         "{}-{}-{}-{}",
         tc.release,
@@ -217,6 +244,118 @@ fn store_lock_path(store_root: &Path, parity: &str) -> PathBuf {
     store_root.join(format!(".lock-{parity}"))
 }
 
+/// Remove the per-generation lock file when its generation directory is
+/// gone and no live process holds the lock. A held lock is left alone.
+pub(crate) fn remove_generation_lock(store_root: &Path, generation: &str) {
+    let dir = store_root.join(generation);
+    let path = store_lock_path(store_root, generation);
+    if dir.exists() || !path.exists() {
+        return;
+    }
+    let Ok(Some(_lock)) = FileLock::try_acquire(&path) else {
+        return; // a live harvest holds it
+    };
+    if !dir.exists() {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// Clean the debris a crash or a manual deletion leaves in the store root:
+/// `.lock-*` files whose generation is gone, and empty manifest-less
+/// generation directories. Existing generations and held locks are kept.
+pub fn sweep_store_debris(store_root: &Path) {
+    let Ok(entries) = fs::read_dir(store_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(generation) = name.strip_prefix(".lock-") {
+            if !generation.is_empty() {
+                remove_generation_lock(store_root, generation);
+            }
+        }
+    }
+    let Ok(names) = generation_names(store_root) else {
+        return;
+    };
+    for generation in names {
+        let units = units_dir(store_root, &generation);
+        let empty = fs::read_dir(&units)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true);
+        // Only manifest-less husks: a manifest is owned by `drop_units`,
+        // which removes its generation itself.
+        if !empty || manifest_path(store_root, &generation).is_file() {
+            continue;
+        }
+        let Ok(Some(_lock)) = FileLock::try_acquire(&store_lock_path(store_root, &generation))
+        else {
+            continue;
+        };
+        let still_empty = fs::read_dir(&units)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true);
+        if still_empty {
+            let _ = crate::util::force_remove_dir(&store_root.join(&generation));
+            drop(_lock);
+            remove_generation_lock(store_root, &generation);
+        }
+    }
+}
+
+/// Delete one whole generation under its lock: units, manifest and the
+/// lock file. Returns `false` when a live harvest holds the generation lock.
+pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
+    util::validate_component(parity, "generation")?;
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
+    let dir = store_root.join(parity);
+    let meta = match fs::symlink_metadata(&dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).context("inspecting generation"),
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() || crate::util::is_reparse_point(&meta) {
+        anyhow::bail!("refusing symlinked/reparse generation {}", dir.display());
+    }
+    let lock_path = store_lock_path(store_root, parity);
+    let Ok(Some(lock)) = FileLock::try_acquire(&lock_path) else {
+        return Ok(false);
+    };
+    crate::util::force_remove_dir(&dir)?;
+    drop(lock);
+    remove_generation_lock(store_root, parity);
+    Ok(true)
+}
+
+/// Unit dir names of one generation: the manifest when readable, else the
+/// `units/` directory (so an orphan generation can still be fully deleted).
+pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<String>> {
+    util::validate_component(parity, "generation")?;
+    if let Ok(Some(manifest)) = load_manifest(store_root, parity) {
+        return Ok(manifest
+            .units
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect());
+    }
+    let mut names = Vec::new();
+    if let Ok(entries) = fs::read_dir(units_dir(store_root, parity)) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if util::validate_component(&name, "unit name").is_ok() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 fn ensure_store_root(store_root: &Path) -> Result<()> {
     util::ensure_windows_user_path(store_root, "store")?;
     match fs::symlink_metadata(store_root) {
@@ -269,7 +408,34 @@ pub struct UnitEntry {
     pub hash: String,
     /// Canonical mtime of the whole group (whole seconds).
     pub stamp: u64,
+    /// Build-dir layout this group reconstructs. Absent in manifests written
+    /// before the new layout; inferred from the destinations when missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<fingerprint::UnitLayout>,
     pub files: Vec<FileEntry>,
+}
+
+impl UnitEntry {
+    /// The layout this group reconstructs (recorded, or inferred).
+    pub fn layout(&self) -> fingerprint::UnitLayout {
+        self.layout.unwrap_or_else(|| {
+            if self
+                .files
+                .iter()
+                .any(|file| file.dest.starts_with(".fingerprint/"))
+            {
+                fingerprint::UnitLayout::Classic
+            } else if self
+                .files
+                .iter()
+                .any(|file| file.dest.contains("/fingerprint/"))
+            {
+                fingerprint::UnitLayout::New
+            } else {
+                fingerprint::UnitLayout::Classic
+            }
+        })
+    }
 }
 
 /// One stored file.
@@ -628,7 +794,7 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
     if store_root.exists() {
         check_store_trust(store_root)?;
     }
-    let _lock = FileLock::acquire(&store_lock_path(store_root, generation))?;
+    let lock = FileLock::acquire(&store_lock_path(store_root, generation))?;
     let Some(mut manifest) = load_manifest(store_root, generation)? else {
         return Ok(0);
     };
@@ -709,11 +875,17 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
         }
     }
     manifest.units = kept;
-    if manifest.units.is_empty() {
-        let _ = fs::remove_dir_all(store_root.join(generation));
+    let empty = manifest.units.is_empty();
+    if empty {
+        let _ = crate::util::force_remove_dir(&store_root.join(generation));
     } else if dropped > 0 {
         manifest.updated = now_secs();
         save_manifest(store_root, generation, &manifest)?;
+    }
+    drop(lock);
+    if empty {
+        // The parity-key store is gone; its outside lock file is debris.
+        remove_generation_lock(store_root, generation);
     }
     Ok(dropped)
 }
@@ -746,8 +918,22 @@ pub fn harvest(
     unit_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<HarvestReport> {
-    let tc = toolchain()?;
-    let parity = parity_key()?;
+    harvest_with(build_root, store_root, unit_filter, dry_run, None, None)
+}
+
+/// Harvest for a specific toolchain and/or layout (`exec` with a `+toolchain`
+/// child). The plain [`harvest`] uses the default toolchain and derives the
+/// layout from `cargo --version`.
+pub fn harvest_with(
+    build_root: &Path,
+    store_root: &Path,
+    unit_filter: Option<&str>,
+    dry_run: bool,
+    selector: Option<&str>,
+    layout: Option<fingerprint::UnitLayout>,
+) -> Result<HarvestReport> {
+    let tc = toolchain_of(selector)?;
+    let parity = parity_key_with(&tc)?;
     let mut report = HarvestReport {
         parity: parity.clone(),
         toolchain: tc.version_line(),
@@ -777,10 +963,36 @@ pub fn harvest(
         })
         .collect();
 
+    // A view that mixes both layouts is ambiguous: keep the layout of the
+    // harvest toolchain (stable classic vs nightly new) and drop the other
+    // before the cohort gate, so those units are never filed under this
+    // parity by accident. A single-layout view is harvested as-is.
+    let mixed_layouts = rows
+        .iter()
+        .any(|(unit, _)| unit.layout == fingerprint::UnitLayout::Classic)
+        && rows
+            .iter()
+            .any(|(unit, _)| unit.layout == fingerprint::UnitLayout::New);
+    let expected_layout =
+        layout.or_else(|| mixed_layouts.then(|| fingerprint::layout_for_cargo(&tc.release, &[])));
+    let rows: Vec<(Unit, ArtifactInfo)> = match expected_layout {
+        Some(wanted) => {
+            let before = rows.len();
+            let kept: Vec<(Unit, ArtifactInfo)> = rows
+                .into_iter()
+                .filter(|(unit, _)| unit.layout == wanted)
+                .collect();
+            report.skipped_stale += before - kept.len();
+            kept
+        }
+        None => rows,
+    };
+
     // Freshness gate for the whole cache: nothing built since the toolchain
     // was installed means the cache belongs to an older generation.
     let newest_activity = rows.iter().filter_map(|(_, arts)| arts.newest).max();
-    if let (Some(newest), Some(installed)) = (newest_activity, toolchain_install_time()) {
+    if let (Some(newest), Some(installed)) = (newest_activity, toolchain_install_time_of(selector))
+    {
         if newest < installed {
             report.note = Some(format!(
                 "the shared cache predates the installed toolchain ({}) — build once, then harvest",
@@ -831,10 +1043,7 @@ pub fn harvest(
             continue;
         }
 
-        let unit_dir = build_root
-            .join(&unit.profile)
-            .join(".fingerprint")
-            .join(&unit.dir_name);
+        let unit_dir = &unit.fingerprint_dir;
         let profile_dir = build_root.join(&unit.profile);
         let memo = unit.memo_file.clone();
         let mut files: Vec<(PathBuf, String, String, String)> = Vec::new();
@@ -871,7 +1080,7 @@ pub fn harvest(
             files.push((
                 entry.path(),
                 name.clone(),
-                format!(".fingerprint/{}/{name}", unit.dir_name),
+                format!("{}/{name}", unit.fingerprint_rel()),
                 role.into(),
             ));
         }
@@ -891,10 +1100,16 @@ pub fn harvest(
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if rel.starts_with("deps/") && rel.ends_with(".d") {
+            // rustc's `.d` side files are not needed for freshness: classic
+            // kept them in `deps/`, the new layout keeps them in `out/`.
+            if rel.ends_with(".d")
+                && (rel.starts_with("deps/") || unit.layout == fingerprint::UnitLayout::New)
+            {
                 continue;
             }
-            let role = if rel.starts_with("build/") {
+            let role = if rel.starts_with("deps/") || rel.contains("/out/") {
+                "artifact"
+            } else if rel.starts_with("build/") {
                 "build-tree"
             } else {
                 "artifact"
@@ -996,9 +1211,9 @@ pub fn harvest(
 
         // Unchanged = same hash, profile and stamp, same (path, role) file
         // set, all present. Anything else is refreshed as a whole group.
-        let mut new_entries: Vec<(&str, &str)> = files
+        let mut new_entries: Vec<(&str, &str, &str)> = files
             .iter()
-            .map(|(_, path, _, role)| (path.as_str(), role.as_str()))
+            .map(|(_, path, dest, role)| (path.as_str(), dest.as_str(), role.as_str()))
             .collect();
         new_entries.sort_unstable();
         let already = manifest
@@ -1006,10 +1221,10 @@ pub fn harvest(
             .iter()
             .find(|entry| entry.name == unit.dir_name)
             .map(|entry| {
-                let mut stored: Vec<(&str, &str)> = entry
+                let mut stored: Vec<(&str, &str, &str)> = entry
                     .files
                     .iter()
-                    .map(|file| (file.path.as_str(), file.role.as_str()))
+                    .map(|file| (file.path.as_str(), file.dest.as_str(), file.role.as_str()))
                     .collect();
                 stored.sort_unstable();
                 entry.hash == plan.hash
@@ -1056,6 +1271,7 @@ pub fn harvest(
             memo: plan.memo.clone(),
             hash: plan.hash.clone(),
             stamp,
+            layout: Some(unit.layout),
             files: entries,
         };
         match manifest
@@ -1467,13 +1683,42 @@ fn restore_file_at(
 /// store's canonical stamp; private copies are stamped after copying. Never
 /// overwrites a file that already exists, never touches sources, and a
 /// partial vault is fine: Cargo recompiles whatever is missing.
+///
+/// `unit_filter` narrows by substring (`restore --unit`); `packages` narrows
+/// to a package set (`exec` passes the project's `Cargo.lock` packages, so a
+/// job never inherits every other project's units). Unit names that cannot be
+/// split into package + hash are kept rather than dropped (fail-open).
 pub fn restore(
     view_root: &Path,
     store_root: &Path,
     unit_filter: Option<&str>,
+    packages: Option<&std::collections::HashSet<String>>,
     dry_run: bool,
 ) -> Result<RestoreReport> {
-    let parity = parity_key()?;
+    restore_with(
+        view_root,
+        store_root,
+        unit_filter,
+        packages,
+        None,
+        None,
+        dry_run,
+    )
+}
+
+/// Restore for a specific toolchain/layout (`exec` with a `+toolchain` or a
+/// new-layout child). `layout` skips units stored in the other build-dir
+/// layout; the plain [`restore`] accepts every stored unit.
+pub fn restore_with(
+    view_root: &Path,
+    store_root: &Path,
+    unit_filter: Option<&str>,
+    packages: Option<&std::collections::HashSet<String>>,
+    layout: Option<fingerprint::UnitLayout>,
+    selector: Option<&str>,
+    dry_run: bool,
+) -> Result<RestoreReport> {
+    let parity = parity_key_of(selector)?;
     let mut report = RestoreReport {
         parity: parity.clone(),
         target: view_root.to_path_buf(),
@@ -1502,14 +1747,27 @@ pub fn restore(
                 continue;
             }
         }
-        let fp_dir = view_root
-            .join(&entry.profile)
-            .join(".fingerprint")
-            .join(&entry.name);
-        if read_small_regular(&fp_dir.join(&entry.memo))
+        if let Some(packages) = packages {
+            if let Some(package) = unit_package(&entry.name) {
+                if !packages.contains(package) {
+                    continue;
+                }
+            }
+        }
+        if let Some(layout) = layout {
+            if entry.layout() != layout {
+                continue;
+            }
+        }
+        // The memo's destination in the manifest is layout-agnostic.
+        let already = entry
+            .files
+            .iter()
+            .find(|file| file.path == entry.memo)
+            .and_then(|file| read_small_regular(&view_root.join(&entry.profile).join(&file.dest)))
             .map(|text| text.trim() == entry.hash)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if already {
             report.units_already += 1;
             continue;
         }
@@ -1541,11 +1799,18 @@ pub fn restore(
                     continue;
                 }
             }
-            // Only `deps/` link outputs (`.rlib`, proc-macro `.so`) may share
-            // the store inode — rustc replaces those atomically. `.rmeta` and
+            // Only link outputs (`.rlib`, proc-macro `.so`) may share the
+            // store inode — rustc replaces those atomically. `.rmeta` and
             // everything else are written in place by rustc, cargo or build
-            // scripts: private verified copies only.
-            let shared = file.path.starts_with("deps/") && !file.path.ends_with(".rmeta");
+            // scripts: private verified copies only. Classic keeps link
+            // outputs in `deps/`; the new layout keeps them in `out/`.
+            let shared = if file.path.starts_with("deps/") {
+                !file.path.ends_with(".rmeta")
+            } else if file.path.contains("/out/") {
+                file.path.ends_with(".rlib") || file.path.ends_with(".so")
+            } else {
+                false
+            };
             if dry_run {
                 unit_touched = true;
                 if shared {
@@ -1651,7 +1916,7 @@ pub fn restore(
 /// The store is a trust boundary: refuse a symlinked, foreign-owned, or
 /// group/world-writable store. A root process must not consume a user-owned
 /// vault (that is the hard-link privesc this fix closes).
-fn check_store_trust(store_root: &Path) -> Result<()> {
+pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
     util::ensure_windows_user_path(store_root, "store")?;
     let meta = fs::symlink_metadata(store_root)
         .with_context(|| format!("inspecting store {}", store_root.display()))?;
@@ -2134,6 +2399,13 @@ fn unit_name_matches(name: &str, query: &str) -> bool {
     name.contains(query)
 }
 
+/// The package part of a unit dir name (`serde_core-b468be6fa8c1f936` →
+/// `serde_core`); `None` for a name that does not end in a 16-hex hash.
+fn unit_package(name: &str) -> Option<&str> {
+    let (package, hash) = name.rsplit_once('-')?;
+    (hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(package)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2402,7 +2674,7 @@ mod tests {
         fs::create_dir_all(occupied.parent().unwrap())?;
         fs::write(&occupied, b"live artifact")?;
 
-        let report = restore(view.path(), store.path(), None, false)?;
+        let report = restore(view.path(), store.path(), None, None, false)?;
         assert_eq!(report.units_linked, 3);
         assert_eq!(report.files_existing, 1, "the live artifact was skipped");
         assert_eq!(fs::read(&occupied)?, b"live artifact");
@@ -2443,7 +2715,7 @@ mod tests {
         }
 
         // Second restore: everything already fresh.
-        let again = restore(view.path(), store.path(), None, false)?;
+        let again = restore(view.path(), store.path(), None, None, false)?;
         assert_eq!(again.units_already, 3);
         assert_eq!(again.files_linked, 0);
         assert_eq!(again.files_copied, 0);
@@ -2458,9 +2730,212 @@ mod tests {
         synthetic_build_dir(build.path())?;
         harvest(build.path(), store.path(), None, false)?;
 
-        let report = restore(view.path(), store.path(), None, false)?;
+        let report = restore(view.path(), store.path(), None, None, false)?;
         assert_eq!(report.errors, 0);
         assert!(view.path().join("debug/.fingerprint").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_can_restrict_units_to_packages() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        let now = now_secs();
+        synthetic_edge_dir(build.path(), now - 3600, now)?;
+        harvest(build.path(), store.path(), None, false)?;
+
+        let mut packages = std::collections::HashSet::new();
+        packages.insert("serde_core".to_string());
+        let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
+        assert_eq!(report.errors, 0);
+        assert!(
+            view.path()
+                .join("debug/.fingerprint/serde_core-b468be6fa8c1f936")
+                .is_dir(),
+            "a unit of a selected package is restored"
+        );
+        assert!(
+            !view
+                .path()
+                .join("debug/.fingerprint/serde-746d173581f1a314")
+                .exists(),
+            "a unit of an unselected package is not restored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn harvest_and_restore_new_layout_units() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        let unit = synthetic_new_layout_unit(build.path(), "anyhow", "9709d57b46b8d526")?;
+
+        let report = harvest_with(
+            build.path(),
+            store.path(),
+            None,
+            false,
+            None,
+            Some(fingerprint::UnitLayout::New),
+        )?;
+        assert_eq!(report.stored, 1, "{report:?}");
+
+        let parity = parity_key()?;
+        let manifest = load_manifest(store.path(), &parity)?.expect("manifest");
+        let entry = &manifest.units[0];
+        assert_eq!(entry.layout(), fingerprint::UnitLayout::New);
+        assert!(
+            entry
+                .files
+                .iter()
+                .any(|file| file.dest == "build/anyhow/9709d57b46b8d526/fingerprint/lib-anyhow")
+        );
+        assert!(
+            entry.files.iter().any(|file| file.dest
+                == "build/anyhow/9709d57b46b8d526/out/libanyhow-9709d57b46b8d526.rlib")
+        );
+        assert!(
+            !entry.files.iter().any(|file| file.dest.ends_with(".d")),
+            "rustc .d side files stay out of the vault"
+        );
+
+        let restored = restore_with(
+            view.path(),
+            store.path(),
+            None,
+            None,
+            Some(fingerprint::UnitLayout::New),
+            None,
+            false,
+        )?;
+        assert_eq!(restored.errors, 0);
+        let root = view.path().join("debug/build/anyhow/9709d57b46b8d526");
+        assert!(root.join("fingerprint/lib-anyhow").is_file());
+        assert!(root.join("out/libanyhow-9709d57b46b8d526.rlib").is_file());
+        assert!(root.join("out/libanyhow-9709d57b46b8d526.rmeta").is_file());
+        assert!(
+            !view.path().join("debug/.fingerprint").exists(),
+            "no classic paths for a new-layout unit"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let rlib = root.join("out/libanyhow-9709d57b46b8d526.rlib");
+            let rmeta = root.join("out/libanyhow-9709d57b46b8d526.rmeta");
+            assert!(fs::metadata(&rlib)?.nlink() >= 2, "rlib is a hard link");
+            assert_eq!(fs::metadata(&rmeta)?.nlink(), 1, "rmeta is a copy");
+        }
+        // The fixture's source unit survives untouched.
+        assert!(unit.join("out/libanyhow-9709d57b46b8d526.rlib").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn harvest_refreshes_when_only_the_layout_changes() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        harvest(build.path(), store.path(), Some("102a33f0"), false)?;
+
+        let parity = parity_key()?;
+        let before = load_manifest(store.path(), &parity)?.expect("manifest");
+        assert_eq!(before.units[0].layout(), fingerprint::UnitLayout::Classic);
+        let stamp = before.units[0].stamp;
+
+        // Same package/hash/memo/json — only the destinations move to the
+        // new layout. The "unchanged" check must notice the new dests.
+        fs::remove_dir_all(build.path().join("debug/.fingerprint"))?;
+        let unit = synthetic_new_layout_unit(build.path(), "serde", "102a33f055a8d229")?;
+        fs::write(
+            unit.join("fingerprint/lib-serde.json"),
+            r#"{"rustc":12019306335353385202,"features":"[]","declared_features":"[]","deps":[]}"#,
+        )?;
+        for file in [
+            unit.join("fingerprint/lib-serde"),
+            unit.join("fingerprint/lib-serde.json"),
+            unit.join("fingerprint/dep-lib-serde"),
+            unit.join("out/libserde-102a33f055a8d229.rlib"),
+            unit.join("out/libserde-102a33f055a8d229.rmeta"),
+        ] {
+            set_stamp(&file, stamp)?;
+        }
+
+        let report = harvest_with(
+            build.path(),
+            store.path(),
+            Some("102a33f0"),
+            false,
+            None,
+            Some(fingerprint::UnitLayout::New),
+        )?;
+        assert_eq!(report.refreshed, 1, "{report:?}");
+        assert_eq!(report.stored, 0);
+
+        let after = load_manifest(store.path(), &parity)?.expect("manifest");
+        assert_eq!(
+            after.units[0].layout(),
+            fingerprint::UnitLayout::New,
+            "the recorded layout follows the dests"
+        );
+        assert!(
+            after.units[0]
+                .files
+                .iter()
+                .any(|file| file.dest.starts_with("build/serde/102a33f055a8d229/"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_can_filter_units_by_layout() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        synthetic_new_layout_unit(build.path(), "anyhow", "9709d57b46b8d526")?;
+
+        harvest_with(
+            build.path(),
+            store.path(),
+            None,
+            false,
+            None,
+            Some(fingerprint::UnitLayout::Classic),
+        )?;
+        harvest_with(
+            build.path(),
+            store.path(),
+            None,
+            false,
+            None,
+            Some(fingerprint::UnitLayout::New),
+        )?;
+
+        let report = restore_with(
+            view.path(),
+            store.path(),
+            None,
+            None,
+            Some(fingerprint::UnitLayout::New),
+            None,
+            false,
+        )?;
+        assert_eq!(report.errors, 0);
+        assert!(
+            view.path()
+                .join("debug/build/anyhow/9709d57b46b8d526/fingerprint/lib-anyhow")
+                .is_file()
+        );
+        assert!(
+            !view
+                .path()
+                .join("debug/.fingerprint/serde-102a33f055a8d229")
+                .exists(),
+            "a classic unit is not restored into a new-layout child"
+        );
         Ok(())
     }
 
@@ -2468,7 +2943,7 @@ mod tests {
     fn restore_without_a_generation_reports_fail_open() -> Result<()> {
         let view = tempfile::tempdir()?;
         let store = tempfile::tempdir()?;
-        let report = restore(view.path(), store.path(), None, false)?;
+        let report = restore(view.path(), store.path(), None, None, false)?;
         assert!(report.note.is_some());
         assert_eq!(report.files_linked, 0);
         Ok(())
@@ -2611,7 +3086,7 @@ mod tests {
         harvest(build.path(), store.path(), Some("102a33f0"), false)?;
 
         let view = tempfile::tempdir()?;
-        restore(view.path(), store.path(), Some("102a33f0"), false)?;
+        restore(view.path(), store.path(), Some("102a33f0"), None, false)?;
 
         let state = view
             .path()
@@ -2661,6 +3136,30 @@ mod tests {
     /// Two units with a resolved dependency edge: `serde` → `serde_core`.
     /// `dep_at`/`unit_at` are the stamps the files carry, so harvest stores
     /// exactly that ordering.
+    /// A minimal new-layout unit: `debug/build/<pkg>/<hash>/{fingerprint,out}`.
+    fn synthetic_new_layout_unit(root: &Path, package: &str, hash: &str) -> Result<PathBuf> {
+        let unit = root.join("debug/build").join(package).join(hash);
+        fs::create_dir_all(unit.join("fingerprint"))?;
+        fs::create_dir_all(unit.join("out"))?;
+        fs::write(
+            unit.join("fingerprint").join(format!("lib-{package}")),
+            "5d82713a7f2d05e2",
+        )?;
+        fs::write(
+            unit.join("fingerprint").join(format!("dep-lib-{package}")),
+            [0u8; 8],
+        )?;
+        fs::write(
+            unit.join("out").join(format!("lib{package}-{hash}.rlib")),
+            [7u8; 64],
+        )?;
+        fs::write(
+            unit.join("out").join(format!("lib{package}-{hash}.rmeta")),
+            [6u8; 48],
+        )?;
+        Ok(unit)
+    }
+
     fn synthetic_edge_dir(root: &Path, dep_at: u64, unit_at: u64) -> Result<()> {
         fs::create_dir_all(root.join("debug/deps"))?;
         let core = root.join("debug/.fingerprint/serde_core-b468be6fa8c1f936");
@@ -2916,6 +3415,7 @@ mod tests {
             memo: "lib-x".into(),
             hash: "0123456789abcdef".into(),
             stamp: 1,
+            layout: None,
             files: vec![FileEntry {
                 path: path.into(),
                 dest: dest.into(),
@@ -3012,7 +3512,7 @@ mod tests {
         );
 
         let view = tempfile::tempdir()?;
-        let report = restore(view.path(), store.path(), None, false)?;
+        let report = restore(view.path(), store.path(), None, None, false)?;
         assert!(report.errors > 0, "tampered artifact must not install");
         assert!(
             !view.path().join(&file.dest).exists(),
