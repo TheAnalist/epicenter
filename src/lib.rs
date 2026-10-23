@@ -6,6 +6,7 @@ pub mod config;
 pub mod doctor;
 pub mod evict;
 pub mod exec;
+pub mod fastlink;
 pub mod fingerprint;
 pub mod paths;
 pub mod prune;

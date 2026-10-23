@@ -43,6 +43,29 @@ enum Command {
         /// Remove an existing rustc-wrapper setting.
         #[arg(long, conflicts_with = "with_wrapper")]
         without_wrapper: bool,
+        /// Wire rustup's bundled LLD into ~/.cargo/config.toml for a faster
+        /// linker, zero installs: GNU/ELF hosts get `-fuse-ld=lld` plus the
+        /// toolchain's `gcc-ld` search dir; MSVC hosts use the bundled
+        /// `lld-link.exe`. Changes RUSTFLAGS, so units re-key once.
+        #[arg(long)]
+        fast: bool,
+        /// Remove the rustflags written by `--fast` (only if they still match).
+        #[arg(long, conflicts_with = "fast")]
+        without_fast: bool,
+        /// Restore ~/.cargo/config.toml from its newest setup backup
+        /// (`config.toml.epicenter-bak[.N]`), then stop.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "cache_root",
+                "use_default",
+                "with_wrapper",
+                "without_wrapper",
+                "fast",
+                "without_fast"
+            ]
+        )]
+        revert_config: bool,
     },
     /// Show what the shared cache currently holds.
     Status,
@@ -77,7 +100,8 @@ enum Command {
         unit: String,
     },
     /// Remove units or stale working dirs deliberately: dry run by default,
-    /// `-y` or `--yes` to delete. Current-generation units are protected unless `--force`.
+    /// `-y` or `--yes` to delete. Bulk selectors protect current-generation
+    /// units unless `--force`; an explicit `--unit` is deliberate.
     Evict {
         /// Unit to remove: dir hash fragment or package name.
         #[arg(long)]
@@ -120,7 +144,8 @@ enum Command {
         /// `store` (the vault only), or `view` (build dir + job dirs only).
         #[arg(long, value_enum, default_value = "all")]
         tier: epicenter_cli::evict::Tier,
-        /// Also include units on the current toolchain generation.
+        /// Also include current-generation units matched by bulk selectors
+        /// (an explicit `--unit` is deliberate and needs no --force).
         #[arg(long)]
         force: bool,
         /// Show what would be removed without removing it.
@@ -216,11 +241,17 @@ fn run() -> Result<()> {
             use_default,
             with_wrapper,
             without_wrapper,
+            fast,
+            without_fast,
+            revert_config,
         } => cmd_setup(
             cache_root.as_deref(),
             use_default,
             with_wrapper.as_deref(),
             without_wrapper,
+            fast,
+            without_fast,
+            revert_config,
         ),
         Command::Status => cmd_status(),
         Command::Prune {
@@ -299,7 +330,30 @@ fn cmd_setup(
     use_default: bool,
     with_wrapper: Option<&str>,
     without_wrapper: bool,
+    fast: bool,
+    without_fast: bool,
+    revert_config: bool,
 ) -> Result<()> {
+    if revert_config {
+        let report = config::revert_config()?;
+        println!("{}", util::heading("epicenter setup — revert"));
+        println!(
+            "  {} {}",
+            util::dim(&format!("{:<11}", "config")),
+            report.config.display()
+        );
+        println!(
+            "  {} {}",
+            util::dim(&format!("{:<11}", "restored")),
+            util::green(&report.backup.display().to_string())
+        );
+        println!(
+            "  {}",
+            util::dim("the backup is kept — run `epicenter setup` to change the config again")
+        );
+        return Ok(());
+    }
+
     let mut wrapper_path: Option<PathBuf> = None;
     if let Some(name) = with_wrapper {
         if name.is_empty() || name.contains('/') || name.contains('\\') {
@@ -314,7 +368,14 @@ fn cmd_setup(
             ),
         }
     }
-    let report = config::setup(cache_root, use_default, with_wrapper, without_wrapper)?;
+    let report = config::setup(
+        cache_root,
+        use_default,
+        with_wrapper,
+        without_wrapper,
+        fast,
+        without_fast,
+    )?;
     println!(
         "{} shared cache ready at {}",
         util::green(util::GLYPH_PASS),
@@ -356,12 +417,55 @@ fn cmd_setup(
             }
         }
     }
+    if let Some(fast) = &report.fast {
+        match fast.edit {
+            config::CargoEdit::Inserted | config::CargoEdit::Appended => {
+                println!(
+                    "{} fast linker:  rust-lld for {}",
+                    util::green(util::GLYPH_PASS),
+                    fast.target
+                );
+                println!("  lld:          {}", fast.lld.display());
+                println!("  rustflags:    {}", fast.flags.join(" "));
+                println!(
+                    "{} RUSTFLAGS changed — every unit re-keys; the next build repopulates the shared cache (run `epicenter harvest` after).",
+                    util::warn(util::GLYPH_WARN)
+                );
+                if std::env::var_os("RUSTFLAGS").is_some()
+                    || std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some()
+                {
+                    println!(
+                        "{} RUSTFLAGS is set in this shell — it overrides the config flags; unset it for --fast to take effect.",
+                        util::warn(util::GLYPH_WARN)
+                    );
+                }
+            }
+            config::CargoEdit::Removed => println!(
+                "{} fast linker:  removed for {}",
+                util::green(util::GLYPH_PASS),
+                fast.target
+            ),
+            config::CargoEdit::AlreadySet if fast.conflict => println!(
+                "{} fast linker:  rustflags for {} are already set — left unchanged (edit ~/.cargo/config.toml to replace them)",
+                util::warn(util::GLYPH_WARN),
+                fast.target
+            ),
+            config::CargoEdit::AlreadySet => println!(
+                "{} fast linker:  already configured for {}",
+                util::green(util::GLYPH_PASS),
+                fast.target
+            ),
+            _ => {}
+        }
+    }
     if let Some(backup) = &report.backup {
         println!(
             "  backup of previous cargo config: {}",
             util::dim(&backup.display().to_string())
         );
     }
+
+    // revert to last backup
     println!();
     println!("→ every `cargo build` on this machine now shares one cache.");
     println!("  Try `epicenter status` after your next build.");

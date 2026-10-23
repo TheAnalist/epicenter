@@ -161,7 +161,7 @@ fn parity_key_with(tc: &Toolchain) -> Result<String> {
         tc.release,
         tc.commit,
         tc.host,
-        flags_digest()
+        flags_digest(&tc.host)
     );
     // The key becomes a directory name: never allow traversal via a fake
     // `rustc -vV` on PATH (e.g. release `../../x`).
@@ -171,7 +171,7 @@ fn parity_key_with(tc: &Toolchain) -> Result<String> {
 
 /// Digest of the flags that live outside the fingerprint: the flag
 /// environment plus the flag-relevant keys of Cargo's global config.
-fn flags_digest() -> String {
+fn flags_digest(host: &str) -> String {
     let mut input = String::from(PARITY_SEED);
     for name in [
         "RUSTFLAGS",
@@ -193,6 +193,19 @@ fn flags_digest() -> String {
             for key in ["rustflags", "rustdocflags", "target", "rustc-wrapper"] {
                 if let Some(value) = crate::config::read_table_key(&text, "build", key) {
                     input.push('\0');
+                    input.push_str(key);
+                    input.push('=');
+                    input.push_str(&value);
+                }
+            }
+            // Target-scoped flags are part of the fingerprint too — `setup
+            // --fast` writes them, so the vault generation must follow.
+            let target_table = format!("target.{host}");
+            for key in ["rustflags", "rustdocflags", "linker"] {
+                if let Some(value) = crate::config::read_table_key(&text, &target_table, key) {
+                    input.push('\0');
+                    input.push_str(&target_table);
+                    input.push('.');
                     input.push_str(key);
                     input.push('=');
                     input.push_str(&value);
@@ -2503,7 +2516,7 @@ mod tests {
         assert_eq!(first, second);
         let tc = toolchain()?;
         assert!(first.starts_with(&format!("{}-{}", tc.release, tc.commit)));
-        assert!(first.ends_with(&flags_digest()));
+        assert!(first.ends_with(&flags_digest(&tc.host)));
         Ok(())
     }
 

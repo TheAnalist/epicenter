@@ -173,6 +173,39 @@ pub(crate) fn job_lock_path(work_root: &Path, job_id: &str) -> PathBuf {
     work_root.join(format!(".lock-{job_id}"))
 }
 
+/// Remove the per-job lock file once the job dir is gone and no process holds
+/// the lock. A held lock (a live job) or an existing dir keeps it.
+pub(crate) fn remove_job_lock(work_root: &Path, job_id: &str) {
+    let dir = work_root.join(job_id);
+    let path = job_lock_path(work_root, job_id);
+    if dir.exists() || !path.exists() {
+        return;
+    }
+    let Ok(Some(_lock)) = crate::util::FileLock::try_acquire(&path) else {
+        return;
+    };
+    if !dir.exists() {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// Clear `.lock-*` debris whose job dir is gone (a crash, or a removal from
+/// before this cleanup existed). Locks of live or kept jobs are left alone.
+pub(crate) fn sweep_job_locks(work_root: &Path) {
+    let Ok(entries) = fs::read_dir(work_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(job_id) = name.strip_prefix(".lock-") else {
+            continue;
+        };
+        if !job_id.is_empty() {
+            remove_job_lock(work_root, job_id);
+        }
+    }
+}
+
 /// What the caller wants.
 pub struct Options<'a> {
     /// Job id / work-dir name; `None` mints one.
@@ -322,7 +355,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     crate::util::create_private_dir_all(work_root)?;
     // Acquire the per-job lock BEFORE looking at/creating the dir: the bulk
     // work-dir GC takes the same lock and must never see an unlocked empty dir.
-    let _job_lock = match crate::util::FileLock::try_acquire(&job_lock_path(work_root, &job_id))? {
+    let job_lock = match crate::util::FileLock::try_acquire(&job_lock_path(work_root, &job_id))? {
         Some(lock) => lock,
         None => bail!(
             "job {} is in use by another epicenter process — wait for it, or use another --id",
@@ -526,6 +559,13 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             work_dir.display(),
             util::dim("(kept — pass --rm to remove)")
         );
+    }
+    // The job dir is gone: drop its outside lock and clear old lock debris.
+    // A kept dir keeps its lock (the next `--reuse` takes the same file).
+    drop(job_lock);
+    if removed {
+        remove_job_lock(work_root, &job_id);
+        sweep_job_locks(work_root);
     }
     Ok(code)
 }
@@ -748,6 +788,8 @@ mod tests {
     fn exec_rm_removes_the_job_dir_either_way() -> Result<()> {
         let (_build, store) = seeded_store()?;
         let work = tempfile::tempdir()?;
+        // Old lock debris from a job dir that no longer exists (or a crash).
+        fs::write(work.path().join(".lock-orphan"), b"")?;
 
         let ok: Vec<String> = vec!["true".into()];
         let opts = Options {
@@ -761,6 +803,14 @@ mod tests {
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
         assert!(!work.path().join("j-ok").exists(), "success -> removed");
+        assert!(
+            !work.path().join(".lock-j-ok").exists(),
+            "success -> its job lock removed"
+        );
+        assert!(
+            !work.path().join(".lock-orphan").exists(),
+            "orphan lock debris swept"
+        );
 
         // `--rm` is explicit: a failing build is removed too (the fixed
         // rmeta-era failure mode used to leave dirs piling up here).
@@ -779,6 +829,10 @@ mod tests {
             !work.path().join("j-bad").exists(),
             "--rm -> removed on failure too"
         );
+        assert!(
+            !work.path().join(".lock-j-bad").exists(),
+            "--rm -> its job lock removed on failure too"
+        );
 
         // Without --rm the dir stays for inspection.
         let kept: Vec<String> = vec!["true".into()];
@@ -795,6 +849,10 @@ mod tests {
         assert!(
             work.path().join("j-keep").exists(),
             "no --rm -> kept for inspection"
+        );
+        assert!(
+            work.path().join(".lock-j-keep").exists(),
+            "a kept job keeps its lock for the next --reuse"
         );
         Ok(())
     }

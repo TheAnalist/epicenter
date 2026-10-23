@@ -139,6 +139,8 @@ pub enum CargoEdit {
     AlreadySet,
     /// The key was appendend at the end of the toml file
     Appended,
+    /// Revert config file to the last backup
+    Reverted,
 }
 
 impl CargoEdit {
@@ -150,6 +152,7 @@ impl CargoEdit {
             CargoEdit::Removed => "removed",
             CargoEdit::AlreadySet => "already set, unchanged",
             CargoEdit::Appended => "appended line at the EOF",
+            CargoEdit::Reverted => "config file reverted to last backup",
         }
     }
 }
@@ -230,6 +233,83 @@ fn remove_build_key(text: &str, key: &str) -> (String, CargoEdit) {
 /// Parse the value of `key` out of the `[build]` table.
 fn read_build_key(text: &str, key: &str) -> Option<String> {
     read_table_key(text, "build", key)
+}
+
+/// Is this line the `[target.<triple>]` header (plain or TOML-quoted)?
+fn is_target_header(line: &str, target: &str) -> bool {
+    let compact = line.trim().replace([' ', '\t'], "");
+    compact == format!("[target.{target}]")
+        || compact == format!("[target.\"{target}\"]")
+        || compact == format!("[target.'{target}']")
+}
+
+/// Insert `rustflags = ...` into `[target.<target>]`, preserving every other
+/// line and comment. Existing `rustflags` are **never** overwritten: the
+/// third return value reports that conflict instead.
+fn set_target_rustflags(text: &str, target: &str, literal: &str) -> (String, CargoEdit, bool) {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if let Some(header) = lines.iter().position(|line| is_target_header(line, target)) {
+        let mut end = header + 1;
+        while end < lines.len() {
+            let trimmed = lines[end].trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                break;
+            }
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim() == "rustflags" {
+                    let same = clean_toml_value(value) == literal;
+                    return (text.to_string(), CargoEdit::AlreadySet, !same);
+                }
+            }
+            end += 1;
+        }
+        lines.insert(end, format!("rustflags = {literal}"));
+        (lines.join("\n") + "\n", CargoEdit::Inserted, false)
+    } else {
+        let needs_blank = lines.last().map_or(false, |line| !line.trim().is_empty());
+        if needs_blank {
+            lines.push(String::new());
+        }
+        lines.push(format!("[target.{target}]"));
+        lines.push(format!("rustflags = {literal}"));
+        (lines.join("\n") + "\n", CargoEdit::Appended, false)
+    }
+}
+
+/// Remove the `--fast` `rustflags` from `[target.<target>]` only when the
+/// value still matches what `--fast` writes. Anything else is left alone.
+fn remove_target_rustflags(text: &str, target: &str, literal: &str) -> (String, CargoEdit, bool) {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_table = false;
+    let mut removed = false;
+    let mut conflict = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_table = is_target_header(line, target);
+            out.push(line.to_string());
+            continue;
+        }
+        if in_table {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim() == "rustflags" {
+                    if clean_toml_value(value) == literal {
+                        removed = true;
+                        continue;
+                    }
+                    conflict = true;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    if removed {
+        (out.join("\n") + "\n", CargoEdit::Removed, false)
+    } else if conflict {
+        (text.to_string(), CargoEdit::AlreadySet, true)
+    } else {
+        (text.to_string(), CargoEdit::AlreadySet, false)
+    }
 }
 
 /// Strip a trailing `#` comment while respecting single/double quoted values.
@@ -342,10 +422,23 @@ pub struct SetupReport {
     pub build_dir_edit: CargoEdit,
     /// What happened to the `rustc-wrapper` (kache/sccache) setting, if touched.
     pub wrapper_edit: Option<CargoEdit>,
+    /// What happened to the zero-install fast linker (`--fast`), if touched.
+    pub fast: Option<FastSetupReport>,
     /// Backup of the previous cargo config, if it was modified.
     pub backup: Option<PathBuf>,
     /// Is the override mode active (vs the canonical template)?
     pub using_override: bool,
+}
+
+/// The `--fast` outcome: rustup's bundled LLD wired into the host target.
+pub struct FastSetupReport {
+    pub target: String,
+    /// `ld.lld` / `lld-link.exe` that the flags point at.
+    pub lld: PathBuf,
+    pub flags: Vec<String>,
+    pub edit: CargoEdit,
+    /// Existing `rustflags` differ and were left untouched.
+    pub conflict: bool,
 }
 
 /// The full `epicenter setup` orchestration: compute the decision, make the
@@ -384,6 +477,8 @@ pub fn setup(
     use_default: bool,
     with_wrapper: Option<&str>,
     without_wrapper: bool,
+    fast: bool,
+    without_fast: bool,
 ) -> Result<SetupReport> {
     // Decision precedence: CLI root > the value already in cargo's config >
     // the canonical default template. `--cache-root` / `--use-default`
@@ -410,7 +505,15 @@ pub fn setup(
 
     // No epicenter side-file: the decision itself is the cargo config below.
     let cargo_cfg = cargo_config_path()?;
-    let (build_dir_edit, wrapper_edit, backup) = if !cargo_cfg.exists() {
+
+    // Detect rustup's bundled LLD only when the user asked for the fast tier;
+    // failure here is a setup error, never a silent no-op.
+    let fast_linker = if fast || without_fast {
+        Some(crate::fastlink::detect()?)
+    } else {
+        None
+    };
+    let (build_dir_edit, wrapper_edit, fast_report, backup) = if !cargo_cfg.exists() {
         if let Some(parent) = cargo_cfg.parent() {
             crate::util::create_private_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -422,8 +525,22 @@ pub fn setup(
         } else {
             None
         };
+        let fast_report = match &fast_linker {
+            Some(lld) if fast => {
+                let literal = lld.rustflags_toml();
+                text.push_str(&format!("\n[target.{}]\nrustflags = {literal}\n", lld.host));
+                Some(FastSetupReport {
+                    target: lld.host.clone(),
+                    lld: lld.linker.clone(),
+                    flags: lld.rustflags(),
+                    edit: CargoEdit::Appended,
+                    conflict: false,
+                })
+            }
+            _ => None,
+        };
         crate::util::write_atomic_private(&cargo_cfg, text.as_bytes())?;
-        (CargoEdit::Created, wrapper_edit, None)
+        (CargoEdit::Created, wrapper_edit, fast_report, None)
     } else {
         let text = crate::util::read_trusted_config(&cargo_cfg, 1024 * 1024)
             .with_context(|| format!("reading {}", cargo_cfg.display()))?;
@@ -439,41 +556,123 @@ pub fn setup(
             }
             None => (text, None),
         };
+        let (text, fast_report) = match &fast_linker {
+            Some(lld) => {
+                let literal = lld.rustflags_toml();
+                let (text, edit, conflict) = if fast {
+                    set_target_rustflags(&text, &lld.host, &literal)
+                } else {
+                    remove_target_rustflags(&text, &lld.host, &literal)
+                };
+                (
+                    text,
+                    Some(FastSetupReport {
+                        target: lld.host.clone(),
+                        lld: lld.linker.clone(),
+                        flags: lld.rustflags(),
+                        edit,
+                        conflict,
+                    }),
+                )
+            }
+            None => (text, None),
+        };
         let mut backup = None;
         let changed = build_dir_edit != CargoEdit::AlreadySet
             || wrapper_edit
                 .as_ref()
-                .is_some_and(|e| *e != CargoEdit::AlreadySet);
+                .is_some_and(|e| *e != CargoEdit::AlreadySet)
+            || fast_report
+                .as_ref()
+                .is_some_and(|report| report.edit != CargoEdit::AlreadySet);
         if changed {
             backup = Some(backup_file(&cargo_cfg)?);
             crate::util::write_atomic_private(&cargo_cfg, text.as_bytes())?;
         }
-        (build_dir_edit, wrapper_edit, backup)
+        (build_dir_edit, wrapper_edit, fast_report, backup)
     };
 
     Ok(SetupReport {
         root,
         build_dir_edit,
         wrapper_edit,
+        fast: fast_report,
         backup,
         using_override: build_dir_value != DEFAULT_BUILD_DIR,
     })
 }
 
-/// Copy `path` to `path.epicenter-bak` before modifying it.
-fn backup_file(path: &Path) -> Result<PathBuf> {
+/// `<config>.epicenter-bak` (suffix 0).
+fn backup_base(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".epicenter-bak");
-    let base = path.with_file_name(name);
-    // Never write through a pre-existing symlink; pick a fresh name instead.
-    let mut backup = base.clone();
-    let mut suffix = 0u32;
-    while fs::symlink_metadata(&backup).is_ok() {
-        suffix += 1;
-        let mut name = base.file_name().unwrap_or_default().to_os_string();
-        name.push(format!(".{suffix}"));
-        backup = base.with_file_name(name);
+    path.with_file_name(name)
+}
+
+/// Setup backups for a config path, oldest to newest.
+///
+/// Suffixes are monotonic (`…-bak`, `…-bak.1`, `…-bak.2`, …), so the newest
+/// backup is always the highest suffix — never mtime (copies can carry any
+/// timestamp) and never "first free" (a gap would break the ordering).
+fn backups(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let base = backup_base(path);
+    let Some(parent) = base.parent() else {
+        return Ok(Vec::new());
+    };
+    let base_name = base
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", parent.display())),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let suffix = if name == base_name {
+            0
+        } else if let Some(rest) = name.strip_prefix(&base_name) {
+            match rest.strip_prefix('.').and_then(|n| n.parse::<u64>().ok()) {
+                Some(number) => number,
+                None => continue, // `…-bak.2.tmp`, `…-bak.old`
+            }
+        } else {
+            continue;
+        };
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_file() || meta.file_type().is_symlink() || crate::util::is_reparse_point(&meta)
+        {
+            continue;
+        }
+        out.push((suffix, entry.path()));
     }
+    out.sort_by_key(|(suffix, _)| *suffix);
+    Ok(out)
+}
+
+/// The newest setup backup for a config path, if any.
+fn latest_backup(path: &Path) -> Result<Option<PathBuf>> {
+    Ok(backups(path)?.pop().map(|(_, path)| path))
+}
+
+/// Copy `path` to the next numbered backup before modifying it.
+fn backup_file(path: &Path) -> Result<PathBuf> {
+    let base = backup_base(path);
+    let next = backups(path)?
+        .last()
+        .map(|(suffix, _)| suffix + 1)
+        .unwrap_or(0);
+    let mut name = base.file_name().unwrap_or_default().to_os_string();
+    if next > 0 {
+        name.push(format!(".{next}"));
+    }
+    let backup = base.with_file_name(name);
     // Create the backup with O_EXCL; the source is opened O_NOFOLLOW by
     // copy_file_hashed so a swapped symlink cannot redirect the copy.
     let source = path.to_path_buf();
@@ -483,6 +682,37 @@ fn backup_file(path: &Path) -> Result<PathBuf> {
         let _ = fs::set_permissions(&backup, meta.permissions());
     }
     Ok(backup)
+}
+
+/// Restored config + the backup it came from.
+#[derive(Debug)]
+pub struct RevertReport {
+    pub config: PathBuf,
+    pub backup: PathBuf,
+}
+
+/// Restore the global cargo config from its newest setup backup.
+pub fn revert_config() -> Result<RevertReport> {
+    let config = cargo_config_path()?;
+    revert_config_at(&config)
+}
+
+/// Restore `config` from its newest backup: trusted read, atomic write.
+fn revert_config_at(config: &Path) -> Result<RevertReport> {
+    let Some(backup) = latest_backup(config)? else {
+        anyhow::bail!(
+            "no setup backup found next to {} — run `epicenter setup` after a change first",
+            config.display()
+        );
+    };
+    let text = crate::util::read_trusted_config(&backup, 1024 * 1024)
+        .with_context(|| format!("reading backup {}", backup.display()))?;
+    crate::util::write_atomic_private(config, text.as_bytes())
+        .with_context(|| format!("restoring {}", config.display()))?;
+    Ok(RevertReport {
+        config: config.to_path_buf(),
+        backup,
+    })
 }
 
 #[cfg(test)]
@@ -504,6 +734,144 @@ mod tests {
         let dir = out.find("build-dir = '/cache'").unwrap();
         let net = out.find("[net]").unwrap();
         assert!(dir < net, "replaced value must stay inside [build]:\n{out}");
+    }
+
+    #[test]
+    fn backups_are_numbered_and_latest_wins() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[build]\nbuild-dir = '/one'\n")?;
+
+        let first = backup_file(&config)?;
+        assert_eq!(
+            first.file_name().unwrap(),
+            "config.toml.epicenter-bak",
+            "the first backup has no suffix"
+        );
+        fs::write(&config, "[build]\nbuild-dir = '/two'\n")?;
+        let second = backup_file(&config)?;
+        assert_eq!(
+            second.file_name().unwrap(),
+            "config.toml.epicenter-bak.1",
+            "suffixes are monotonic"
+        );
+        assert_eq!(latest_backup(&config)?, Some(second.clone()));
+        assert_eq!(
+            fs::read_to_string(&first)?,
+            "[build]\nbuild-dir = '/one'\n",
+            "the older backup is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revert_restores_the_newest_backup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "one\n")?;
+        let first = backup_file(&config)?;
+        fs::write(&config, "two\n")?;
+        let second = backup_file(&config)?;
+        fs::write(&config, "current\n")?;
+
+        let report = revert_config_at(&config)?;
+        assert_eq!(report.config, config.clone());
+        assert_eq!(report.backup, second);
+        assert_eq!(fs::read_to_string(&config)?, "two\n");
+        assert!(first.is_file() && second.is_file(), "backups are kept");
+
+        // Reverting again is idempotent: the newest backup is still the same.
+        let again = revert_config_at(&config)?;
+        assert_eq!(again.backup, second);
+        assert_eq!(fs::read_to_string(&config)?, "two\n");
+        Ok(())
+    }
+
+    #[test]
+    fn revert_without_a_backup_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let err = revert_config_at(&config).unwrap_err();
+        assert!(err.to_string().contains("no setup backup"), "{err}");
+    }
+
+    #[test]
+    fn inserts_fast_flags_into_an_existing_target_table() {
+        let src = "[build]\nbuild-dir = '/c'\n\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\n[net]\nx = 1\n";
+        let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\", \"-C\", \"link-arg=-B/tmp/gcc-ld\"]"#;
+        let (out, edit, conflict) = set_target_rustflags(src, "x86_64-unknown-linux-gnu", literal);
+        assert_eq!(edit, CargoEdit::Inserted);
+        assert!(!conflict);
+        assert!(
+            out.contains("linker = \"clang\""),
+            "existing key lost:\n{out}"
+        );
+        let target = out.find("[target.").unwrap();
+        let flags = out.find("rustflags").unwrap();
+        let net = out.find("[net]").unwrap();
+        assert!(
+            target < flags && flags < net,
+            "flags escaped the table:\n{out}"
+        );
+        assert!(out.contains(literal));
+    }
+
+    #[test]
+    fn fast_flags_are_never_overwritten() {
+        let src = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n";
+        let (out, edit, conflict) =
+            set_target_rustflags(src, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        assert_eq!(edit, CargoEdit::AlreadySet);
+        assert!(conflict);
+        assert_eq!(out, src, "existing flags untouched");
+
+        // Re-running --fast with the same value is a clean no-op.
+        let same = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"ours\"]\n";
+        let (out, edit, conflict) =
+            set_target_rustflags(same, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        assert_eq!(edit, CargoEdit::AlreadySet);
+        assert!(!conflict);
+        assert_eq!(out, same);
+    }
+
+    #[test]
+    fn removes_only_our_fast_flags() {
+        let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
+        let src = format!(
+            "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrustflags = {literal}\n\n[net]\nx = 1\n"
+        );
+        let (out, edit, conflict) =
+            remove_target_rustflags(&src, "x86_64-unknown-linux-gnu", literal);
+        assert_eq!(edit, CargoEdit::Removed);
+        assert!(!conflict);
+        assert!(!out.contains("rustflags"), "flags not removed:\n{out}");
+        assert!(
+            out.contains("linker = \"clang\""),
+            "other keys kept:\n{out}"
+        );
+
+        let custom = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n";
+        let (out, edit, conflict) =
+            remove_target_rustflags(custom, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        assert_eq!(edit, CargoEdit::AlreadySet);
+        assert!(conflict);
+        assert_eq!(out, custom, "custom flags untouched");
+    }
+
+    #[test]
+    fn fast_flags_create_the_target_table_when_missing() {
+        let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
+        let (out, edit, conflict) = set_target_rustflags(
+            "[build]\nbuild-dir = '/c'\n",
+            "x86_64-unknown-linux-gnu",
+            literal,
+        );
+        assert_eq!(edit, CargoEdit::Appended);
+        assert!(!conflict);
+        assert!(
+            out.contains("[target.x86_64-unknown-linux-gnu]\nrustflags = "),
+            "got:\n{out}"
+        );
     }
 
     #[test]

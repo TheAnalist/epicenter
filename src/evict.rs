@@ -284,12 +284,20 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
         );
     }
 
+    // A lone `--unit` names exactly what the user wants — deliberate, like
+    // `--tier store` and `--work-dir`. Bulk selectors keep the guard.
+    let explicit_unit = opts.unit.is_some()
+        && !opts.stale
+        && opts.rustc_key.is_none()
+        && !opts.husks
+        && opts.older_than.is_none();
+
     let mut protected = 0usize;
     let mut chosen: Vec<Candidate> = Vec::new();
     for (_, candidate) in candidates {
         // Current-generation units are protected whenever a view is involved;
         // `--tier store` is explicitly the vault-trimming mode.
-        if candidate.current && !opts.force && opts.tier.touches_view() {
+        if candidate.current && !opts.force && opts.tier.touches_view() && !explicit_unit {
             protected += 1;
             continue;
         }
@@ -298,12 +306,17 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
     chosen.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
 
     if chosen.is_empty() {
-        println!("  nothing matches the given selectors");
         if protected > 0 {
             println!(
-                "  {} {protected} current-generation unit(s) matched but are protected — use --force to include them",
+                "  {} {protected} current-generation unit(s) match but are protected — use --force to include them",
                 util::warn(util::GLYPH_WARN)
             );
+            println!(
+                "  {}",
+                util::dim("nothing else matches the given selectors")
+            );
+        } else {
+            println!("  nothing matches the given selectors");
         }
         return Ok(());
     }
@@ -618,6 +631,8 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         return Err(err).with_context(|| format!("removing {}", path.display()));
     }
     drop(job_lock);
+    crate::exec::remove_job_lock(&work_root, &name);
+    crate::exec::sweep_job_locks(&work_root);
     println!();
     println!(
         "  {} {name} removed · {} actually freed · {} links released",
@@ -828,7 +843,7 @@ fn evict_work_dirs(
     let mut freed_unique = 0u64;
     let mut freed_shared = 0u64;
     for row in rows.iter().filter(|row| row.old_enough && !row.locked) {
-        let _job_lock = match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(
+        let job_lock = match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(
             &work_root, &row.name,
         ))? {
             Some(lock) => lock,
@@ -846,6 +861,8 @@ fn evict_work_dirs(
                 report.removed += 1;
                 freed_unique += row.unique;
                 freed_shared += row.shared;
+                drop(job_lock);
+                crate::exec::remove_job_lock(&work_root, &row.name);
             }
             Err(e) => {
                 report.errors += 1;
@@ -853,6 +870,7 @@ fn evict_work_dirs(
             }
         }
     }
+    crate::exec::sweep_job_locks(&work_root);
     println!();
     println!(
         "  {} {} dir(s) evicted · {} actually freed · {} link(s) released (other links, e.g. the vault, still hold those bytes)",
@@ -1793,11 +1811,27 @@ mod tests {
             "dry run touches nothing"
         );
 
+        fs::write(home.path().join("work/.lock-old-job"), b"")?;
+        fs::write(home.path().join("work/.lock-fresh-job"), b"")?;
+        fs::write(home.path().join("work/.lock-orphan"), b"")?;
+
         let done = evict_work_dirs(&build, None, true)?;
         assert_eq!(done.removed, 1);
         assert_eq!(done.unique_bytes, 64, "unique bytes are actually freed");
         assert!(!old_job.exists(), "aged job dir collected");
         assert!(fresh_job.exists(), "young job dir kept");
+        assert!(
+            !home.path().join("work/.lock-old-job").exists(),
+            "the collected job's lock is removed"
+        );
+        assert!(
+            home.path().join("work/.lock-fresh-job").is_file(),
+            "the kept job's lock stays"
+        );
+        assert!(
+            !home.path().join("work/.lock-orphan").exists(),
+            "orphan lock debris is swept"
+        );
         Ok(())
     }
 
@@ -1875,6 +1909,8 @@ mod tests {
         let home = tier_home()?;
         let build = home.path().join("build");
         let job = aged_job(home.path(), "fresh-job", 0)?;
+        fs::write(home.path().join("work/.lock-fresh-job"), b"")?;
+        fs::write(home.path().join("work/.lock-orphan"), b"")?;
         let opts = Options {
             work_dir: Some("fresh-job"),
             delete: true,
@@ -1884,6 +1920,14 @@ mod tests {
         assert!(
             !job.exists(),
             "an explicitly selected dir goes regardless of age"
+        );
+        assert!(
+            !home.path().join("work/.lock-fresh-job").exists(),
+            "the removed job's lock is cleaned"
+        );
+        assert!(
+            !home.path().join("work/.lock-orphan").exists(),
+            "orphan lock debris is swept"
         );
         Ok(())
     }
@@ -2265,7 +2309,7 @@ mod tests {
         let (home, build) = harvested_home()?;
         let store = home.path().join("store");
         let opts = Options {
-            unit: Some("pkg"),
+            older_than: Some("0s"),
             delete: true,
             ..no_selectors()
         };
@@ -2274,9 +2318,29 @@ mod tests {
             build
                 .join("debug/.fingerprint/pkg-1122334455667788")
                 .exists(),
-            "current unit protected without --force"
+            "a bulk selector protects the current unit without --force"
         );
         assert_eq!(crate::vault::stored_units(&store)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_unit_bypasses_the_current_generation_guard() -> Result<()> {
+        let (home, build) = harvested_home()?;
+        let store = home.path().join("store");
+        let opts = Options {
+            unit: Some("pkg"),
+            delete: true,
+            ..no_selectors()
+        };
+        run(&build, &opts)?;
+        assert!(
+            !build
+                .join("debug/.fingerprint/pkg-1122334455667788")
+                .exists(),
+            "an explicit --unit is deliberate: it needs no --force"
+        );
+        assert_eq!(crate::vault::stored_units(&store)?.len(), 0);
         Ok(())
     }
 

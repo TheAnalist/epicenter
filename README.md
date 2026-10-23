@@ -80,6 +80,9 @@ epicenter status                 # watch it fill up
 epicenter doctor                 # verify everything is healthy
 ```
 
+Every setup edit backs up the previous config as `config.toml.epicenter-bak[.N]` (monotonic suffixes).
+`epicenter setup --revert-config` restores the newest one atomically and prints both the config and the backup path.
+
 ## Three workflows, one tool
 
 1. **Daily development (zero extra steps)** — run `epicenter setup` once. Every
@@ -101,17 +104,19 @@ epicenter doctor                 # verify everything is healthy
 | `epicenter setup` | write the shared-cache config; **backups** any file it modifies (`*.epicenter-bak`) |
 | `epicenter setup --cache-root <path>` | use a different cache directory instead of the default |
 | `epicenter setup --use-default` | remove a custom root, back to the canonical default |
+| `epicenter setup --fast` | wire rustup's bundled LLD (`ld.lld` / `lld-link`) into `~/.cargo/config.toml` — zero installs; `--without-fast` removes it |
+| `epicenter setup --revert-config` | restore `~/.cargo/config.toml` from the newest setup backup (`config.toml.epicenter-bak[.N]`), then stop |
 | `epicenter setup --with-wrapper kache` | also configure [kache](https://github.com/kunobi-ninja/kache) (or sccache) as `rustc-wrapper` |
 | `epicenter setup --without-wrapper` | remove a previously configured wrapper |
 | `epicenter status` | sizes, per-directory breakdown, largest build units |
 | `epicenter who [--unit <q>]` | unit forensics: per-package blocks, toolchain generations, stale flags |
 | `epicenter why <unit>` | one unit in depth: hashes, features, deps, artifact inventory, FRESH/DIRTY verdict |
-| `epicenter evict --unit <q>` | remove units deliberately (store + views): dry run by default, `--yes` to delete |
+| `epicenter evict --unit <q>` | remove units deliberately (store + views): dry run by default, `--yes` to delete — an explicit `--unit` is deliberate, so no `--force` even on the current generation |
 | `epicenter evict --unit <q> --tier store` | trim the **vault only** — no `--force` needed, the vault is yours to trim |
 | `epicenter evict --generation <key>` | delete a whole parity-key generation (units, manifest, lock) — dry run unless `--yes`; the active generation needs `--force`; `--tier store` keeps views |
 | `epicenter evict --unit <q> --tier view` | unlink the working copies only (build dir + job dirs); vault untouched |
 | `epicenter evict --work <job\|build> --crate <name>` | surgical cache-bust: unlink one crate from ONE view; the vault is never touched |
-| `epicenter evict --stale` / `--husks` / `--older-than 90d` / `--rustc-key <h>` | bulk selectors, by default across the store and every known view |
+| `epicenter evict --stale` / `--husks` / `--older-than 90d` / `--rustc-key <h>` | bulk selectors, by default across the store and every known view — current-generation units need `--force` |
 | `epicenter evict --work-dir <job>` | remove ONE job dir now — explicit choices bypass the GC window (dry run default; a live build's dir is refused) |
 | `epicenter evict --work-dirs [--older-than 7d]` | collect stale per-job working dirs; a dir a live build has locked is never touched |
 | `epicenter prune [--older-than 30d]` | age-based housekeeping of the shared build dir (policy GC, default 30d). **Dry run by default** — pass `--yes` to delete |
@@ -121,6 +126,33 @@ epicenter doctor                 # verify everything is healthy
 | `epicenter restore [--into <dir>] [--unit <q>] [--dry-run]` | seed a working dir from the vault (default: the shared build dir) — `deps/`/`out/` rlibs and `.so` hard-linked; `.rmeta` + fingerprint state copied |
 | `epicenter verify` | audit the vault: file sizes, canonical stamps, hash contents, dependency ordering — and name the job dirs under `work/` |
 | `epicenter exec [--harvest] [--rm] [--reuse] [--target-dir [DIR]] [--id <id>] [--cwd <dir>] -- <cmd>` | run a command in a fresh per-job build dir seeded from the vault for the project's packages (CI/agents) |
+
+### Zero-install fast linker (`setup --fast`)
+
+rustup already ships LLVM's linker inside every toolchain — no `mold`, no `lld`
+package, no `clang` needed:
+
+```text
+~/.rustup/toolchains/<toolchain>/lib/rustlib/<host>/bin/gcc-ld/
+    ld.lld   lld-link   ld64.lld   wasm-ld
+```
+
+`epicenter setup --fast` detects that directory for the active host and writes
+one `[target.<host>] rustflags` line into `~/.cargo/config.toml`:
+
+- **Linux / BSD (ELF)** — `-C link-arg=-fuse-ld=lld -C link-arg=-B<gcc-ld>`.
+  The system C compiler stays the driver; it does not have to be clang.
+- **Windows MSVC** — `-C linker=<gcc-ld>/lld-link.exe`. `-fuse-ld` is a
+  GCC/Clang flag and `link.exe` does not understand it, so rustc is pointed at
+  the bundled linker directly.
+- **macOS** is refused — `ld64.lld` is not a drop-in replacement for Apple's
+  linker.
+
+`epicenter setup --without-fast` removes the flags again, but only when they
+still match what `--fast` wrote: custom `rustflags` are never touched. The
+change is backed up (`config.toml.epicenter-bak`) like every setup edit.
+Enabling it changes RUSTFLAGS, so every unit re-keys once and the vault opens a
+new generation — build once, then `epicenter harvest`.
 
 ## `prune` vs `evict` — housekeeping vs deliberate removal
 
@@ -319,6 +351,14 @@ only cost is the next compile. `evict` therefore treats the tiers explicitly:
   crate in one view (a patched dependency in an agent job, a flaky crate in
   CI). A freshness operation, never a space claim; the vault is untouched and
   a view a live build has locked refuses to be touched.
+
+An explicit `--unit` is a deliberate choice, like `--tier store`: it bypasses
+the current-generation guard. Bulk selectors (`--stale`, `--older-than`,
+`--rustc-key`, `--husks`) keep it unless you pass `--force`.
+
+Removing a job dir (`exec --rm`, `evict --work-dir`, `evict --work-dirs`) also
+deletes its `.lock-<job>` marker and sweeps orphan `.lock-*` files left behind
+by crashed or older removals.
 
 ## Cross-OS notes
 
