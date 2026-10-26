@@ -41,8 +41,8 @@ spawned**.
 
 These benchmarks are done against 5 projects with 37 identical dependencies each.
 
-**Five cold builds: 71.3 s → 15.3 s (4.7× faster). Disk: 3.65 GiB → 0.91 GiB
-(−75%). A cold per-job `work/` dir seeded from the vault: 0.33 s.**
+**Five cold builds: 123 s → 28.9 s (4.3× faster). Disk: 3.65 GiB → 0.91 GiB
+(−75%). A cold per-job `work/` dir seeded from the vault: 1.50 s.**
 
 All five projects declare the same platform stack. This is the monorepo / "one platform crate" case.
 Every non-local Cargo unit is byte-for-byte identical across projects,
@@ -69,6 +69,21 @@ where a cold per-job build dir is seeded from the durable store instead of recom
 ![Build time per project](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-per-project.svg)
 
 ![Cold start in a per-job work dir](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-vault.svg)
+
+### rust-lld (`--fast`)
+
+`epicenter setup --fast` wires rustup's bundled `ld.lld` into Cargo — no extra
+install. On these Linux/GNU debug builds it is **neutral**: the five cold
+builds go from 28.9 s to 29.1 s (+0.7%), and a paired relink after a one-line
+change goes from 1039 ms to 1047 ms (+0.8%) — both inside run-to-run noise.
+A cold build compiles 176 crates before it links, so the linker is a small
+slice; `--fast` targets link-heavy workloads and platforms with a slower
+system linker (large release binaries, MSVC). This benchmark covers the
+debug/GNU case only.
+
+![rust-lld summary](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-fast-summary.svg)
+
+![rust-lld relink](https://raw.githubusercontent.com/TheAnalist/epicenter/main/chart-fast-relink.svg)
 
 ## Quickstart
 
@@ -104,7 +119,7 @@ Every setup edit backs up the previous config as `config.toml.epicenter-bak[.N]`
 | `epicenter setup` | write the shared-cache config; **backups** any file it modifies (`*.epicenter-bak`) |
 | `epicenter setup --cache-root <path>` | use a different cache directory instead of the default |
 | `epicenter setup --use-default` | remove a custom root, back to the canonical default |
-| `epicenter setup --fast` | wire rustup's bundled LLD (`ld.lld` / `lld-link`) into `~/.cargo/config.toml` — zero installs; `--without-fast` removes it |
+| `epicenter setup --fast` | wire rustup's bundled LLD (`ld.lld` / `lld-link`) into `~/.cargo/config.toml` — zero installs; also sets `incremental = true` unless a wrapper is configured; `--without-fast` removes the flags |
 | `epicenter setup --revert-config` | restore `~/.cargo/config.toml` from the newest setup backup (`config.toml.epicenter-bak[.N]`), then stop |
 | `epicenter setup --with-wrapper kache` | also configure [kache](https://github.com/kunobi-ninja/kache) (or sccache) as `rustc-wrapper` |
 | `epicenter setup --without-wrapper` | remove a previously configured wrapper |
@@ -147,6 +162,11 @@ one `[target.<host>] rustflags` line into `~/.cargo/config.toml`:
   the bundled linker directly.
 - **macOS** is refused — `ld64.lld` is not a drop-in replacement for Apple's
   linker.
+
+When no `rustc-wrapper` remains, `--fast` also sets `[build] incremental =
+true`: wrapper caches (kache/sccache) and Cargo's incremental state work
+against each other, so the key is skipped when a wrapper is present. Either
+outcome is printed in the setup report.
 
 `epicenter setup --without-fast` removes the flags again, but only when they
 still match what `--fast` wrote: custom `rustflags` are never touched. The

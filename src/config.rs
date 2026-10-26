@@ -125,7 +125,7 @@ pub fn cargo_config_path() -> Result<PathBuf> {
 }
 
 /// What an edit to Cargo's config changed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoEdit {
     /// The file did not exist and was created.
     Created,
@@ -157,10 +157,16 @@ impl CargoEdit {
     }
 }
 
-/// Sets `key = 'value'` inside the `[build]` table of a Cargo config,
-/// as pure text surgery so user comments and formatting survive untouched.
-fn set_build_key(text: &str, key: &str, value: &str) -> (String, CargoEdit) {
-    let wanted = format!("{key} = '{value}'");
+/// Sets `key = 'value'` (or `key = value` for booleans) inside the `[build]`
+/// table of a Cargo config, as pure text surgery so user comments and
+/// formatting survive untouched. Mutates `text` in place; the return value
+/// only describes what changed.
+fn set_build_key(text: &mut String, key: &str, value: &str, is_bool: bool) -> CargoEdit {
+    let wanted = if is_bool {
+        format!("{key} = {value}")
+    } else {
+        format!("{key} = '{value}'")
+    };
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
     // Exact header match (whitespace-insensitive) — `.contains("[build]")`
@@ -180,15 +186,17 @@ fn set_build_key(text: &str, key: &str, value: &str) -> (String, CargoEdit) {
                 }
                 if t.split_once('=').map_or(false, |(k, _)| k.trim() == key) {
                     if t == wanted {
-                        return (text.to_string(), CargoEdit::AlreadySet);
+                        return CargoEdit::AlreadySet;
                     }
                     lines[j] = wanted;
-                    return (lines.join("\n") + "\n", CargoEdit::Replaced);
+                    *text = lines.join("\n") + "\n";
+                    return CargoEdit::Replaced;
                 }
                 j += 1;
             }
             lines.insert(i + 1, wanted);
-            (lines.join("\n") + "\n", CargoEdit::Inserted)
+            *text = lines.join("\n") + "\n";
+            CargoEdit::Inserted
         }
         None => {
             let needs_blank = lines.last().map_or(false, |l| !l.trim().is_empty());
@@ -197,13 +205,15 @@ fn set_build_key(text: &str, key: &str, value: &str) -> (String, CargoEdit) {
             }
             lines.push("[build]".to_string());
             lines.push(wanted);
-            (lines.join("\n") + "\n", CargoEdit::Appended)
+            *text = lines.join("\n") + "\n";
+            CargoEdit::Appended
         }
     }
 }
 
-/// delete `key = ...` from the `[build]` table, if present.
-fn remove_build_key(text: &str, key: &str) -> (String, CargoEdit) {
+/// Delete `key = ...` from the `[build]` table, if present. Mutates `text`;
+/// leaves it untouched when the key is absent.
+fn remove_build_key(text: &mut String, key: &str) -> CargoEdit {
     let mut out: Vec<String> = Vec::new();
     let mut in_build = false;
     let mut removed = false;
@@ -225,9 +235,10 @@ fn remove_build_key(text: &str, key: &str) -> (String, CargoEdit) {
         out.push(line.to_string());
     }
     if removed {
-        (out.join("\n") + "\n", CargoEdit::Removed)
+        *text = out.join("\n") + "\n";
+        CargoEdit::Removed
     } else {
-        (text.to_string(), CargoEdit::AlreadySet)
+        CargoEdit::AlreadySet
     }
 }
 /// Parse the value of `key` out of the `[build]` table.
@@ -245,8 +256,8 @@ fn is_target_header(line: &str, target: &str) -> bool {
 
 /// Insert `rustflags = ...` into `[target.<target>]`, preserving every other
 /// line and comment. Existing `rustflags` are **never** overwritten: the
-/// third return value reports that conflict instead.
-fn set_target_rustflags(text: &str, target: &str, literal: &str) -> (String, CargoEdit, bool) {
+/// second return value reports that conflict instead.
+fn set_target_rustflags(text: &mut String, target: &str, literal: &str) -> (CargoEdit, bool) {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     if let Some(header) = lines.iter().position(|line| is_target_header(line, target)) {
         let mut end = header + 1;
@@ -258,13 +269,14 @@ fn set_target_rustflags(text: &str, target: &str, literal: &str) -> (String, Car
             if let Some((key, value)) = trimmed.split_once('=') {
                 if key.trim() == "rustflags" {
                     let same = clean_toml_value(value) == literal;
-                    return (text.to_string(), CargoEdit::AlreadySet, !same);
+                    return (CargoEdit::AlreadySet, !same);
                 }
             }
             end += 1;
         }
         lines.insert(end, format!("rustflags = {literal}"));
-        (lines.join("\n") + "\n", CargoEdit::Inserted, false)
+        *text = lines.join("\n") + "\n";
+        (CargoEdit::Inserted, false)
     } else {
         let needs_blank = lines.last().map_or(false, |line| !line.trim().is_empty());
         if needs_blank {
@@ -272,13 +284,14 @@ fn set_target_rustflags(text: &str, target: &str, literal: &str) -> (String, Car
         }
         lines.push(format!("[target.{target}]"));
         lines.push(format!("rustflags = {literal}"));
-        (lines.join("\n") + "\n", CargoEdit::Appended, false)
+        *text = lines.join("\n") + "\n";
+        (CargoEdit::Appended, false)
     }
 }
 
 /// Remove the `--fast` `rustflags` from `[target.<target>]` only when the
 /// value still matches what `--fast` writes. Anything else is left alone.
-fn remove_target_rustflags(text: &str, target: &str, literal: &str) -> (String, CargoEdit, bool) {
+fn remove_target_rustflags(text: &mut String, target: &str, literal: &str) -> (CargoEdit, bool) {
     let mut out: Vec<String> = Vec::new();
     let mut in_table = false;
     let mut removed = false;
@@ -304,12 +317,20 @@ fn remove_target_rustflags(text: &str, target: &str, literal: &str) -> (String, 
         out.push(line.to_string());
     }
     if removed {
-        (out.join("\n") + "\n", CargoEdit::Removed, false)
+        *text = out.join("\n") + "\n";
+        (CargoEdit::Removed, false)
     } else if conflict {
-        (text.to_string(), CargoEdit::AlreadySet, true)
+        (CargoEdit::AlreadySet, true)
     } else {
-        (text.to_string(), CargoEdit::AlreadySet, false)
+        (CargoEdit::AlreadySet, false)
     }
+}
+
+/// Enable Cargo incremental compilation in `[build]`. `--fast` only does this
+/// when no `rustc-wrapper` remains: wrapper caches and incremental state work
+/// against each other.
+fn set_incremental(text: &mut String) -> CargoEdit {
+    set_build_key(text, "incremental", "true", true)
 }
 
 /// Strip a trailing `#` comment while respecting single/double quoted values.
@@ -430,13 +451,16 @@ pub struct SetupReport {
     pub using_override: bool,
 }
 
-/// The `--fast` outcome: rustup's bundled LLD wired into the host target.
+/// The `--fast` outcome: rustup's bundled LLD wired into the host target + incremental building
 pub struct FastSetupReport {
     pub target: String,
     /// `ld.lld` / `lld-link.exe` that the flags point at.
     pub lld: PathBuf,
     pub flags: Vec<String>,
     pub edit: CargoEdit,
+    /// What `--fast` did to `[build] incremental`, if it applied. `None`
+    /// when a `rustc-wrapper` is (or will be) configured, or `--without-fast`.
+    pub incremental: Option<CargoEdit>,
     /// Existing `rustflags` differ and were left untouched.
     pub conflict: bool,
 }
@@ -513,6 +537,18 @@ pub fn setup(
     } else {
         None
     };
+    // `--fast` also enables Cargo incremental compilation, unless a
+    // rustc-wrapper remains: wrapper caches (kache/sccache) and incremental
+    // state work against each other. Check the existing config too — the
+    // wrapper may have been configured without a CLI flag in this run.
+    let incremental = if with_wrapper.is_some() {
+        false
+    } else if without_wrapper {
+        true
+    } else {
+        cargo_configured("rustc-wrapper")?.is_none()
+    };
+
     let (build_dir_edit, wrapper_edit, fast_report, backup) = if !cargo_cfg.exists() {
         if let Some(parent) = cargo_cfg.parent() {
             crate::util::create_private_dir_all(parent)
@@ -525,6 +561,14 @@ pub fn setup(
         } else {
             None
         };
+
+        let incremental_edit = if fast && incremental {
+            text.push_str("incremental = true\n");
+            Some(CargoEdit::Inserted)
+        } else {
+            None
+        };
+
         let fast_report = match &fast_linker {
             Some(lld) if fast => {
                 let literal = lld.rustflags_toml();
@@ -534,6 +578,7 @@ pub fn setup(
                     lld: lld.linker.clone(),
                     flags: lld.rustflags(),
                     edit: CargoEdit::Appended,
+                    incremental: incremental_edit,
                     conflict: false,
                 })
             }
@@ -542,46 +587,45 @@ pub fn setup(
         crate::util::write_atomic_private(&cargo_cfg, text.as_bytes())?;
         (CargoEdit::Created, wrapper_edit, fast_report, None)
     } else {
-        let text = crate::util::read_trusted_config(&cargo_cfg, 1024 * 1024)
+        let mut text = crate::util::read_trusted_config(&cargo_cfg, 1024 * 1024)
             .with_context(|| format!("reading {}", cargo_cfg.display()))?;
-        let (text, build_dir_edit) = set_build_key(&text, "build-dir", &build_dir_value);
-        let (text, wrapper_edit) = match with_wrapper {
-            Some(name) => {
-                let (text, edit) = set_build_key(&text, "rustc-wrapper", name);
-                (text, Some(edit))
-            }
-            None if without_wrapper => {
-                let (text, edit) = remove_build_key(&text, "rustc-wrapper");
-                (text, Some(edit))
-            }
-            None => (text, None),
+        let build_dir_edit = set_build_key(&mut text, "build-dir", &build_dir_value, false);
+        let wrapper_edit = match with_wrapper {
+            Some(name) => Some(set_build_key(&mut text, "rustc-wrapper", name, false)),
+            None if without_wrapper => Some(remove_build_key(&mut text, "rustc-wrapper")),
+            None => None,
         };
-        let (text, fast_report) = match &fast_linker {
+        let incremental_edit = if fast && incremental {
+            Some(set_incremental(&mut text))
+        } else {
+            None
+        };
+        let fast_report = match &fast_linker {
             Some(lld) => {
                 let literal = lld.rustflags_toml();
-                let (text, edit, conflict) = if fast {
-                    set_target_rustflags(&text, &lld.host, &literal)
+                let (edit, conflict) = if fast {
+                    set_target_rustflags(&mut text, &lld.host, &literal)
                 } else {
-                    remove_target_rustflags(&text, &lld.host, &literal)
+                    remove_target_rustflags(&mut text, &lld.host, &literal)
                 };
-                (
-                    text,
-                    Some(FastSetupReport {
-                        target: lld.host.clone(),
-                        lld: lld.linker.clone(),
-                        flags: lld.rustflags(),
-                        edit,
-                        conflict,
-                    }),
-                )
+                // add also DWARF unpaking to reduce linker workload.
+                // (I think it can give 2% speed increse but it reduces memory usage and doesn't modify
+                // debug funtionalities).
+                Some(FastSetupReport {
+                    target: lld.host.clone(),
+                    lld: lld.linker.clone(),
+                    flags: lld.rustflags(),
+                    edit,
+                    incremental: incremental_edit,
+                    conflict,
+                })
             }
-            None => (text, None),
+            None => None,
         };
         let mut backup = None;
         let changed = build_dir_edit != CargoEdit::AlreadySet
-            || wrapper_edit
-                .as_ref()
-                .is_some_and(|e| *e != CargoEdit::AlreadySet)
+            || wrapper_edit.is_some_and(|e| e != CargoEdit::AlreadySet)
+            || incremental_edit.is_some_and(|e| e != CargoEdit::AlreadySet)
             || fast_report
                 .as_ref()
                 .is_some_and(|report| report.edit != CargoEdit::AlreadySet);
@@ -723,19 +767,19 @@ mod tests {
     fn replaced_line_keeps_the_rest_of_the_file() {
         // Regression test for the split_inclusive `Replaced` bug: the kache
         // line and the [net] table had to survive the replacement.
-        let src = "[build]\nbuild-dir = '/old'\nrustc-wrapper = \"kache\"\n\n[net]\nx = 1\n";
-        let (out, edit) = set_build_key(src, "build-dir", "/cache");
+        let mut src =
+            "[build]\nbuild-dir = '/old'\nrustc-wrapper = \"kache\"\n\n[net]\nx = 1\n".to_string();
+        let edit = set_build_key(&mut src, "build-dir", "/cache", false);
         assert_eq!(edit, CargoEdit::Replaced);
         assert!(
-            out.contains("rustc-wrapper = \"kache\""),
-            "tail deleted:\n{out}"
+            src.contains("rustc-wrapper = \"kache\""),
+            "tail deleted:\n{src}"
         );
-        assert!(out.contains("[net]"), "tail deleted:\n{out}");
-        let dir = out.find("build-dir = '/cache'").unwrap();
-        let net = out.find("[net]").unwrap();
-        assert!(dir < net, "replaced value must stay inside [build]:\n{out}");
+        assert!(src.contains("[net]"), "tail deleted:\n{src}");
+        let dir = src.find("build-dir = '/cache'").unwrap();
+        let net = src.find("[net]").unwrap();
+        assert!(dir < net, "replaced value must stay inside [build]:\n{src}");
     }
-
     #[test]
     fn backups_are_numbered_and_latest_wins() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -797,151 +841,148 @@ mod tests {
 
     #[test]
     fn inserts_fast_flags_into_an_existing_target_table() {
-        let src = "[build]\nbuild-dir = '/c'\n\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\n[net]\nx = 1\n";
+        let mut src = "[build]\nbuild-dir = '/c'\n\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\n[net]\nx = 1\n".to_string();
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\", \"-C\", \"link-arg=-B/tmp/gcc-ld\"]"#;
-        let (out, edit, conflict) = set_target_rustflags(src, "x86_64-unknown-linux-gnu", literal);
+        let (edit, conflict) = set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal);
         assert_eq!(edit, CargoEdit::Inserted);
         assert!(!conflict);
         assert!(
-            out.contains("linker = \"clang\""),
-            "existing key lost:\n{out}"
+            src.contains("linker = \"clang\""),
+            "existing key lost:\n{src}"
         );
-        let target = out.find("[target.").unwrap();
-        let flags = out.find("rustflags").unwrap();
-        let net = out.find("[net]").unwrap();
+        let target = src.find("[target.").unwrap();
+        let flags = src.find("rustflags").unwrap();
+        let net = src.find("[net]").unwrap();
         assert!(
             target < flags && flags < net,
-            "flags escaped the table:\n{out}"
+            "flags escaped the table:\n{src}"
         );
-        assert!(out.contains(literal));
+        assert!(src.contains(literal));
     }
-
     #[test]
     fn fast_flags_are_never_overwritten() {
-        let src = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n";
-        let (out, edit, conflict) =
-            set_target_rustflags(src, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        let mut src =
+            "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n".to_string();
+        let original = src.clone();
+        let (edit, conflict) =
+            set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
         assert_eq!(edit, CargoEdit::AlreadySet);
         assert!(conflict);
-        assert_eq!(out, src, "existing flags untouched");
+        assert_eq!(src, original, "existing flags untouched");
 
         // Re-running --fast with the same value is a clean no-op.
-        let same = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"ours\"]\n";
-        let (out, edit, conflict) =
-            set_target_rustflags(same, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        let mut same =
+            "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"ours\"]\n".to_string();
+        let original = same.clone();
+        let (edit, conflict) =
+            set_target_rustflags(&mut same, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
         assert_eq!(edit, CargoEdit::AlreadySet);
         assert!(!conflict);
-        assert_eq!(out, same);
+        assert_eq!(same, original);
     }
-
     #[test]
     fn removes_only_our_fast_flags() {
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
-        let src = format!(
+        let mut src = format!(
             "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrustflags = {literal}\n\n[net]\nx = 1\n"
         );
-        let (out, edit, conflict) =
-            remove_target_rustflags(&src, "x86_64-unknown-linux-gnu", literal);
+        let (edit, conflict) =
+            remove_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal);
         assert_eq!(edit, CargoEdit::Removed);
         assert!(!conflict);
-        assert!(!out.contains("rustflags"), "flags not removed:\n{out}");
+        assert!(!src.contains("rustflags"), "flags not removed:\n{src}");
         assert!(
-            out.contains("linker = \"clang\""),
-            "other keys kept:\n{out}"
+            src.contains("linker = \"clang\""),
+            "other keys kept:\n{src}"
         );
 
-        let custom = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n";
-        let (out, edit, conflict) =
-            remove_target_rustflags(custom, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        let mut custom =
+            "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n".to_string();
+        let original = custom.clone();
+        let (edit, conflict) = remove_target_rustflags(
+            &mut custom,
+            "x86_64-unknown-linux-gnu",
+            "[\"-C\", \"ours\"]",
+        );
         assert_eq!(edit, CargoEdit::AlreadySet);
         assert!(conflict);
-        assert_eq!(out, custom, "custom flags untouched");
+        assert_eq!(custom, original, "custom flags untouched");
     }
-
     #[test]
     fn fast_flags_create_the_target_table_when_missing() {
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
-        let (out, edit, conflict) = set_target_rustflags(
-            "[build]\nbuild-dir = '/c'\n",
-            "x86_64-unknown-linux-gnu",
-            literal,
-        );
+        let mut src = "[build]\nbuild-dir = '/c'\n".to_string();
+        let (edit, conflict) = set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal);
         assert_eq!(edit, CargoEdit::Appended);
         assert!(!conflict);
         assert!(
-            out.contains("[target.x86_64-unknown-linux-gnu]\nrustflags = "),
-            "got:\n{out}"
+            src.contains("[target.x86_64-unknown-linux-gnu]\nrustflags = "),
+            "got:\n{src}"
         );
     }
-
     #[test]
     fn appends_table_without_merging_lines() {
         // Regression test for the collect::<String> `Appended` bug: joining
         // without separators fused `[net]` and `foo = 1` into one line.
-        let (out, edit) = set_build_key("[net]\nfoo = 1\n", "build-dir", "/cache");
+        let mut src = "[net]\nfoo = 1\n".to_string();
+        let edit = set_build_key(&mut src, "build-dir", "/cache", false);
         assert_eq!(edit, CargoEdit::Appended);
-        assert!(!out.contains("[net]foo"), "lines merged:\n{out}");
-        assert!(out.contains("foo = 1"));
-        let net = out.find("[net]").unwrap();
-        let build = out.rfind("[build]").unwrap();
+        assert!(!src.contains("[net]foo"), "lines merged:\n{src}");
+        assert!(src.contains("foo = 1"));
+        let net = src.find("[net]").unwrap();
+        let build = src.rfind("[build]").unwrap();
         assert!(net < build);
     }
-
     #[test]
     fn appends_build_table_when_missing() {
-        let (out, edit) = set_build_key("[net]\nfoo = 1\n", "build-dir", "/cache");
+        let mut src = "[net]\nfoo = 1\n".to_string();
+        let edit = set_build_key(&mut src, "build-dir", "/cache", false);
         assert_eq!(edit, CargoEdit::Appended);
-        assert!(out.contains("[build]\nbuild-dir = '/cache'"), "got:\n{out}");
+        assert!(src.contains("[build]\nbuild-dir = '/cache'"), "got:\n{src}");
     }
-
     #[test]
     fn inserts_into_existing_build_table() {
-        let (out, edit) = set_build_key(
-            "[build]\nrustflags = []\n\n[net]\nx = 1\n",
-            "build-dir",
-            "/cache",
-        );
+        let mut src = "[build]\nrustflags = []\n\n[net]\nx = 1\n".to_string();
+        let edit = set_build_key(&mut src, "build-dir", "/cache", false);
         assert_eq!(edit, CargoEdit::Inserted);
         // build-dir must land inside [build], i.e. after the header but before [net].
-        let build = out.find("[build]").unwrap();
-        let dir = out.find("build-dir").unwrap();
-        let net = out.find("[net]").unwrap();
-        assert!(build < dir && dir < net, "got:\n{out}");
+        let build = src.find("[build]").unwrap();
+        let dir = src.find("build-dir").unwrap();
+        let net = src.find("[net]").unwrap();
+        assert!(build < dir && dir < net, "got:\n{src}");
     }
-
     #[test]
     fn replaces_old_value() {
-        let (out, edit) = set_build_key("[build]\nbuild-dir = '/old'\n", "build-dir", "/cache");
+        let mut src = "[build]\nbuild-dir = '/old'\n".to_string();
+        let edit = set_build_key(&mut src, "build-dir", "/cache", false);
         assert_eq!(edit, CargoEdit::Replaced);
-        assert!(out.contains("build-dir = '/cache'"));
-        assert!(!out.contains("/old"));
+        assert!(src.contains("build-dir = '/cache'"));
+        assert!(!src.contains("/old"));
     }
-
     #[test]
     fn already_set_is_a_no_op() {
-        let src = "[build]\nbuild-dir = '/cache'\n";
-        let (out, edit) = set_build_key(src, "build-dir", "/cache");
+        let mut src = "[build]\nbuild-dir = '/cache'\n".to_string();
+        let original = src.clone();
+        let edit = set_build_key(&mut src, "build-dir", "/cache", false);
         assert_eq!(edit, CargoEdit::AlreadySet);
-        assert_eq!(out, src);
+        assert_eq!(src, original);
     }
-
     #[test]
     fn removes_wrapper_line() {
-        let src = "[build]\nbuild-dir = '/cache'\nrustc-wrapper = 'sccache'\n";
-        let (out, edit) = remove_build_key(src, "rustc-wrapper");
+        let mut src = "[build]\nbuild-dir = '/cache'\nrustc-wrapper = 'sccache'\n".to_string();
+        let edit = remove_build_key(&mut src, "rustc-wrapper");
         assert_eq!(edit, CargoEdit::Removed);
-        assert!(out.contains("build-dir"), "build-dir must survive:\n{out}");
-        assert!(!out.contains("rustc-wrapper"));
+        assert!(src.contains("build-dir"), "build-dir must survive:\n{src}");
+        assert!(!src.contains("rustc-wrapper"));
     }
-
     #[test]
     fn remove_is_a_no_op_when_absent() {
-        let src = "[build]\nbuild-dir = '/cache'\n";
-        let (out, edit) = remove_build_key(src, "rustc-wrapper");
+        let mut src = "[build]\nbuild-dir = '/cache'\n".to_string();
+        let original = src.clone();
+        let edit = remove_build_key(&mut src, "rustc-wrapper");
         assert_eq!(edit, CargoEdit::AlreadySet);
-        assert_eq!(out, src);
+        assert_eq!(src, original);
     }
-
     #[test]
     fn reads_key_from_build_table() {
         assert_eq!(
@@ -989,12 +1030,12 @@ mod tests {
 
     #[test]
     fn removal_is_scoped_to_the_build_table() {
-        let src = "[build]\nbuild-dir = '/x'\n\n[target.x]\nrustc-wrapper = 'keep'\n";
-        let (out, edit) = remove_build_key(src, "rustc-wrapper");
+        let mut src =
+            "[build]\nbuild-dir = '/x'\n\n[target.x]\nrustc-wrapper = 'keep'\n".to_string();
+        let edit = remove_build_key(&mut src, "rustc-wrapper");
         assert_eq!(edit, CargoEdit::AlreadySet);
-        assert!(out.contains("rustc-wrapper = 'keep'"));
+        assert!(src.contains("rustc-wrapper = 'keep'"));
     }
-
     #[test]
     fn dotted_build_dir_is_detected() {
         assert_eq!(
@@ -1037,5 +1078,27 @@ mod tests {
             normalize_root_input("cache/build").unwrap(),
             cwd.join("cache/build"),
         );
+    }
+
+    #[test]
+    fn incremental_is_written_as_a_bool() {
+        let mut text = "[build]\nbuild-dir = '/cache'\n".to_string();
+        let edit = set_incremental(&mut text);
+        assert_eq!(edit, CargoEdit::Inserted);
+        assert!(text.contains("incremental = true"), "got:\n{text}");
+        assert!(!text.contains("incremental = 'true'"), "got:\n{text}");
+
+        let again = set_incremental(&mut text);
+        assert_eq!(again, CargoEdit::AlreadySet);
+        assert_eq!(text.matches("incremental =").count(), 1, "got:\n{text}");
+    }
+
+    #[test]
+    fn incremental_replaces_false() {
+        let mut text = "[build]\nincremental = false\n".to_string();
+        let edit = set_incremental(&mut text);
+        assert_eq!(edit, CargoEdit::Replaced);
+        assert!(text.contains("incremental = true"));
+        assert!(!text.contains("incremental = false"));
     }
 }

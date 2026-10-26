@@ -417,16 +417,28 @@ fn cmd_setup(
             }
         }
     }
-    if let Some(fast) = &report.fast {
-        match fast.edit {
+    if let Some(fast_report) = &report.fast {
+        // The incremental key is only touched by --fast, and only when no
+        // rustc-wrapper remains (the wrapper and incremental state conflict).
+        let print_incremental = || {
+            if !fast {
+                return; // --without-fast: incremental was left alone
+            }
+            match fast_report.incremental {
+                Some(edit) => println!("  incremental:  incremental = true ({})", edit.describe()),
+                None => println!("  incremental:  skipped (rustc-wrapper is set)"),
+            }
+        };
+        match fast_report.edit {
             config::CargoEdit::Inserted | config::CargoEdit::Appended => {
                 println!(
                     "{} fast linker:  rust-lld for {}",
                     util::green(util::GLYPH_PASS),
-                    fast.target
+                    fast_report.target
                 );
-                println!("  lld:          {}", fast.lld.display());
-                println!("  rustflags:    {}", fast.flags.join(" "));
+                println!("  lld:          {}", fast_report.lld.display());
+                println!("  rustflags:    {}", fast_report.flags.join(" "));
+                print_incremental();
                 println!(
                     "{} RUSTFLAGS changed — every unit re-keys; the next build repopulates the shared cache (run `epicenter harvest` after).",
                     util::warn(util::GLYPH_WARN)
@@ -443,18 +455,24 @@ fn cmd_setup(
             config::CargoEdit::Removed => println!(
                 "{} fast linker:  removed for {}",
                 util::green(util::GLYPH_PASS),
-                fast.target
+                fast_report.target
             ),
-            config::CargoEdit::AlreadySet if fast.conflict => println!(
-                "{} fast linker:  rustflags for {} are already set — left unchanged (edit ~/.cargo/config.toml to replace them)",
-                util::warn(util::GLYPH_WARN),
-                fast.target
-            ),
-            config::CargoEdit::AlreadySet => println!(
-                "{} fast linker:  already configured for {}",
-                util::green(util::GLYPH_PASS),
-                fast.target
-            ),
+            config::CargoEdit::AlreadySet if fast_report.conflict => {
+                println!(
+                    "{} fast linker:  rustflags for {} are already set — left unchanged (edit ~/.cargo/config.toml to replace them)",
+                    util::warn(util::GLYPH_WARN),
+                    fast_report.target
+                );
+                print_incremental();
+            }
+            config::CargoEdit::AlreadySet => {
+                println!(
+                    "{} fast linker:  already configured for {}",
+                    util::green(util::GLYPH_PASS),
+                    fast_report.target
+                );
+                print_incremental();
+            }
             _ => {}
         }
     }
