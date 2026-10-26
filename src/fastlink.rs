@@ -11,7 +11,9 @@
 //!   `-C link-arg=-fuse-ld=lld -C link-arg=-B<gcc-ld>` — a flag GCC and Clang
 //!   both understand, with `-B` making the bundled `ld.lld` discoverable.
 //! - MSVC hosts cannot use `-fuse-ld` (the driver is `link.exe`): rustc is
-//!   pointed directly at the bundled `lld-link.exe` with `-C linker=…`.
+//!   pointed at the generic `rust-lld.exe` with `-C linker=…`. rustc detects
+//!   that name and appends `-flavor link`; `gcc-ld/lld-link.exe` is already
+//!   the COFF driver and rejects that flag.
 //!
 //! Apple's `ld64.lld` is not a drop-in for the system linker, so `--fast`
 //! refuses macOS instead of producing fragile builds.
@@ -25,7 +27,7 @@ use anyhow::{Context, Result, bail};
 pub enum Flavor {
     /// ELF/GNU-style: the C compiler drives `ld.lld` found via `-B`.
     Gnu,
-    /// COFF/MSVC: rustc drives the bundled `lld-link.exe` directly.
+    /// COFF/MSVC: rustc drives the generic `rust-lld.exe` with `-flavor link`.
     Msvc,
 }
 
@@ -36,7 +38,7 @@ pub struct FastLinker {
     pub host: String,
     /// `…/lib/rustlib/<host>/bin/gcc-ld`.
     pub lld_dir: PathBuf,
-    /// `ld.lld` / `lld-link.exe` inside `lld_dir`.
+    /// `ld.lld` (ELF) or `rust-lld.exe` (COFF), the binary the flags point at.
     pub linker: PathBuf,
     pub flavor: Flavor,
 }
@@ -61,6 +63,25 @@ impl FastLinker {
     /// The `rustflags = [...]` value, ready for the config line.
     pub fn rustflags_toml(&self) -> String {
         toml_array(&self.rustflags())
+    }
+
+    /// TOML literals written by older epicenter versions for this host.
+    ///
+    /// 0.0.7 pointed MSVC at `gcc-ld/lld-link.exe`. rustc recognizes the
+    /// `lld-link` name and switches to the generic LLD protocol
+    /// (`-flavor link`), which the COFF driver rejects. `--fast` migrates
+    /// these values to `rust-lld.exe`; `--without-fast` removes them.
+    pub fn legacy_rustflags_toml(&self) -> Vec<String> {
+        match self.flavor {
+            Flavor::Msvc => {
+                let old = self.lld_dir.join("lld-link.exe");
+                vec![toml_array(&[
+                    "-C".to_string(),
+                    format!("linker={}", forward(&old)),
+                ])]
+            }
+            Flavor::Gnu => Vec::new(),
+        }
     }
 }
 
@@ -130,14 +151,13 @@ pub fn locate(sysroot: &Path, host: &str) -> Result<FastLinker> {
              leave the default Apple linker in place"
         );
     }
-    let lld_dir = sysroot
-        .join("lib")
-        .join("rustlib")
-        .join(host)
-        .join("bin")
-        .join("gcc-ld");
-    let (flavor, names): (Flavor, &[&str]) = if host.contains("windows-msvc") {
-        (Flavor::Msvc, &["lld-link.exe", "lld-link"])
+    let bin_dir = sysroot.join("lib").join("rustlib").join(host).join("bin");
+    let lld_dir = bin_dir.join("gcc-ld");
+    let (flavor, search_dir, names): (Flavor, &Path, &[&str]) = if host.contains("windows-msvc") {
+        // rustc matches these exact names and adds `-flavor link`; only the
+        // generic multi-call driver understands it. `gcc-ld/lld-link.exe`
+        // is already the COFF driver and rejects the flag.
+        (Flavor::Msvc, &bin_dir, &["rust-lld.exe", "rust-lld"])
     } else if host.contains("windows-gnu")
         || host.contains("linux")
         || host.contains("freebsd")
@@ -147,18 +167,18 @@ pub fn locate(sysroot: &Path, host: &str) -> Result<FastLinker> {
         || host.contains("solaris")
         || host.contains("illumos")
     {
-        (Flavor::Gnu, &["ld.lld", "ld.lld.exe"])
+        (Flavor::Gnu, &lld_dir, &["ld.lld", "ld.lld.exe"])
     } else {
         bail!("--fast is not supported on host {host} (supported: Linux/BSD ELF and Windows)");
     };
     let linker = names
         .iter()
-        .map(|name| lld_dir.join(name))
+        .map(|name| search_dir.join(name))
         .find(|path| path.is_file())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "rustup's bundled LLD was not found in {} — is the `{host}` target installed?",
-                lld_dir.display()
+                search_dir.display()
             )
         })?;
     Ok(FastLinker {
@@ -187,6 +207,15 @@ mod tests {
         dir
     }
 
+    /// Create files directly in `<sysroot>/lib/rustlib/<host>/bin`.
+    fn fixture_bin(root: &Path, host: &str, names: &[&str]) {
+        let dir = root.join("lib").join("rustlib").join(host).join("bin");
+        std::fs::create_dir_all(&dir).expect("create fixture");
+        for name in names {
+            std::fs::write(dir.join(name), b"").expect("write fixture");
+        }
+    }
+
     #[test]
     fn gnu_hosts_use_fuse_ld_with_the_bundled_dir() {
         let root = tempfile::tempdir().unwrap();
@@ -204,17 +233,34 @@ mod tests {
     }
 
     #[test]
-    fn msvc_hosts_link_with_the_bundled_lld_link() {
+    fn msvc_hosts_link_with_the_generic_rust_lld() {
         let root = tempfile::tempdir().unwrap();
-        fixture(root.path(), "x86_64-pc-windows-msvc", &["lld-link.exe"]);
+        fixture_bin(root.path(), "x86_64-pc-windows-msvc", &["rust-lld.exe"]);
         let lld = locate(root.path(), "x86_64-pc-windows-msvc").unwrap();
         assert_eq!(lld.flavor, Flavor::Msvc);
         let flags = lld.rustflags();
         assert_eq!(flags[0], "-C");
         assert!(flags[1].starts_with("linker="));
-        assert!(flags[1].ends_with("/lld-link.exe"));
+        assert!(flags[1].ends_with("/bin/rust-lld.exe"), "{}", flags[1]);
         assert!(flags[1].contains("x86_64-pc-windows-msvc"));
         assert!(!flags[1].contains('\\'), "paths are forward-slash");
+
+        // rustc passes `-flavor link` for the `lld-link` name; the COFF
+        // driver rejects it. Prefer the generic driver even when both exist.
+        fixture(root.path(), "x86_64-pc-windows-msvc", &["lld-link.exe"]);
+        let lld = locate(root.path(), "x86_64-pc-windows-msvc").unwrap();
+        assert!(lld.linker.ends_with("rust-lld.exe"));
+    }
+
+    #[test]
+    fn msvc_exposes_the_old_lld_link_literal_for_migration() {
+        let root = tempfile::tempdir().unwrap();
+        fixture_bin(root.path(), "x86_64-pc-windows-msvc", &["rust-lld.exe"]);
+        let lld = locate(root.path(), "x86_64-pc-windows-msvc").unwrap();
+        let legacy = lld.legacy_rustflags_toml();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].contains("gcc-ld/lld-link.exe"), "{}", legacy[0]);
+        assert!(lld.rustflags_toml().contains("/bin/rust-lld.exe"));
     }
 
     #[test]

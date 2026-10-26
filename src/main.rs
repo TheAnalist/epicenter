@@ -400,8 +400,13 @@ fn cmd_setup(
             util::green(util::GLYPH_PASS)
         );
     }
-    if report.wrapper_edit.is_some() {
-        println!("{} rustc-wrapper: added", util::green(util::GLYPH_PASS));
+    if let Some(edit) = report.wrapper_edit {
+        let label = if without_wrapper && edit == config::CargoEdit::AlreadySet {
+            "not set"
+        } else {
+            edit.describe()
+        };
+        println!("{} rustc-wrapper: {label}", util::green(util::GLYPH_PASS));
         // Show where the wrapper binary was discovered — and teach the PATH
         // story when it only lives in the cargo bin dir: cargo spawns the
         // wrapper by NAME at build time, which needs PATH.
@@ -430,7 +435,9 @@ fn cmd_setup(
             }
         };
         match fast_report.edit {
-            config::CargoEdit::Inserted | config::CargoEdit::Appended => {
+            config::CargoEdit::Inserted
+            | config::CargoEdit::Appended
+            | config::CargoEdit::Replaced => {
                 println!(
                     "{} fast linker:  rust-lld for {}",
                     util::green(util::GLYPH_PASS),
@@ -464,6 +471,13 @@ fn cmd_setup(
                     fast_report.target
                 );
                 print_incremental();
+            }
+            config::CargoEdit::AlreadySet if !fast => {
+                println!(
+                    "{} fast linker:  not configured for {} (nothing to remove)",
+                    util::green(util::GLYPH_PASS),
+                    fast_report.target
+                );
             }
             config::CargoEdit::AlreadySet => {
                 println!(

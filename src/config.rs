@@ -255,9 +255,15 @@ fn is_target_header(line: &str, target: &str) -> bool {
 }
 
 /// Insert `rustflags = ...` into `[target.<target>]`, preserving every other
-/// line and comment. Existing `rustflags` are **never** overwritten: the
-/// second return value reports that conflict instead.
-fn set_target_rustflags(text: &mut String, target: &str, literal: &str) -> (CargoEdit, bool) {
+/// line and comment. Existing `rustflags` are **never** overwritten, except
+/// literals in `stale` (written by an older `--fast`), which are migrated.
+/// The second return value reports a real conflict instead.
+fn set_target_rustflags(
+    text: &mut String,
+    target: &str,
+    literal: &str,
+    stale: &[String],
+) -> (CargoEdit, bool) {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     if let Some(header) = lines.iter().position(|line| is_target_header(line, target)) {
         let mut end = header + 1;
@@ -268,8 +274,16 @@ fn set_target_rustflags(text: &mut String, target: &str, literal: &str) -> (Carg
             }
             if let Some((key, value)) = trimmed.split_once('=') {
                 if key.trim() == "rustflags" {
-                    let same = clean_toml_value(value) == literal;
-                    return (CargoEdit::AlreadySet, !same);
+                    let value = clean_toml_value(value);
+                    if value == literal {
+                        return (CargoEdit::AlreadySet, false);
+                    }
+                    if stale.iter().any(|old| value == old.as_str()) {
+                        lines[end] = format!("rustflags = {literal}");
+                        *text = lines.join("\n") + "\n";
+                        return (CargoEdit::Replaced, false);
+                    }
+                    return (CargoEdit::AlreadySet, true);
                 }
             }
             end += 1;
@@ -290,8 +304,14 @@ fn set_target_rustflags(text: &mut String, target: &str, literal: &str) -> (Carg
 }
 
 /// Remove the `--fast` `rustflags` from `[target.<target>]` only when the
-/// value still matches what `--fast` writes. Anything else is left alone.
-fn remove_target_rustflags(text: &mut String, target: &str, literal: &str) -> (CargoEdit, bool) {
+/// value matches what `--fast` writes (or a `stale` literal from an older
+/// version). Anything else is left alone.
+fn remove_target_rustflags(
+    text: &mut String,
+    target: &str,
+    literal: &str,
+    stale: &[String],
+) -> (CargoEdit, bool) {
     let mut out: Vec<String> = Vec::new();
     let mut in_table = false;
     let mut removed = false;
@@ -306,7 +326,8 @@ fn remove_target_rustflags(text: &mut String, target: &str, literal: &str) -> (C
         if in_table {
             if let Some((key, value)) = trimmed.split_once('=') {
                 if key.trim() == "rustflags" {
-                    if clean_toml_value(value) == literal {
+                    let value = clean_toml_value(value);
+                    if value == literal || stale.iter().any(|old| value == old.as_str()) {
                         removed = true;
                         continue;
                     }
@@ -454,7 +475,7 @@ pub struct SetupReport {
 /// The `--fast` outcome: rustup's bundled LLD wired into the host target + incremental building
 pub struct FastSetupReport {
     pub target: String,
-    /// `ld.lld` / `lld-link.exe` that the flags point at.
+    /// `ld.lld` / `rust-lld.exe` that the flags point at.
     pub lld: PathBuf,
     pub flags: Vec<String>,
     pub edit: CargoEdit,
@@ -603,10 +624,11 @@ pub fn setup(
         let fast_report = match &fast_linker {
             Some(lld) => {
                 let literal = lld.rustflags_toml();
+                let legacy = lld.legacy_rustflags_toml();
                 let (edit, conflict) = if fast {
-                    set_target_rustflags(&mut text, &lld.host, &literal)
+                    set_target_rustflags(&mut text, &lld.host, &literal, &legacy)
                 } else {
-                    remove_target_rustflags(&mut text, &lld.host, &literal)
+                    remove_target_rustflags(&mut text, &lld.host, &literal, &legacy)
                 };
                 // add also DWARF unpaking to reduce linker workload.
                 // (I think it can give 2% speed increse but it reduces memory usage and doesn't modify
@@ -843,7 +865,8 @@ mod tests {
     fn inserts_fast_flags_into_an_existing_target_table() {
         let mut src = "[build]\nbuild-dir = '/c'\n\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\n[net]\nx = 1\n".to_string();
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\", \"-C\", \"link-arg=-B/tmp/gcc-ld\"]"#;
-        let (edit, conflict) = set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal);
+        let (edit, conflict) =
+            set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal, &[]);
         assert_eq!(edit, CargoEdit::Inserted);
         assert!(!conflict);
         assert!(
@@ -864,8 +887,12 @@ mod tests {
         let mut src =
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n".to_string();
         let original = src.clone();
-        let (edit, conflict) =
-            set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        let (edit, conflict) = set_target_rustflags(
+            &mut src,
+            "x86_64-unknown-linux-gnu",
+            "[\"-C\", \"ours\"]",
+            &[],
+        );
         assert_eq!(edit, CargoEdit::AlreadySet);
         assert!(conflict);
         assert_eq!(src, original, "existing flags untouched");
@@ -874,8 +901,12 @@ mod tests {
         let mut same =
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"ours\"]\n".to_string();
         let original = same.clone();
-        let (edit, conflict) =
-            set_target_rustflags(&mut same, "x86_64-unknown-linux-gnu", "[\"-C\", \"ours\"]");
+        let (edit, conflict) = set_target_rustflags(
+            &mut same,
+            "x86_64-unknown-linux-gnu",
+            "[\"-C\", \"ours\"]",
+            &[],
+        );
         assert_eq!(edit, CargoEdit::AlreadySet);
         assert!(!conflict);
         assert_eq!(same, original);
@@ -887,7 +918,7 @@ mod tests {
             "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrustflags = {literal}\n\n[net]\nx = 1\n"
         );
         let (edit, conflict) =
-            remove_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal);
+            remove_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal, &[]);
         assert_eq!(edit, CargoEdit::Removed);
         assert!(!conflict);
         assert!(!src.contains("rustflags"), "flags not removed:\n{src}");
@@ -903,6 +934,7 @@ mod tests {
             &mut custom,
             "x86_64-unknown-linux-gnu",
             "[\"-C\", \"ours\"]",
+            &[],
         );
         assert_eq!(edit, CargoEdit::AlreadySet);
         assert!(conflict);
@@ -912,7 +944,8 @@ mod tests {
     fn fast_flags_create_the_target_table_when_missing() {
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
         let mut src = "[build]\nbuild-dir = '/c'\n".to_string();
-        let (edit, conflict) = set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal);
+        let (edit, conflict) =
+            set_target_rustflags(&mut src, "x86_64-unknown-linux-gnu", literal, &[]);
         assert_eq!(edit, CargoEdit::Appended);
         assert!(!conflict);
         assert!(
@@ -1100,5 +1133,30 @@ mod tests {
         assert_eq!(edit, CargoEdit::Replaced);
         assert!(text.contains("incremental = true"));
         assert!(!text.contains("incremental = false"));
+    }
+
+    #[test]
+    fn migrates_the_old_msvc_lld_link_flags() {
+        let target = "x86_64-pc-windows-msvc";
+        let old = r#"["-C", "linker=C:/rust/gcc-ld/lld-link.exe"]"#;
+        let new = r#"["-C", "linker=C:/rust/bin/rust-lld.exe"]"#;
+        let mut src = format!("[target.{target}]\nrustflags = {old}\n");
+        let (edit, conflict) = set_target_rustflags(&mut src, target, new, &[old.to_string()]);
+        assert_eq!(edit, CargoEdit::Replaced);
+        assert!(!conflict);
+        assert!(src.contains(new));
+        assert!(!src.contains("lld-link.exe"));
+    }
+
+    #[test]
+    fn without_fast_removes_the_old_msvc_lld_link_flags() {
+        let target = "x86_64-pc-windows-msvc";
+        let old = r#"["-C", "linker=C:/rust/gcc-ld/lld-link.exe"]"#;
+        let new = r#"["-C", "linker=C:/rust/bin/rust-lld.exe"]"#;
+        let mut src = format!("[target.{target}]\nrustflags = {old}\n");
+        let (edit, conflict) = remove_target_rustflags(&mut src, target, new, &[old.to_string()]);
+        assert_eq!(edit, CargoEdit::Removed);
+        assert!(!conflict);
+        assert!(!src.contains("rustflags"), "{src}");
     }
 }

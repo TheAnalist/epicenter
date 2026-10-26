@@ -119,7 +119,7 @@ Every setup edit backs up the previous config as `config.toml.epicenter-bak[.N]`
 | `epicenter setup` | write the shared-cache config; **backups** any file it modifies (`*.epicenter-bak`) |
 | `epicenter setup --cache-root <path>` | use a different cache directory instead of the default |
 | `epicenter setup --use-default` | remove a custom root, back to the canonical default |
-| `epicenter setup --fast` | wire rustup's bundled LLD (`ld.lld` / `lld-link`) into `~/.cargo/config.toml` — zero installs; also sets `incremental = true` unless a wrapper is configured; `--without-fast` removes the flags |
+| `epicenter setup --fast` | wire rustup's bundled LLD (`ld.lld` / `rust-lld`) into `~/.cargo/config.toml` — zero installs; also sets `incremental = true` unless a wrapper is configured; `--without-fast` removes the flags |
 | `epicenter setup --revert-config` | restore `~/.cargo/config.toml` from the newest setup backup (`config.toml.epicenter-bak[.N]`), then stop |
 | `epicenter setup --with-wrapper kache` | also configure [kache](https://github.com/kunobi-ninja/kache) (or sccache) as `rustc-wrapper` |
 | `epicenter setup --without-wrapper` | remove a previously configured wrapper |
@@ -157,9 +157,11 @@ one `[target.<host>] rustflags` line into `~/.cargo/config.toml`:
 
 - **Linux / BSD (ELF)** — `-C link-arg=-fuse-ld=lld -C link-arg=-B<gcc-ld>`.
   The system C compiler stays the driver; it does not have to be clang.
-- **Windows MSVC** — `-C linker=<gcc-ld>/lld-link.exe`. `-fuse-ld` is a
+- **Windows MSVC** — `-C linker=<bin>/rust-lld.exe`. `-fuse-ld` is a
   GCC/Clang flag and `link.exe` does not understand it, so rustc is pointed at
-  the bundled linker directly.
+  the bundled **generic** LLD driver. rustc recognizes the name and appends
+  `-flavor link`; `gcc-ld/lld-link.exe` is already the COFF driver and rejects
+  that flag.
 - **macOS** is refused — `ld64.lld` is not a drop-in replacement for Apple's
   linker.
 
