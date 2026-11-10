@@ -1,6 +1,6 @@
 //! Small formatting/parsing helpers shared by the other modules.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -92,13 +92,13 @@ pub const GLYPH_FAIL: &str = "✕";
 /// `◆`
 pub const GLYPH_INFO: &str = "◆";
 
-/// `1234567` -> `"1.2 MiB"` style, compact.
+/// `1234567` -> `"1.2 MB"` style, compact decimal units.
 pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
@@ -106,6 +106,21 @@ pub fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Render an untrusted name for a terminal without ANSI/control injection.
+pub fn safe_display(value: &std::ffi::OsStr) -> String {
+    value
+        .to_string_lossy()
+        .chars()
+        .flat_map(|ch| {
+            if ch.is_control() {
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
 }
 
 /// Parse `"30d"`, `"2w"`, `"12h"`, `"90m"`, `"45s"` or plain seconds `"45"`.
@@ -257,7 +272,7 @@ pub fn force_remove_dir(path: &Path) -> std::io::Result<()> {
         if entry.file_type().is_symlink() {
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+        let Ok(meta) = metadata_nofollow(entry.path()) else {
             continue;
         };
         let mut perms = meta.permissions();
@@ -271,8 +286,8 @@ pub fn force_remove_dir(path: &Path) -> std::io::Result<()> {
 
 // ── security: identity, paths, private dirs, hashes ────────────────────────
 
-/// Effective uid. Only meaningful on Unix; 0 elsewhere (permission checks
-/// are skipped there and documented as such).
+/// Effective uid. Only meaningful on Unix; Windows uses the owner SID check
+/// in [`owned_by_us`] instead.
 #[cfg(unix)]
 pub fn euid() -> u32 {
     // SAFETY: geteuid(2) has no preconditions and never fails.
@@ -284,18 +299,281 @@ pub fn euid() -> u32 {
     0
 }
 
-/// Is this file owned by the current effective user? (always true off Unix)
-pub fn owned_by_us(meta: &fs::Metadata) -> bool {
+/// Is this file owned by the current effective user?
+///
+/// Unix checks the uid from the already-open metadata. Windows has no uid;
+/// inspect the file's owner SID against the current process token. This is
+/// the path-aware check that closes the "owned_by_us is always true" gap.
+pub fn owned_by_us(path: &Path, meta: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = path;
         meta.uid() == euid()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = meta;
+        windows_owner_is_current(path).unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, meta);
         true
     }
+}
+
+#[cfg(windows)]
+fn windows_token_user() -> Option<Vec<usize>> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut needed = 0u32;
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0usize; words.max(1)];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    (ok != 0).then_some(buffer)
+}
+
+#[cfg(windows)]
+fn windows_owner_is_current(path: &Path) -> Option<bool> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_USER,
+    };
+
+    // Canonical Windows paths can carry a `\\?\` verbatim prefix; the
+    // security API expects the ordinary DOS path.
+    let text = strip_verbatim(&path.to_string_lossy());
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if rc != 0 {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return None;
+    }
+    if owner.is_null() {
+        unsafe { LocalFree(descriptor) };
+        return None;
+    }
+
+    let Some(token_user) = windows_token_user() else {
+        unsafe { LocalFree(descriptor) };
+        return None;
+    };
+    let same = unsafe {
+        let user = &*(token_user.as_ptr() as *const TOKEN_USER);
+        EqualSid(owner, user.User.Sid) != 0
+    };
+    unsafe { LocalFree(descriptor) };
+    Some(same)
+}
+
+/// Does this path's DACL grant write access only to the current user,
+/// SYSTEM, Administrators and the object owner?
+///
+/// A NULL or missing DACL is public. `None` means the DACL could not be
+/// inspected; callers must treat that as not private.
+#[cfg(windows)]
+pub fn windows_acl_is_private(path: &Path) -> Option<bool> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT, ACL,
+        ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetAclInformation, GetLengthSid, GetSecurityDescriptorDacl, IsValidSid, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_USER,
+        WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid,
+        WinLocalSystemSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+        ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+        ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+    };
+
+    let token_user = windows_token_user()?;
+    let user = unsafe { &*(token_user.as_ptr() as *const TOKEN_USER) };
+    if user.User.Sid.is_null() {
+        return None;
+    }
+
+    let text = strip_verbatim(&path.to_string_lossy());
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if rc != 0 || owner.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return None;
+    }
+
+    let result = (|| -> Option<bool> {
+        let mut present: i32 = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted: i32 = 0;
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+        {
+            return None;
+        }
+        // A missing or NULL DACL grants full access to everyone.
+        if present == 0 || dacl.is_null() {
+            return Some(false);
+        }
+        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return None;
+        }
+
+        // Mutation bits only. Do not use FILE_GENERIC_WRITE as a whole: it
+        // also contains READ_CONTROL and SYNCHRONIZE, which read-only ACEs
+        // already grant.
+        const WRITE_MASK: u32 = FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_DELETE_CHILD
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | GENERIC_WRITE
+            | GENERIC_ALL;
+
+        for index in 0..info.AceCount {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return None;
+            }
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            let size = usize::from(header.AceSize);
+            if size < std::mem::size_of::<ACE_HEADER>() {
+                return Some(false);
+            }
+            let kind = u32::from(header.AceType);
+            let (mask, sid_offset) = match kind {
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {
+                    if size < 8 + 8 {
+                        return Some(false);
+                    }
+                    let mask = unsafe {
+                        std::ptr::read_unaligned((ace as *const u8).add(4) as *const u32)
+                    };
+                    (mask, 8usize)
+                }
+                ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
+                    if size < 12 + 8 {
+                        return Some(false);
+                    }
+                    let mask = unsafe {
+                        std::ptr::read_unaligned((ace as *const u8).add(4) as *const u32)
+                    };
+                    let flags = unsafe {
+                        std::ptr::read_unaligned((ace as *const u8).add(8) as *const u32)
+                    };
+                    let mut offset = 12usize;
+                    if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                        offset += 16;
+                    }
+                    if flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+                        offset += 16;
+                    }
+                    (mask, offset)
+                }
+                // Obsolete compound ACEs are not expected on files. Do not
+                // guess at their layout; fail closed if one appears.
+                ACCESS_ALLOWED_COMPOUND_ACE_TYPE => return Some(false),
+                _ => continue,
+            };
+            if mask & WRITE_MASK == 0 {
+                continue;
+            }
+            if sid_offset + 8 > size {
+                return Some(false);
+            }
+            let sid = unsafe { (ace as *const u8).add(sid_offset) as PSID };
+            if unsafe { IsValidSid(sid) } == 0 {
+                return Some(false);
+            }
+            let sid_len = unsafe { GetLengthSid(sid) } as usize;
+            if sid_offset + sid_len > size {
+                return Some(false);
+            }
+            let trusted = unsafe {
+                EqualSid(sid, user.User.Sid) != 0
+                    || EqualSid(sid, owner) != 0
+                    || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                    || IsWellKnownSid(sid, WinCreatorOwnerSid) != 0
+                    || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
+            };
+            if !trusted {
+                return Some(false);
+            }
+        }
+        Some(true)
+    })();
+
+    unsafe { LocalFree(descriptor) };
+    result
 }
 
 /// Windows reserved device names (case-insensitive, before the first dot).
@@ -308,10 +586,24 @@ pub fn is_windows_reserved(value: &str) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit())
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return true;
+    }
+    for prefix in ["COM", "LPT"] {
+        let Some(rest) = stem.strip_prefix(prefix) else {
+            continue;
+        };
+        let mut chars = rest.chars();
+        if let (Some(one), None) = (chars.next(), chars.next()) {
+            if one.is_ascii_digit() || matches!(one, '¹' | '²' | '³') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Windows single-user policy: the cache/store/work must live under the
@@ -367,13 +659,17 @@ pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
     let mut current = PathBuf::new();
     for component in full.components() {
         current.push(component.as_os_str());
-        if let Ok(meta) = fs::symlink_metadata(&current) {
-            if is_reparse_point(&meta) {
+        match metadata_nofollow(&current) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
                 anyhow::bail!(
                     "{what} path contains a reparse point: {}",
                     current.display()
                 );
             }
+            // A missing/unreadable component is handled by the canonical
+            // checks below; the old code ignored metadata errors here too.
+            Err(_) => {}
         }
     }
 
@@ -443,6 +739,7 @@ pub fn validate_component(value: &str, what: &str) -> Result<()> {
         || value.trim_end_matches([' ', '.']) == "."
         || value.trim_end_matches([' ', '.']) == ".."
         || value.contains(['/', '\\', '\0', ':'])
+        || value.chars().any(char::is_control)
         || is_windows_reserved(value)
     {
         anyhow::bail!("invalid {what} {value:?}: expected one plain path component");
@@ -505,12 +802,19 @@ pub fn create_private_dir_all(path: &Path) -> Result<()> {
             .mode(0o700)
             .create(path)
             .with_context(|| format!("creating private directory {}", path.display()))?;
-        let meta =
-            fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
-        if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
+        let meta = match metadata_nofollow(path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                anyhow::bail!("{} is not a real directory", path.display());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", path.display()));
+            }
+        };
+        if !meta.is_dir() {
             anyhow::bail!("{} is not a real directory", path.display());
         }
-        if !owned_by_us(&meta) {
+        if !owned_by_us(path, &meta) {
             anyhow::bail!(
                 "{} is owned by uid {} — refusing to use a cache directory not owned by uid {}",
                 path.display(),
@@ -532,12 +836,19 @@ pub fn create_private_dir_all(path: &Path) -> Result<()> {
 /// Verify (and, when possible, repair) an existing private directory.
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
     refuse_destructive_chmod(path)?;
-    let meta =
-        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
+    let meta = match metadata_nofollow(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} is not a real directory", path.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", path.display()));
+        }
+    };
+    if !meta.is_dir() {
         anyhow::bail!("{} is not a real directory", path.display());
     }
-    if !owned_by_us(&meta) {
+    if !owned_by_us(path, &meta) {
         anyhow::bail!(
             "{} is owned by another user — refusing a shared/untrusted cache",
             path.display()
@@ -558,9 +869,16 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// file, with no symlink at any component. Read-only; used before hashing or
 /// restoring a store file.
 pub fn check_regular_chain(base: &Path, rel: &Path) -> Result<()> {
-    let base_meta =
-        fs::symlink_metadata(base).with_context(|| format!("inspecting {}", base.display()))?;
-    if !base_meta.is_dir() || base_meta.file_type().is_symlink() || is_reparse_point(&base_meta) {
+    let base_meta = match metadata_nofollow(base) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} is not a real directory", base.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", base.display()));
+        }
+    };
+    if !base_meta.is_dir() {
         anyhow::bail!("{} is not a real directory", base.display());
     }
     let mut current = base.to_path_buf();
@@ -570,11 +888,15 @@ pub fn check_regular_chain(base: &Path, rel: &Path) -> Result<()> {
             anyhow::bail!("refusing non-normal path component in {}", rel.display());
         };
         current.push(part);
-        let meta = fs::symlink_metadata(&current)
-            .with_context(|| format!("inspecting {}", current.display()))?;
-        if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-            anyhow::bail!("symlink/reparse in store path: {}", current.display());
-        }
+        let meta = match metadata_nofollow(&current) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                anyhow::bail!("symlink/reparse in store path: {}", current.display());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", current.display()));
+            }
+        };
         if index + 1 == components.len() {
             if !meta.is_file() {
                 anyhow::bail!("not a regular file: {}", current.display());
@@ -586,13 +908,87 @@ pub fn check_regular_chain(base: &Path, rel: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate a state root and return its canonical path.
+///
+/// The final component must be a real directory, not a symlink or reparse
+/// point. Canonicalizing also resolves any symlink in an ancestor; callers
+/// that keep the returned path use the resolved tree for the rest of the
+/// operation, so swapping the original link cannot redirect a later write.
+pub fn validate_state_root(path: &Path, what: &str) -> Result<PathBuf> {
+    ensure_windows_user_path(path, what)?;
+    let meta = match metadata_nofollow(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "{} {} is a symlink/reparse or not a directory",
+                what,
+                path.display()
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {} {}", what, path.display()));
+        }
+    };
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "{} {} is a symlink/reparse or not a directory",
+            what,
+            path.display()
+        );
+    }
+    let canonical =
+        fs::canonicalize(path).with_context(|| format!("resolving {} {}", what, path.display()))?;
+    let meta = match metadata_nofollow(&canonical) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "resolved {} {} is a symlink/reparse or not a directory",
+                what,
+                canonical.display()
+            );
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspecting resolved {} {}", what, canonical.display()));
+        }
+    };
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "resolved {} {} is a symlink/reparse or not a directory",
+            what,
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+/// Keeps Windows directory handles alive through the following file install.
+#[derive(Default)]
+pub struct DirChainGuard {
+    #[cfg(windows)]
+    #[allow(dead_code)] // held for its RAII side effect
+    handles: Vec<File>,
+}
+
 /// Create a directory chain under an existing `base` without following any
 /// symlink component. `rel` must already have been validated (only normal
-/// components). New components are 0700.
-pub fn create_dir_chain_nofollow(base: &Path, rel: &Path) -> Result<()> {
-    let base_meta =
-        fs::symlink_metadata(base).with_context(|| format!("inspecting {}", base.display()))?;
-    if !base_meta.is_dir() || base_meta.file_type().is_symlink() || is_reparse_point(&base_meta) {
+/// components). New components are 0700. Keep the returned guard alive until
+/// the file is installed; on Windows it prevents a parent rename/junction swap.
+pub fn create_dir_chain_nofollow(base: &Path, rel: &Path) -> Result<DirChainGuard> {
+    #[cfg(windows)]
+    {
+        return create_dir_chain_windows(base, rel);
+    }
+    let base_meta = match metadata_nofollow(base) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} is not a real directory", base.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", base.display()));
+        }
+    };
+    if !base_meta.is_dir() {
         anyhow::bail!("{} is not a real directory", base.display());
     }
     let mut current = base.to_path_buf();
@@ -601,34 +997,142 @@ pub fn create_dir_chain_nofollow(base: &Path, rel: &Path) -> Result<()> {
             anyhow::bail!("refusing non-normal path component in {}", rel.display());
         };
         current.push(part);
-        match fs::symlink_metadata(&current) {
+        match metadata_nofollow(&current) {
             Ok(meta) => {
-                if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-                    anyhow::bail!("symlink/reparse in destination path: {}", current.display());
-                }
                 if !meta.is_dir() {
                     anyhow::bail!("not a directory: {}", current.display());
                 }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                anyhow::bail!("symlink/reparse in destination path: {}", current.display());
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;
-                    fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(&current)
-                        .with_context(|| format!("creating {}", current.display()))?;
+                    match fs::DirBuilder::new().mode(0o700).create(&current) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // Another worker created it between the lookup and
+                            // mkdir; accept a real directory, never a link.
+                            let meta = match metadata_nofollow(&current) {
+                                Ok(meta) => meta,
+                                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                                    anyhow::bail!(
+                                        "symlink/reparse in destination path: {}",
+                                        current.display()
+                                    );
+                                }
+                                Err(err) => {
+                                    return Err(err).with_context(|| {
+                                        format!("inspecting {}", current.display())
+                                    });
+                                }
+                            };
+                            if !meta.is_dir() {
+                                anyhow::bail!(
+                                    "symlink/reparse in destination path: {}",
+                                    current.display()
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            return Err(err)
+                                .with_context(|| format!("creating {}", current.display()));
+                        }
+                    }
                 }
                 #[cfg(not(unix))]
-                fs::create_dir(&current)
-                    .with_context(|| format!("creating {}", current.display()))?;
+                {
+                    match fs::create_dir(&current) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // Parallel restore workers race here on Windows.
+                            let meta = match metadata_nofollow(&current) {
+                                Ok(meta) => meta,
+                                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                                    anyhow::bail!(
+                                        "symlink/reparse in destination path: {}",
+                                        current.display()
+                                    );
+                                }
+                                Err(err) => {
+                                    return Err(err).with_context(|| {
+                                        format!("inspecting {}", current.display())
+                                    });
+                                }
+                            };
+                            if !meta.is_dir() {
+                                anyhow::bail!(
+                                    "symlink/reparse in destination path: {}",
+                                    current.display()
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            return Err(err)
+                                .with_context(|| format!("creating {}", current.display()));
+                        }
+                    }
+                }
             }
             Err(err) => {
                 return Err(err).with_context(|| format!("inspecting {}", current.display()));
             }
         }
     }
-    Ok(())
+    Ok(DirChainGuard::default())
+}
+
+#[cfg(windows)]
+fn open_dir_handle(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening directory handle {}", path.display()))?;
+    let meta = file.metadata()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
+        anyhow::bail!("{} is not a real directory", path.display());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_dir_chain_windows(base: &Path, rel: &Path) -> Result<DirChainGuard> {
+    // Hold a handle for every parent. Windows refuses to rename/delete a
+    // directory while a handle without FILE_SHARE_DELETE is open, so a
+    // directory->junction swap cannot redirect a later write.
+    let mut handles = vec![open_dir_handle(base)?];
+    let mut current = base.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!("refusing non-normal path component in {}", rel.display());
+        };
+        current.push(part);
+        match open_dir_handle(&current) {
+            Ok(file) => handles.push(file),
+            Err(err)
+                if err
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("creating {}", current.display()));
+                    }
+                }
+                handles.push(open_dir_handle(&current)?);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(DirChainGuard { handles })
 }
 
 /// Capability-style directory handle for Unix restore. All child lookups
@@ -726,16 +1230,19 @@ impl AtDir {
         Ok(true)
     }
 
-    /// Portable fallback for platforms without /proc/self/fd: linkat with a
-    /// source path but a held destination directory fd. The destination is
-    /// still race-free; the source is store-owned and pre-checked.
-    pub(crate) fn link_path(&self, source: &Path, dst_name: &std::ffi::OsStr) -> Result<()> {
+    /// Link the exact inode behind an already-open, hashed source descriptor.
+    /// Linux exposes the held fd through /proc/self/fd, so a concurrent path
+    /// swap in the store cannot substitute another inode between the hash
+    /// check and the link. Other Unix platforms copy instead.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn link_fd(&self, source: &File, dst_name: &std::ffi::OsStr) -> std::io::Result<()> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        let src = CString::new(source.as_os_str().as_bytes())
-            .with_context(|| format!("source path contains NUL: {}", source.display()))?;
+        use std::os::unix::io::AsRawFd;
+        let src = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let dst = CString::new(dst_name.as_bytes())
-            .with_context(|| format!("destination name contains NUL: {:?}", dst_name))?;
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let rc = unsafe {
             libc::linkat(
                 libc::AT_FDCWD,
@@ -745,11 +1252,20 @@ impl AtDir {
                 libc::AT_SYMLINK_FOLLOW,
             )
         };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("linking {:?}", dst_name));
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn link_fd(
+        &self,
+        _source: &File,
+        _dst_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
     pub(crate) fn create_excl(&self, name: &std::ffi::OsStr, mode: u32) -> Result<File> {
@@ -811,14 +1327,18 @@ pub(crate) fn open_file_nofollow(path: &Path) -> Result<File> {
     let fd = unsafe {
         libc::open(
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("opening {}", path.display()));
     }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -840,7 +1360,6 @@ pub(crate) fn set_stamp_fd(file: &File, stamp: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 pub(crate) fn sha256_file_fd(file: &mut File) -> std::io::Result<String> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(0))?;
@@ -856,6 +1375,29 @@ pub(crate) fn sha256_file_fd(file: &mut File) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Try a copy-on-write clone (Linux `FICLONE`). A clone is a **new inode**:
+/// it preserves isolation while avoiding duplicate disk blocks on btrfs/XFS/
+/// ZFS and other reflink-capable filesystems. `Unsupported`/`EOPNOTSUPP`
+/// means the caller should fall back to a verified copy.
+#[cfg(target_os = "linux")]
+fn try_reflink(src: &File, dst: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // FICLONE is _IOW(0x94, 9, int); libc does not expose it on every
+    // version, so keep the stable value local.
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let rc = unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_reflink(_src: &File, _dst: &File) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
 #[cfg(unix)]
 pub(crate) fn copy_fd_verified(
     src: &mut File,
@@ -865,6 +1407,21 @@ pub(crate) fn copy_fd_verified(
 ) -> Result<(u64, String)> {
     use std::io::{Seek, SeekFrom};
     src.seek(SeekFrom::Start(0))?;
+    // Prefer a reflink (new inode, no duplicated blocks). Hash the clone
+    // from its own descriptor; a clone is only trusted after verification.
+    if try_reflink(src, dst).is_ok() {
+        dst.seek(SeekFrom::Start(0))?;
+        let hash = sha256_file_fd(dst)?;
+        let size = dst.metadata()?.len();
+        if size != expected_size || hash != expected_hash {
+            anyhow::bail!(
+                "integrity check failed (recorded {expected_size} bytes/{}, found {size} bytes/{})",
+                &expected_hash[..expected_hash.len().min(12)],
+                &hash[..hash.len().min(12)]
+            );
+        }
+        return Ok((size, hash));
+    }
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     let mut size = 0u64;
@@ -890,20 +1447,23 @@ pub(crate) fn copy_fd_verified(
 }
 
 /// SHA-256 of a regular file (lowercase hex). Callers that accept untrusted
-/// paths must reject symlinks with `symlink_metadata` first.
+/// paths must reject symlinks with `metadata_nofollow` first.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
     let mut file = options.open(path)?;
-    if is_reparse_point(&file.metadata()?) {
+    let meta = file.metadata()?;
+    if !meta.is_file() || is_reparse_point(&meta) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "reparse point refused",
+            "not a regular file",
         ));
     }
     let mut hasher = Sha256::new();
@@ -921,14 +1481,24 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// Like [`read_small_text`] but follows a user's config symlink (dotfiles);
 /// still refuses FIFOs/devices and oversized inputs.
 pub fn read_small_text_follow(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let meta = fs::metadata(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a small regular file",
         ));
     }
-    fs::read_to_string(path)
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// Read a small regular file without following a symlink and without
@@ -940,8 +1510,10 @@ pub fn read_small_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
     let mut file = options.open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || is_reparse_point(&meta) || meta.len() > max_bytes {
@@ -966,8 +1538,10 @@ pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<Strin
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
     let mut file = options.open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || is_reparse_point(&meta) || meta.len() > max_bytes {
@@ -976,7 +1550,7 @@ pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<Strin
             "not a small regular config file",
         ));
     }
-    if !owned_by_us(&meta) {
+    if !owned_by_us(path, &meta) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "config file is owned by another user",
@@ -997,6 +1571,15 @@ pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<Strin
     Ok(text)
 }
 
+/// A random suffix for temp names, so a writer cannot predict and pre-plant
+/// the next temp path.
+pub(crate) fn temp_nonce() -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map(|_| u64::from_le_bytes(bytes))
+        .unwrap_or(0)
+}
+
 /// Atomically replace a private config file. The temp is created with
 /// `O_EXCL` and mode 0600 in the same directory, then renamed over the
 /// target. Renaming replaces a planted symlink instead of following it (on
@@ -1011,8 +1594,12 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
     let mut last_error = None;
+    let nonce = temp_nonce();
     for attempt in 0..100u32 {
-        let tmp = parent.join(format!(".{base}.tmp-{}-{attempt}", std::process::id()));
+        let tmp = parent.join(format!(
+            ".{base}.tmp-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1031,13 +1618,14 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::remove_file(&tmp);
             return Err(err).with_context(|| format!("writing {}", tmp.display()));
         }
-        drop(file);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            // Use the held fd, never a path that could be swapped.
+            file.set_permissions(fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("securing {}", tmp.display()))?;
         }
+        drop(file);
         match fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
             #[cfg(windows)]
@@ -1076,18 +1664,40 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Refuses symlinks/FIFOs/devices and never follows a destination symlink.
 /// Returns (bytes, sha256).
 pub fn copy_file_hashed(src: &Path, dst: &Path) -> Result<(u64, String)> {
-    let meta = fs::symlink_metadata(src)
-        .with_context(|| format!("inspecting source {}", src.display()))?;
-    if !meta.file_type().is_file() || is_reparse_point(&meta) {
+    copy_file_hashed_mode(src, dst, true)
+}
+
+fn copy_file_hashed_mode(src: &Path, dst: &Path, require_owner: bool) -> Result<(u64, String)> {
+    let meta = match metadata_nofollow(src) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "{} is not a regular file (symlink/special file refused)",
+                src.display()
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting source {}", src.display()));
+        }
+    };
+    if !meta.is_file() {
         anyhow::bail!(
             "{} is not a regular file (symlink/special file refused)",
             src.display()
         );
     }
-    if !owned_by_us(&meta) {
+    if require_owner && !owned_by_us(src, &meta) {
         anyhow::bail!(
             "{} is owned by another user — refusing to copy it into the vault",
             src.display()
+        );
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes (cap {}) — refusing to copy an oversized artifact",
+            src.display(),
+            meta.len(),
+            MAX_FILE_BYTES
         );
     }
     let mut options = OpenOptions::new();
@@ -1095,20 +1705,45 @@ pub fn copy_file_hashed(src: &Path, dst: &Path) -> Result<(u64, String)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
     let mut input = options
         .open(src)
         .with_context(|| format!("opening source {}", src.display()))?;
-    if !input.metadata()?.is_file() {
+    let input_meta = input.metadata()?;
+    if !input_meta.is_file() || is_reparse_point(&input_meta) {
         anyhow::bail!("{} changed type while opening", src.display());
     }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut output_options = OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Create the destination private; the store makes it read-only after
+        // stamping. Normal umasks leave it owner-writable for the stamp.
+        output_options.mode(0o600);
+    }
+    let mut output = output_options
         .open(dst)
         .with_context(|| format!("creating {}", dst.display()))?;
+
+    if !output.metadata()?.is_file() {
+        anyhow::bail!("{} changed type while opening", dst.display());
+    }
+
+    // Copy-on-write clone when the filesystem supports it. The clone is a
+    // new inode (no shared mutable state) and costs no duplicate blocks.
+    if try_reflink(&input, &output).is_ok() {
+        let hash = sha256_file(dst).with_context(|| format!("hashing cloned {}", dst.display()))?;
+        return Ok((output.metadata()?.len(), hash));
+    }
+
     let mut hasher = Sha256::new();
+    // Small enough to keep the 3,000+ tiny fingerprint files cheap; the
+    // harvest/restore pools parallelize across unit groups, so large rlibs
+    // still keep the disk busy.
     let mut buf = [0u8; 64 * 1024];
     let mut size = 0u64;
     loop {
@@ -1124,6 +1759,496 @@ pub fn copy_file_hashed(src: &Path, dst: &Path) -> Result<(u64, String)> {
     Ok((size, format!("{:x}", hasher.finalize())))
 }
 
+/// Upper bound for one stored artifact. This is a disk-fill guard, not a
+/// performance target: rustc artifacts are normally far smaller.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Files below this size are stored raw; gzip headers would erase the win.
+pub(crate) const COMPRESS_MIN_BYTES: u64 = 4 * 1024;
+
+/// Compress one regular owned source into a content-addressed gzip blob.
+///
+/// The blob lives at `<generation>/blobs/<aa>/<sha256>.gz`. The return is
+/// `(raw_size, sha256, object_path)` where `object_path` is relative to the
+/// generation root. `None` means the file is too small or gzip did not make
+/// it smaller; the caller should store it raw.
+pub(crate) fn compress_file_hashed(
+    src: &Path,
+    generation_root: &Path,
+) -> Result<Option<(u64, String, String)>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let meta = match metadata_nofollow(src) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "{} is not a regular file (symlink/special file refused)",
+                src.display()
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting source {}", src.display()));
+        }
+    };
+    if !meta.is_file() {
+        anyhow::bail!(
+            "{} is not a regular file (symlink/special file refused)",
+            src.display()
+        );
+    }
+    if !owned_by_us(src, &meta) {
+        anyhow::bail!(
+            "{} is owned by another user — refusing to compress it into the vault",
+            src.display()
+        );
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes (cap {}) — refusing to compress an oversized artifact",
+            src.display(),
+            meta.len(),
+            MAX_FILE_BYTES
+        );
+    }
+    if meta.len() < COMPRESS_MIN_BYTES {
+        return Ok(None);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
+    let mut input = options
+        .open(src)
+        .with_context(|| format!("opening source {}", src.display()))?;
+    let input_meta = input.metadata()?;
+    if !input_meta.is_file() || is_reparse_point(&input_meta) {
+        anyhow::bail!("{} changed type while opening", src.display());
+    }
+
+    let blobs = generation_root.join("blobs");
+    create_private_dir_all(&blobs)?;
+    let nonce = temp_nonce();
+    let mut tmp = None;
+    for attempt in 0..100u32 {
+        let candidate = blobs.join(format!(".tmp-{}-{nonce}-{attempt}.gz", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                tmp = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("creating {}", candidate.display()));
+            }
+        }
+    }
+    let Some((tmp_path, tmp_file)) = tmp else {
+        anyhow::bail!("could not create a compression temp in {}", blobs.display());
+    };
+
+    let mut encoder = GzEncoder::new(tmp_file, Compression::fast());
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    let result = (|| -> Result<()> {
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            encoder.write_all(&buf[..n])?;
+            size += n as u64;
+        }
+        encoder.finish()?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("compressing {}", src.display()));
+    }
+    let sha = format!("{:x}", hasher.finalize());
+    let compressed_size = fs::metadata(&tmp_path)?.len();
+    if compressed_size >= size {
+        let _ = fs::remove_file(&tmp_path);
+        return Ok(None);
+    }
+
+    let object = format!("blobs/{}/{sha}.gz", &sha[..2]);
+    let final_path = generation_root.join(&object);
+    if let Some(parent) = final_path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    // The blob name is its content hash. Never follow or replace a planted
+    // symlink, and never silently accept bytes that do not match the name.
+    let mut install = true;
+    match metadata_nofollow(&final_path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                let _ = fs::remove_file(&tmp_path);
+                anyhow::bail!(
+                    "blob path {} is a symlink/reparse or not a regular file",
+                    final_path.display()
+                );
+            }
+            let existing = sha256_file(&final_path)
+                .with_context(|| format!("hashing existing blob {}", final_path.display()))?;
+            if existing != sha {
+                let _ = fs::remove_file(&tmp_path);
+                anyhow::bail!(
+                    "content-addressed blob {} does not match its name",
+                    final_path.display()
+                );
+            }
+            install = false;
+            let _ = fs::remove_file(&tmp_path);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            let _ = fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "blob path {} is a symlink/reparse or not a regular file",
+                final_path.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err).with_context(|| format!("inspecting {}", final_path.display()));
+        }
+    }
+    if install {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp_path);
+                let meta = match metadata_nofollow(&final_path) {
+                    Ok(meta) => meta,
+                    Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                        anyhow::bail!("blob path {} is not a regular file", final_path.display());
+                    }
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("inspecting {}", final_path.display()));
+                    }
+                };
+                if !meta.is_file() {
+                    anyhow::bail!("blob path {} is not a regular file", final_path.display());
+                }
+                let existing = sha256_file(&final_path)?;
+                if existing != sha {
+                    anyhow::bail!(
+                        "content-addressed blob {} does not match its name",
+                        final_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err).with_context(|| format!("installing {}", final_path.display()));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file = open_file_nofollow(&final_path)
+            .with_context(|| format!("opening blob {}", final_path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("securing blob {}", final_path.display()))?;
+    }
+    Ok(Some((size, sha, object)))
+}
+
+/// Hash the decoded content of a gzip blob.
+pub(crate) fn decompress_file_hashed(
+    src: &Path,
+    require_owner: bool,
+    max_size: u64,
+) -> Result<(u64, String)> {
+    use flate2::read::GzDecoder;
+    let meta = match metadata_nofollow(src) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} is not a regular blob", src.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting blob {}", src.display()));
+        }
+    };
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a regular blob", src.display());
+    }
+    if require_owner && !owned_by_us(src, &meta) {
+        anyhow::bail!("{} is owned by another user", src.display());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
+    let mut input = options
+        .open(src)
+        .with_context(|| format!("opening blob {}", src.display()))?;
+    let input_meta = input.metadata()?;
+    if !input_meta.is_file() || is_reparse_point(&input_meta) {
+        anyhow::bail!("{} is not a regular blob", src.display());
+    }
+    let mut decoder = GzDecoder::new(&mut input);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        size = size.saturating_add(n as u64);
+        if size > max_size {
+            anyhow::bail!(
+                "decoded blob {} exceeds its recorded size ({max_size} bytes)",
+                src.display()
+            );
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((size, format!("{:x}", hasher.finalize())))
+}
+
+/// Decompress a blob into a new file and verify its decoded size/hash.
+///
+/// `dst` is created with `create_new`; creation failures keep their
+/// `io::ErrorKind` (notably `AlreadyExists`) instead of being turned into an
+/// integrity error. Once `dst` has been created, a decode/write/integrity
+/// failure removes the file this call created and returns the specific error.
+/// Callers must not unlink `dst` themselves on an error: only this function
+/// knows whether the destination belonged to this operation.
+#[cfg(not(unix))]
+pub(crate) fn decompress_file_verified(
+    src: &Path,
+    dst: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<()> {
+    use flate2::read::GzDecoder;
+    if expected_size > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "blob {} records {} bytes (cap {}) — refusing to decompress",
+            src.display(),
+            expected_size,
+            MAX_FILE_BYTES
+        );
+    }
+    let mut input_options = OpenOptions::new();
+    input_options.read(true);
+    #[cfg(windows)]
+    windows_no_reparse(&mut input_options);
+    let mut input = input_options
+        .open(src)
+        .with_context(|| format!("opening blob {}", src.display()))?;
+    let input_meta = input.metadata()?;
+    if !input_meta.is_file() || is_reparse_point(&input_meta) {
+        anyhow::bail!("{} is not a regular blob", src.display());
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .with_context(|| format!("creating {}", dst.display()))?;
+    let mut decoder = GzDecoder::new(&mut input);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    let result = (|| -> Result<()> {
+        loop {
+            let n = decoder
+                .read(&mut buf)
+                .with_context(|| format!("decoding blob {}", src.display()))?;
+            if n == 0 {
+                break;
+            }
+            size = size.saturating_add(n as u64);
+            if size > expected_size {
+                anyhow::bail!("decoded blob exceeds its recorded size ({expected_size} bytes)");
+            }
+            hasher.update(&buf[..n]);
+            output
+                .write_all(&buf[..n])
+                .with_context(|| format!("writing {}", dst.display()))?;
+        }
+        output
+            .flush()
+            .with_context(|| format!("flushing {}", dst.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(dst);
+        return Err(err);
+    }
+    let found = format!("{:x}", hasher.finalize());
+    if size != expected_size || found != expected_hash {
+        let _ = fs::remove_file(dst);
+        anyhow::bail!(
+            "blob integrity check failed for {} (recorded {} bytes/{}, found {} bytes/{})",
+            src.display(),
+            expected_size,
+            &expected_hash[..expected_hash.len().min(12)],
+            size,
+            &found[..found.len().min(12)]
+        );
+    }
+    Ok(())
+}
+
+/// (nominal, actually freed, released, file count) of a set of paths about to
+/// be unlinked. A file frees its bytes only when every one of its links is in
+/// the set; inodes are counted once, so hard links never inflate the total.
+pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::collections::{HashMap, HashSet};
+        use std::os::unix::fs::MetadataExt;
+
+        let mut per_inode: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut count = 0u64;
+        for path in files {
+            if !seen.insert(path.as_path()) {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(path) else {
+                continue;
+            };
+            count += 1;
+            let entry =
+                per_inode
+                    .entry((meta.dev(), meta.ino()))
+                    .or_insert((meta.len(), meta.nlink(), 0));
+            entry.2 += 1;
+        }
+        let mut nominal = 0u64;
+        let mut freed = 0u64;
+        for (size, links, planned) in per_inode.values() {
+            nominal += size;
+            if planned >= links {
+                freed += size;
+            }
+        }
+        (nominal, freed, nominal - freed, count)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        let mut nominal = 0u64;
+        let mut count = 0u64;
+        for path in files {
+            if !seen.insert(path.as_path()) {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(path) {
+                nominal += meta.len();
+                count += 1;
+            }
+        }
+        (nominal, nominal, 0, count)
+    }
+}
+
+/// Hard-link a regular owned source into a new destination while hashing it.
+///
+/// `None` means the filesystem cannot link the pair (for example across
+/// devices); the caller should copy instead. The source and destination must
+/// be on one filesystem, and the destination is verified to be the same
+/// regular inode before its content is hashed.
+#[cfg(unix)]
+pub fn try_link_file_hashed(src: &Path, dst: &Path) -> Result<Option<(u64, String)>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let before = match metadata_nofollow(src) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "{} is not a regular file (symlink/special file refused)",
+                src.display()
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting source {}", src.display()));
+        }
+    };
+    if !before.is_file() {
+        anyhow::bail!(
+            "{} is not a regular file (symlink/special file refused)",
+            src.display()
+        );
+    }
+    if !owned_by_us(src, &before) {
+        anyhow::bail!(
+            "{} is owned by another user — refusing to link it into the vault",
+            src.display()
+        );
+    }
+
+    match fs::hard_link(src, dst) {
+        Ok(()) => {}
+        Err(err) if link_fallback(&err) => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("linking {} -> {}", src.display(), dst.display()));
+        }
+    }
+
+    let after = match metadata_nofollow(dst) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            let _ = fs::remove_file(dst);
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting linked file {}", dst.display()));
+        }
+    };
+    if !after.is_file()
+        || !owned_by_us(dst, &after)
+        || after.dev() != before.dev()
+        || after.ino() != before.ino()
+    {
+        let _ = fs::remove_file(dst);
+        return Ok(None);
+    }
+
+    let size = after.len();
+    let hash =
+        sha256_file(dst).with_context(|| format!("hashing linked file {}", dst.display()))?;
+    Ok(Some((size, hash)))
+}
+
+#[cfg(unix)]
+pub(crate) fn link_fallback(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EXDEV)
+            | Some(libc::EPERM)
+            | Some(libc::EMLINK)
+            | Some(libc::ENOSYS)
+            | Some(libc::EOPNOTSUPP)
+    )
+}
+
 /// Copy + verify a recorded size/hash. On mismatch the new destination is
 /// removed and the operation fails (never installs unverified bytes).
 pub fn copy_file_verified(
@@ -1132,13 +2257,34 @@ pub fn copy_file_verified(
     expected_size: u64,
     expected_hash: &str,
 ) -> Result<(u64, String)> {
+    copy_file_verified_mode(src, dst, expected_size, expected_hash, true)
+}
+
+/// Copy a verified file whose source may be foreign-owned. Use only after the
+/// store's read-only, signature-verified reader policy has accepted it.
+pub fn copy_file_verified_unowned(
+    src: &Path,
+    dst: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<(u64, String)> {
+    copy_file_verified_mode(src, dst, expected_size, expected_hash, false)
+}
+
+fn copy_file_verified_mode(
+    src: &Path,
+    dst: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+    require_owner: bool,
+) -> Result<(u64, String)> {
     if expected_hash.is_empty() {
         anyhow::bail!(
             "{} has no recorded SHA-256 (re-harvest the vault before restoring)",
             src.display()
         );
     }
-    let (size, hash) = copy_file_hashed(src, dst)?;
+    let (size, hash) = copy_file_hashed_mode(src, dst, require_owner)?;
     if size != expected_size || hash != expected_hash {
         let _ = fs::remove_file(dst);
         anyhow::bail!(
@@ -1185,23 +2331,69 @@ pub struct FileLock {
     file: File,
 }
 
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+
+#[cfg(windows)]
+fn windows_no_reparse(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+/// Open an existing lock file without following a symlink/reparse point.
+fn open_lock_file(path: &Path) -> Result<File> {
+    let mut create = OpenOptions::new();
+    create.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        create.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        create.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    match create.open(path) {
+        Ok(file) => return Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("creating lock {}", path.display()));
+        }
+    }
+
+    let mut open = OpenOptions::new();
+    open.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = open
+        .open(path)
+        .with_context(|| format!("opening lock {}", path.display()))?;
+    let meta = file.metadata()?;
+    if meta.file_type().is_symlink() || is_reparse_point(&meta) {
+        anyhow::bail!("refusing symlinked/reparse lock file {}", path.display());
+    }
+    Ok(file)
+}
+
 impl FileLock {
     pub fn acquire(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             create_private_dir_all(parent)?;
         }
-        if fs::symlink_metadata(path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("refusing symlinked lock file {}", path.display());
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .with_context(|| format!("opening lock {}", path.display()))?;
+        let file = open_lock_file(path)?;
         file.lock()
             .with_context(|| format!("locking {}", path.display()))?;
         Ok(Self { file })
@@ -1211,18 +2403,7 @@ impl FileLock {
         if let Some(parent) = path.parent() {
             create_private_dir_all(parent)?;
         }
-        if fs::symlink_metadata(path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("refusing symlinked lock file {}", path.display());
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .with_context(|| format!("opening lock {}", path.display()))?;
+        let file = open_lock_file(path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
             // Contention (or an unsupported lock): fail closed as "in use".
@@ -1235,6 +2416,77 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
+}
+
+/// Minimal line diff for `setup --dry-run`: unchanged lines are prefixed with
+/// two spaces, removals with `- `, additions with `+ `.
+///
+/// Config files are tiny, so the O(n·m) LCS is simpler than pulling in a diff
+/// dependency and produces stable, readable output.
+pub fn line_diff(before: &str, after: &str) -> String {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out = String::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push_str("  ");
+            out.push_str(a[i]);
+            out.push('\n');
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push_str("- ");
+            out.push_str(a[i]);
+            out.push('\n');
+            i += 1;
+        } else {
+            out.push_str("+ ");
+            out.push_str(b[j]);
+            out.push('\n');
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        out.push_str("- ");
+        out.push_str(a[i]);
+        out.push('\n');
+        i += 1;
+    }
+    while j < b.len() {
+        out.push_str("+ ");
+        out.push_str(b[j]);
+        out.push('\n');
+        j += 1;
+    }
+    out
+}
+
+/// Read metadata without following a symlink or Windows reparse point.
+///
+/// Missing paths keep `ErrorKind::NotFound`, so every caller must decide
+/// explicitly whether absence is acceptable. A path that exists but is a link
+/// is rejected as `InvalidInput`.
+pub fn metadata_nofollow(path: &Path) -> std::io::Result<Metadata> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || is_reparse_point(&meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a symlink or reparse point", path.display()),
+        ));
+    }
+    Ok(meta)
 }
 
 #[cfg(test)]
@@ -1262,11 +2514,151 @@ mod tests {
     }
 
     #[test]
+    fn command_for_resolves_bare_tools_and_sets_the_windows_guard() -> Result<()> {
+        let command = command_for("rustc")?;
+        assert!(
+            Path::new(command.get_program()).is_absolute(),
+            "bare tool names resolve to an absolute path"
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "NoDefaultCurrentDirectoryInExePath"
+                    && value == Some(std::ffi::OsStr::new("1"))),
+            "Windows CWD search is disabled for every spawned tool"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_dir_chain_creation_accepts_already_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let base = root.path().to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                create_dir_chain_nofollow(&base, Path::new("debug/deps"))
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert!(root.path().join("debug/deps").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_refuses_a_symlink() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let victim = dir.path().join("victim");
+        let lock = dir.path().join("lock");
+        std::os::unix::fs::symlink(&victim, &lock)?;
+        assert!(FileLock::acquire(&lock).is_err());
+        assert!(!victim.exists(), "the symlink target must not be created");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_open_is_nonblocking_and_rejected() -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("fifo");
+        let name = CString::new(path.as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let err = open_file_nofollow(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("regular file"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_nofollow_preserves_missing_and_rejects_links() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("missing");
+        let err = metadata_nofollow(&missing).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        let regular = dir.path().join("regular");
+        fs::write(&regular, b"x")?;
+        let meta = metadata_nofollow(&regular)?;
+        assert!(meta.is_file());
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&regular, &link)?;
+            let err = metadata_nofollow(&link).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_rejects_a_users_write_ace() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(M)"])
+            .status()
+            .context("running icacls")?;
+        assert!(status.success(), "icacls could not add the test ACE");
+        assert_eq!(windows_acl_is_private(dir.path()), Some(false));
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn decompress_verified_preserves_already_exists() -> Result<()> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let dir = tempfile::tempdir()?;
+        let blob = dir.path().join("blob.gz");
+        let file = fs::File::create(&blob)?;
+        let mut encoder = GzEncoder::new(file, Compression::fast());
+        encoder.write_all(b"payload")?;
+        encoder.finish()?;
+        let dst = dir.path().join("dst");
+        fs::write(&dst, b"keep")?;
+
+        let err = decompress_file_verified(&blob, &dst, 7, "unused").unwrap_err();
+        assert_eq!(
+            err.root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(fs::read(&dst)?, b"keep", "an existing destination survives");
+        Ok(())
+    }
+
+    #[test]
+    fn decompression_respects_the_recorded_size() -> Result<()> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("blob.gz");
+        let file = fs::File::create(&path)?;
+        let mut encoder = GzEncoder::new(file, Compression::fast());
+        encoder.write_all(&[0u8; 1024 * 1024])?;
+        encoder.finish()?;
+        let err = decompress_file_hashed(&path, true, 1024).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
     fn human_sizes() {
         assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1023), "1023 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(3 * 1_048_576 + 200_000), "3.2 MiB");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1000), "1.0 KB");
+        assert_eq!(human_bytes(1_000_000), "1.0 MB");
+        assert_eq!(human_bytes(3_200_000), "3.2 MB");
+        assert_eq!(human_bytes(1_000_000_000), "1.0 GB");
+        assert_eq!(human_bytes(3_500_000_000), "3.5 GB");
+        assert_eq!(human_bytes(1_000_000_000_000), "1.0 TB");
+        assert_eq!(human_bytes(18_000_000_000_000), "18.0 TB");
     }
 
     #[test]
@@ -1306,9 +2698,31 @@ mod tests {
         assert!(validate_component("foo ", "profile").is_err());
         assert!(validate_component("CON", "profile").is_err());
         assert!(validate_component("CON.txt", "profile").is_err());
+        assert!(validate_component("CONIN$", "profile").is_err());
+        assert!(validate_component("CONOUT$.txt", "profile").is_err());
+        assert!(validate_component("COM¹", "profile").is_err());
+        assert!(validate_component("LPT³.log", "profile").is_err());
+        assert!(validate_component("bad\u{1b}[31m", "profile").is_err());
         assert!(validate_component("COM1.log", "profile").is_err());
         assert!(validate_component("foo.bar", "profile").is_ok());
         assert!(validate_rel(".. /x", "path").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_helper_hashes_and_shares_the_inode() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::write(&src, b"hello")?;
+        let (size, hash) = try_link_file_hashed(&src, &dst)?.expect("hard link");
+        assert_eq!(size, 5);
+        assert_eq!(hash, sha256_file(&src)?);
+        assert_eq!(fs::metadata(&src)?.nlink(), 2);
+        assert_eq!(fs::metadata(&src)?.ino(), fs::metadata(&dst)?.ino());
+        Ok(())
     }
 
     #[test]
@@ -1351,6 +2765,16 @@ mod tests {
         let chained = Err::<(), _>(anyhow::anyhow!("inner detail")).context("outer headline");
         let block = error_block_with(false, &chained.unwrap_err());
         assert_eq!(block, "✕ outer headline\n  caused by: inner detail");
+    }
+
+    #[test]
+    fn line_diff_marks_changes() {
+        let diff = line_diff("a\nb\nc\n", "a\nx\nc\n");
+        assert!(diff.contains("- b"), "{diff}");
+        assert!(diff.contains("+ x"), "{diff}");
+        assert!(diff.contains("  a"), "{diff}");
+        assert!(diff.contains("  c"), "{diff}");
+        assert_eq!(line_diff("same\n", "same\n"), "  same\n");
     }
 }
 

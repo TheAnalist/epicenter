@@ -42,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use crate::util::metadata_nofollow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
     Lib,
@@ -409,20 +411,23 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
         .with_context(|| format!("reading build dir {}", build_root.display()))?
     {
         let profile_entry = profile_entry?;
-        if !profile_entry.file_type()?.is_dir() {
+        if !metadata_nofollow(&profile_entry.path()).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
         let profile = profile_entry.file_name().to_string_lossy().into_owned();
+        if crate::util::validate_component(&profile, "profile").is_err() {
+            continue;
+        }
         let profile_dir = profile_entry.path();
 
         // Classic layout: <profile>/.fingerprint/<pkg>-<hash>/
         let fp_root = profile_dir.join(".fingerprint");
-        if is_real_dir(&fp_root) {
+        if metadata_nofollow(&fp_root).is_ok_and(|meta| meta.is_dir()) {
             for unit_entry in
                 fs::read_dir(&fp_root).with_context(|| format!("reading {}", fp_root.display()))?
             {
                 let unit_entry = unit_entry?;
-                if !unit_entry.file_type()?.is_dir() {
+                if !metadata_nofollow(&unit_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                     continue;
                 }
                 if let Some(unit) = read_classic_unit(&profile, &unit_entry.path()) {
@@ -433,27 +438,32 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
 
         // New layout: <profile>/build/<pkg>/<hash>/fingerprint/
         let build_dir = profile_dir.join("build");
-        if is_real_dir(&build_dir) {
+        if metadata_nofollow(&build_dir).is_ok_and(|meta| meta.is_dir()) {
             for package_entry in fs::read_dir(&build_dir)
                 .with_context(|| format!("reading {}", build_dir.display()))?
             {
                 let package_entry = package_entry?;
-                if !package_entry.file_type()?.is_dir() {
+                if !metadata_nofollow(&package_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                     continue;
                 }
                 let package = package_entry.file_name().to_string_lossy().into_owned();
+                if crate::util::validate_component(&package, "package").is_err() {
+                    continue;
+                }
                 for hash_entry in fs::read_dir(package_entry.path())
                     .with_context(|| format!("reading {}", package_entry.path().display()))?
                 {
                     let hash_entry = hash_entry?;
-                    if !hash_entry.file_type()?.is_dir() {
+                    if !metadata_nofollow(&hash_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                         continue;
                     }
                     let hash = hash_entry.file_name().to_string_lossy().into_owned();
                     if !looks_like_hash(&hash) {
                         continue;
                     }
-                    if !is_real_dir(&hash_entry.path().join("fingerprint")) {
+                    if !metadata_nofollow(&hash_entry.path().join("fingerprint"))
+                        .is_ok_and(|meta| meta.is_dir())
+                    {
                         continue;
                     }
                     if let Some(unit) = read_new_unit(build_root, &profile, &package, &hash) {
@@ -505,17 +515,11 @@ pub fn dep_edges(units: &[Unit]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// A directory we may read: real, not a symlink or a Windows reparse point.
-fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|meta| {
-            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
-        })
-        .unwrap_or(false)
-}
-
 fn read_classic_unit(profile: &str, unit_dir: &Path) -> Option<Unit> {
     let dir_name = unit_dir.file_name()?.to_string_lossy().into_owned();
+    if crate::util::validate_component(&dir_name, "unit name").is_err() {
+        return None;
+    }
     let (package, dir_suffix) = split_dir_name(&dir_name)?;
     let parsed = parse_unit_files(unit_dir)?;
     Some(Unit {
@@ -569,17 +573,20 @@ struct ParsedUnit {
 fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
     let mut candidates: Vec<(String, String)> = Vec::new(); // (name, content)
     let mut dep_info: Option<PathBuf> = None;
-    let mut json_path: Option<PathBuf> = None;
+    let mut json_paths: Vec<PathBuf> = Vec::new();
 
     for entry in fs::read_dir(unit_dir).ok()? {
         let entry = entry.ok()?;
         // Only regular files: never read a FIFO/device/symlink planted by a
         // build script (harvest would otherwise hang or copy a secret).
-        let entry_meta = fs::symlink_metadata(entry.path()).ok()?;
-        if !entry_meta.is_file()
-            || entry_meta.file_type().is_symlink()
-            || crate::util::is_reparse_point(&entry_meta)
-        {
+        let entry_meta = match metadata_nofollow(&entry.path()) {
+            Ok(meta) => meta,
+            // A symlink/reparse entry was skipped before too.
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => continue,
+            // A metadata error used to abort parsing this unit.
+            Err(_) => return None,
+        };
+        if !entry_meta.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -588,7 +595,7 @@ fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
             continue;
         }
         if name.ends_with(".json") {
-            json_path = Some(entry.path());
+            json_paths.push(entry.path());
             continue;
         }
         if name == "invoked.timestamp" {
@@ -610,8 +617,17 @@ fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
 
     let ((memo_file, memo_hash), extra_files) = pick_memo(candidates)?;
     let kind = classify_kind(&memo_file);
-    let json = json_path
-        .and_then(|path| crate::util::read_small_text(&path, 4 * 1024 * 1024).ok())
+    // Cargo always names the fingerprint `<memo>.json`. Taking any `.json`
+    // would let a hand-written unit pass a stray JSON as provenance.
+    let wanted = format!("{memo_file}.json");
+    let json = json_paths
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .map(|name| name == wanted.as_str())
+                .unwrap_or(false)
+        })
+        .and_then(|path| crate::util::read_small_text(path, 4 * 1024 * 1024).ok())
         .and_then(|text| parse_fingerprint(&text));
     Some(ParsedUnit {
         kind,
@@ -706,7 +722,7 @@ fn collect_classic_artifacts(
 ) {
     let profile_dir = build_root.join(&unit.profile);
     let deps_dir = profile_dir.join("deps");
-    if is_real_dir(&deps_dir) {
+    if metadata_nofollow(&deps_dir).is_ok_and(|meta| meta.is_dir()) {
         let suffix = format!("-{}", unit.dir_suffix);
         if let Ok(entries) = fs::read_dir(&deps_dir) {
             for entry in entries.flatten() {
@@ -737,7 +753,7 @@ fn collect_classic_artifacts(
 
     if unit.kind != UnitKind::Lib {
         for candidate in build_anchor_dirs(build_root, unit) {
-            if !is_real_dir(&candidate) {
+            if !metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
             for entry in WalkDir::new(&candidate).min_depth(1) {
@@ -760,7 +776,7 @@ fn collect_classic_artifacts(
 fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>) {
     for sub in ["out", "run"] {
         let dir = unit.unit_dir.join(sub);
-        if !is_real_dir(&dir) {
+        if !metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
         for entry in WalkDir::new(&dir).min_depth(1) {
@@ -1065,6 +1081,18 @@ mod tests {
             .unwrap();
         assert_eq!(edges[serde_at], vec![core_at]);
         assert!(edges[core_at].is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_units_skips_a_symlinked_profile() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        let unit = victim.path().join(".fingerprint/pkg-1111222233334444");
+        fs::create_dir_all(&unit)?;
+        std::os::unix::fs::symlink(victim.path(), build.path().join("debug"))?;
+        assert!(read_units(build.path())?.is_empty());
         Ok(())
     }
 

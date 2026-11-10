@@ -20,8 +20,12 @@ pub struct DirStat {
 
 pub struct CacheSummary {
     pub root: PathBuf,
+    /// Unique inode bytes in the tree; hard-linked paths count once.
     pub total_bytes: u64,
+    /// Path count, including hard links.
     pub total_files: u64,
+    /// Paths whose inode has more than one link.
+    pub linked_files: u64,
     /// Per top-level directory, largest first.
     pub dirs: Vec<DirStat>,
     /// Oldest file mtime = how long ago the cache was first used.
@@ -41,6 +45,7 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
         root: root.to_path_buf(),
         total_bytes: 0,
         total_files: 0,
+        linked_files: 0,
         dirs: Vec::new(),
         oldest: None,
         top_units: Vec::new(),
@@ -48,6 +53,8 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
 
     // Per top-level bucket (profile dirs like `debug`/`release`, usually).
     let mut buckets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    #[cfg(unix)]
+    let mut seen_inodes = std::collections::HashSet::new();
     for entry in WalkDir::new(root).min_depth(1) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -58,8 +65,21 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
         }
         let Ok(meta) = entry.metadata() else { continue };
 
-        summary.total_bytes += meta.len();
+        #[cfg(unix)]
+        let unique = {
+            use std::os::unix::fs::MetadataExt;
+            seen_inodes.insert((meta.dev(), meta.ino()))
+        };
+        #[cfg(not(unix))]
+        let unique = true;
+
+        if unique {
+            summary.total_bytes += meta.len();
+        }
         summary.total_files += 1;
+        if crate::vault::link_count(&meta) > 1 {
+            summary.linked_files += 1;
+        }
         if let Ok(mtime) = meta.modified() {
             if summary.oldest.map_or(true, |oldest| mtime < oldest) {
                 summary.oldest = Some(mtime);
@@ -85,7 +105,9 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
             "(cache root)".to_string()
         };
         let bucket = buckets.entry(bucket).or_insert((0, 0));
-        bucket.0 += meta.len();
+        if unique {
+            bucket.0 += meta.len();
+        }
         bucket.1 += 1;
     }
 
@@ -109,6 +131,27 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_count_once() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let debug = root.path().join("debug");
+        fs::create_dir_all(&debug)?;
+        let first = debug.join("liba.rlib");
+        let second = debug.join("libb.rlib");
+        fs::write(&first, [0u8; 10])?;
+        fs::hard_link(&first, &second)?;
+
+        let summary = summarize(root.path())?;
+        assert_eq!(summary.total_bytes, 10);
+        assert_eq!(summary.total_files, 2);
+        assert_eq!(summary.linked_files, 2);
+        let bucket = summary.dirs.iter().find(|d| d.name == "debug").unwrap();
+        assert_eq!(bucket.bytes, 10);
+        assert_eq!(bucket.files, 2);
+        Ok(())
+    }
 
     #[test]
     fn summarizes_sizes_and_buckets() -> Result<()> {

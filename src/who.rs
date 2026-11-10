@@ -391,10 +391,8 @@ fn explain_one(all: &[(Unit, ArtifactInfo)], picked: &(Unit, ArtifactInfo)) -> R
         for (path, size, mtime) in arts.paths.iter().take(8) {
             println!(
                 "    {:<42} {:>9}  {}",
-                path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |n| n.to_string_lossy().into_owned()
-                ),
+                path.file_name()
+                    .map_or_else(|| path.display().to_string(), |n| util::safe_display(n)),
                 human_bytes(*size),
                 util::dim(&format!(
                     "{:>10} old",

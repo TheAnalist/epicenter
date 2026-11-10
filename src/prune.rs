@@ -30,6 +30,10 @@ pub struct Group {
     pub newest: Option<SystemTime>,
     /// Total size of all files.
     pub bytes: u64,
+    /// Retention family: incremental, deps, build, or fingerprint.
+    pub kind: String,
+    /// True for `incremental/` and wrapper `incremental.*` state.
+    pub incremental: bool,
 }
 
 /// Extract `name-hash` from a Cargo artifact name.
@@ -106,7 +110,16 @@ pub fn artifact_key(root: &Path, path: &Path) -> Option<String> {
                 return name_hash(first, false);
             }
             // incremental/<crate-hash>/, .fingerprint/<crate-hash>/
-            "incremental" | ".fingerprint" => {
+            "incremental" => {
+                let anchor_dir = components.get(i + 1)?;
+                return name_hash(anchor_dir, false);
+            }
+            // Wrapper state: incremental.kache-auto/... is one reclaimable
+            // family; its internal v1/<hash>/session layout is opaque.
+            comp if comp.starts_with("incremental") => {
+                return Some((*comp).to_string());
+            }
+            ".fingerprint" => {
                 let anchor_dir = components.get(i + 1)?;
                 return name_hash(anchor_dir, false);
             }
@@ -137,7 +150,15 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
                 let anchor: PathBuf = comps.iter().take(take).collect();
                 return Some(root.join(anchor));
             }
-            "incremental" | ".fingerprint" => {
+            "incremental" => {
+                let anchor: PathBuf = comps.iter().take(i + 2).collect();
+                return Some(root.join(anchor));
+            }
+            name if name.starts_with("incremental") => {
+                let anchor: PathBuf = comps.iter().take(i + 1).collect();
+                return Some(root.join(anchor));
+            }
+            ".fingerprint" => {
                 let anchor: PathBuf = comps.iter().take(i + 2).collect();
                 return Some(root.join(anchor));
             }
@@ -164,13 +185,39 @@ pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
             continue;
         };
         let Ok(meta) = entry.metadata() else { continue };
+        let incremental = entry.path().components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with("incremental")
+        });
+        let kind = if incremental {
+            "incremental"
+        } else if entry
+            .path()
+            .components()
+            .any(|component| component.as_os_str() == "deps")
+        {
+            "deps"
+        } else if entry
+            .path()
+            .components()
+            .any(|component| component.as_os_str() == "build")
+        {
+            "build"
+        } else {
+            "fingerprint"
+        };
         let group = groups.entry(key.clone()).or_insert_with(|| Group {
             key,
             files: Vec::new(),
             anchor: None,
             newest: None,
             bytes: 0,
+            kind: kind.to_string(),
+            incremental,
         });
+        group.incremental |= incremental;
         group.bytes += meta.len();
         group.files.push(entry.into_path());
         if let Ok(mtime) = meta.modified() {
@@ -191,32 +238,105 @@ pub struct PruneReport {
     pub kept_groups: u64,
     pub files_freed: u64,
     pub bytes_freed: u64,
+    pub bytes_released: u64,
     pub errors: u64,
 }
 
-/// The garbage collector.
+/// Retention options for [`prune_with`].
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Keep the newest N groups per package/kind and remove older duplicates.
+    /// When set, the age cutoff is ignored.
+    pub keep_latest: Option<usize>,
+    /// Only consider incremental state (`incremental/` and `incremental.*`).
+    pub incremental: bool,
+}
+
+/// The garbage collector with default age retention.
 pub fn prune(root: &Path, cutoff: SystemTime, delete: bool) -> Result<PruneReport> {
+    prune_with(root, cutoff, delete, &Options::default())
+}
+
+fn package_key(key: &str) -> &str {
+    key.rsplit_once('-')
+        .filter(|(_, hash)| is_hex16(hash))
+        .map(|(package, _)| package)
+        .unwrap_or(key)
+}
+
+/// The garbage collector.
+pub fn prune_with(
+    root: &Path,
+    cutoff: SystemTime,
+    delete: bool,
+    opts: &Options,
+) -> Result<PruneReport> {
+    // Hold Cargo's build locks through the whole scan/delete. A check that
+    // drops them lets a build start before the removals and lose artifacts.
+    let _build_locks = if delete {
+        match crate::exec::cargo_locks(root)? {
+            Some(locks) => Some(locks),
+            None => anyhow::bail!(
+                "build dir {} is in use by a live build — prune skipped",
+                root.display()
+            ),
+        }
+    } else {
+        None
+    };
     let groups = scan(root)?;
     let mut report = PruneReport::default();
-    for group in groups.into_values() {
-        // No usable mtime -> keep (conservative).
-        let Some(newest) = group.newest else {
-            report.kept_groups += 1;
-            continue;
-        };
-        if newest >= cutoff {
-            report.kept_groups += 1;
-            continue;
-        }
+    let mut selected = Vec::new();
+    let mut candidates: Vec<Group> = groups
+        .into_values()
+        .filter(|group| !opts.incremental || group.incremental)
+        .collect();
 
-        // Count everything BEFORE deleting so dry-runs report identically.
-        report.removed_groups += 1;
-        report.files_freed += group.files.len() as u64;
-        report.bytes_freed += group.bytes;
-        if !delete {
-            continue;
+    if let Some(keep) = opts.keep_latest {
+        candidates.sort_by(|a, b| b.newest.cmp(&a.newest).then_with(|| a.key.cmp(&b.key)));
+        let mut kept: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for group in candidates {
+            let bucket = (package_key(&group.key).to_string(), group.kind.clone());
+            let count = kept.entry(bucket).or_default();
+            if *count < keep {
+                *count += 1;
+                report.kept_groups += 1;
+            } else {
+                selected.push(group);
+            }
         }
+    } else {
+        for group in candidates {
+            // No usable mtime -> keep (conservative).
+            let Some(newest) = group.newest else {
+                report.kept_groups += 1;
+                continue;
+            };
+            if newest >= cutoff {
+                report.kept_groups += 1;
+                continue;
+            }
+            selected.push(group);
+        }
+    }
 
+    // Count every selected path before deleting so dry-runs report the same
+    // numbers. Hard links outside the selection keep their bytes.
+    report.removed_groups = selected.len() as u64;
+    let files: Vec<PathBuf> = selected
+        .iter()
+        .flat_map(|group| group.files.iter().cloned())
+        .collect();
+    let (_, freed, released, count) = crate::util::account_files(&files);
+    report.files_freed = count;
+    report.bytes_freed = freed;
+    report.bytes_released = released;
+    if !delete {
+        return Ok(report);
+    }
+
+    for group in selected {
         match &group.anchor {
             Some(anchor) => {
                 if let Err(e) = fs::remove_dir_all(anchor) {
@@ -395,6 +515,92 @@ mod tests {
                 "anchor must stop at the unit dir, never build/<pkg>"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_wrapper_incremental_state() {
+        let root = Path::new("/cache");
+        let file = root
+            .join("debug/incremental.kache-auto/v1/0123456789abcdef/rustc/foo-abc/session/file");
+        assert_eq!(
+            artifact_key(root, &file).as_deref(),
+            Some("incremental.kache-auto")
+        );
+        assert_eq!(
+            anchor_for(root, &file).as_deref(),
+            Some(root.join("debug/incremental.kache-auto").as_path())
+        );
+    }
+
+    #[test]
+    fn keep_latest_retains_the_newest_groups() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let deps = root.path().join("debug/deps");
+        fs::create_dir_all(&deps)?;
+        let now = SystemTime::now();
+        let hashes = ["1111111111111111", "2222222222222222", "3333333333333333"];
+        for (index, hash) in hashes.iter().enumerate() {
+            let file = deps.join(format!("libsame-{hash}.rlib"));
+            fs::write(&file, vec![index as u8; 10])?;
+            let modified = now - std::time::Duration::from_secs((3 - index) as u64 * 60);
+            fs::File::options()
+                .write(true)
+                .open(&file)?
+                .set_modified(modified)?;
+        }
+
+        let opts = Options {
+            keep_latest: Some(2),
+            incremental: false,
+        };
+        let report = prune_with(root.path(), now, false, &opts)?;
+        assert_eq!(report.removed_groups, 1);
+        assert_eq!(report.kept_groups, 2);
+        assert_eq!(report.bytes_freed, 10);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_reports_only_actually_freed_bytes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let deps = root.path().join("debug/deps");
+        let fingerprint = root.path().join("debug/.fingerprint/x-abc");
+        fs::create_dir_all(&deps)?;
+        fs::create_dir_all(&fingerprint)?;
+        let artifact = deps.join("libx-abc.rlib");
+        fs::write(&artifact, [0u8; 7])?;
+        fs::write(fingerprint.join("root-output"), [0u8; 2])?;
+        fs::hard_link(&artifact, outside.path().join("kept.rlib"))?;
+
+        let cutoff = SystemTime::now() + std::time::Duration::from_secs(3_600);
+        let report = prune(root.path(), cutoff, false)?;
+        assert_eq!(report.files_freed, 2);
+        assert_eq!(report.bytes_freed, 2, "only the private fingerprint frees");
+        assert_eq!(report.bytes_released, 7, "the rlib keeps its outside link");
+        Ok(())
+    }
+
+    #[test]
+    fn delete_refuses_a_live_cargo_build_lock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let deps = root.path().join("debug/deps");
+        let lock_dir = root.path().join("debug");
+        fs::create_dir_all(&deps)?;
+        fs::write(deps.join("libx-abc.rlib"), [0u8; 7])?;
+        let lock_path = lock_dir.join(".cargo-build-lock");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)?;
+        lock.lock()?;
+        let cutoff = SystemTime::now() + std::time::Duration::from_secs(3_600);
+        let err = prune(root.path(), cutoff, true).unwrap_err();
+        assert!(err.to_string().contains("in use"), "{err}");
+        assert!(deps.join("libx-abc.rlib").exists());
         Ok(())
     }
 

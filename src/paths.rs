@@ -64,6 +64,41 @@ pub fn cargo_build_dir() -> Result<Option<String>> {
         .filter(|value| !value.trim().is_empty()))
 }
 
+/// Default per-user, per-machine work root for disposable job dirs. Never
+/// derived from the shared build root: a shared build dir must not imply a
+/// shared, attacker-seedable work directory.
+pub fn default_work_root() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(base).join("epicenter").join("work"));
+        }
+        return Ok(home()?
+            .join("AppData")
+            .join("Local")
+            .join("epicenter")
+            .join("work"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(home()?
+            .join("Library")
+            .join("Caches")
+            .join("epicenter")
+            .join("work"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join("epicenter").join("work"));
+            }
+        }
+        return Ok(home()?.join(".cache").join("epicenter").join("work"));
+    }
+}
+
 /// epicenter's (former) own directory — only kept for the doctor's
 /// legacy-file advisory; the shared-cache decision lives in
 /// `~/.cargo/config.toml` now.

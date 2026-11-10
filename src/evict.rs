@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
 use crate::fingerprint::{self, ArtifactInfo, Unit};
-use crate::util::{self, human_age, human_bytes, parse_duration};
+use crate::util::{self, human_age, human_bytes, metadata_nofollow, parse_duration};
 use crate::who;
 
 /// What the user asked to evict.
@@ -80,8 +80,39 @@ pub const DEFAULT_WORK_MAX_AGE: &str = "7d";
 
 /// `epicenter evict [unit] [--stale|--rustc-key|--husks|--older-than|--work-dirs|--work <view>] [--tier <t>] [--force] [--yes]`
 pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
+    let build_root = if build_root.exists() {
+        crate::util::validate_state_root(build_root, "build root")?
+    } else {
+        build_root.to_path_buf()
+    };
+    let build_root = build_root.as_path();
+    let work_root = crate::exec::work_root(build_root);
+    let store_root = crate::vault::store_root(build_root);
+    if work_root.exists() {
+        crate::util::ensure_private_dir(&work_root)?;
+    }
+    if work_root.starts_with(&store_root) || store_root.starts_with(&work_root) {
+        bail!(
+            "work root {} overlaps the vault {} — refusing to collect job dirs",
+            work_root.display(),
+            store_root.display()
+        );
+    }
+    if let (Ok(canonical_work), Ok(canonical_store)) =
+        (work_root.canonicalize(), store_root.canonicalize())
+    {
+        if canonical_work.starts_with(&canonical_store)
+            || canonical_store.starts_with(&canonical_work)
+        {
+            bail!(
+                "work root {} resolves inside the vault {} — refusing to collect job dirs",
+                work_root.display(),
+                store_root.display()
+            );
+        }
+    }
     #[cfg(windows)]
-    crate::util::ensure_windows_user_path(&crate::exec::work_root(build_root), "work root")?;
+    crate::util::ensure_windows_user_path(&work_root, "work root")?;
     // An empty selector is a wildcard (`contains("")`) — never delete by it.
     for (name, value) in [
         ("--unit", opts.unit),
@@ -351,7 +382,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
         .flat_map(|candidate| candidate.places.iter())
         .flat_map(|place| place.files().iter().cloned())
         .collect();
-    let (nominal, freed, released, count) = account_files(&all_files);
+    let (nominal, freed, released, count) = util::account_files(&all_files);
     let places: usize = chosen.iter().map(|candidate| candidate.places.len()).sum();
 
     println!();
@@ -460,11 +491,11 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                     },
                     None => None,
                 };
-                if crate::exec::dir_locked(root) {
+                let Some(_cargo_locks) = crate::exec::cargo_locks(root)? else {
                     errors += 1;
                     eprintln!("view {label} is in use by a live build — skipped");
                     continue;
-                }
+                };
                 remove_dir(unit_dir, &mut errors);
                 for anchor in anchors {
                     if anchor.is_dir() {
@@ -558,6 +589,15 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Windows locks the current directory of every process: a shell sitting
+    // inside the job dir makes rename/remove fail with "access denied".
+    if cwd_is_within(&path) {
+        bail!(
+            "the current directory is inside {} — `cd` out of the job dir and retry; \
+             Windows cannot rename or remove a directory a process is working in",
+            path.display()
+        );
+    }
     let job_lock =
         match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(&work_root, &name))? {
             Some(lock) => lock,
@@ -569,11 +609,12 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     // Hold Cargo's own lock files through the rename/delete. A boolean check
     // here would release the locks immediately and let a build start in the
     // window before `rename`.
-    let Some(_cargo_locks) = crate::exec::cargo_locks(&path)? else {
-        bail!(
+    let cargo_locks = match crate::exec::cargo_locks(&path)? {
+        Some(locks) => locks,
+        None => bail!(
             "job dir {} is in use by a live build — remove it when it finishes",
             path.display()
-        );
+        ),
     };
     let newest = dir_newest(&path);
     let (bytes, unique, shared, files) = dir_accounting(&path);
@@ -606,14 +647,14 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         util::dim("explicitly selected — age policy not applied")
     );
     println!();
-    println!(
-        "  {} {} nominal — {} actually freed · {} links released",
-        util::dim("result:   "),
-        human_bytes(bytes),
-        human_bytes(unique),
-        human_bytes(shared)
-    );
     if !delete {
+        println!(
+            "  {} {} nominal — {} would be freed · {} links released",
+            util::dim("result:   "),
+            human_bytes(bytes),
+            human_bytes(unique),
+            human_bytes(shared)
+        );
         println!("  {}", util::dim("run again with -y or --yes to remove it"));
         return Ok(());
     }
@@ -621,11 +662,36 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     // later GC/exec can guess, and a build that races the check fails rather
     // than writing into a directory being deleted.
     let tombstone = work_root.join(format!(".{name}.deleting-{}", std::process::id()));
-    if fs::symlink_metadata(&tombstone).is_ok() {
-        let _ = crate::util::force_remove_dir(&tombstone);
+    match metadata_nofollow(&tombstone) {
+        Ok(_) => {
+            crate::util::force_remove_dir(&tombstone)
+                .with_context(|| format!("clearing stale tombstone {}", tombstone.display()))?;
+        }
+        // No stale tombstone to clear.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // A link is not a tombstone we created; do not follow it. The later
+        // rename will fail safely if it still occupies the name.
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspecting tombstone {}", tombstone.display()));
+        }
     }
-    fs::rename(&path, &tombstone).with_context(|| format!("isolating {}", path.display()))?;
-    if let Err(err) = fs::remove_dir_all(&tombstone) {
+    // Windows refuses to rename a directory while a handle inside it is open,
+    // including Cargo's lock files. Drop our guards right before the rename;
+    // the job lock (outside the dir) still keeps other epicenter jobs out.
+    #[cfg(windows)]
+    drop(cargo_locks);
+    #[cfg(not(windows))]
+    let _cargo_locks = cargo_locks;
+    isolate_dir(&path, &tombstone).with_context(|| {
+        format!(
+            "isolating {} — a process still holds this job dir open (a build, editor/rust-analyzer, \
+             or a shell inside it); close it and retry",
+            path.display()
+        )
+    })?;
+    if let Err(err) = crate::util::force_remove_dir(&tombstone) {
         let _ = fs::rename(&tombstone, &path);
         drop(job_lock);
         return Err(err).with_context(|| format!("removing {}", path.display()));
@@ -633,18 +699,57 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     drop(job_lock);
     crate::exec::remove_job_lock(&work_root, &name);
     crate::exec::sweep_job_locks(&work_root);
-    println!();
     println!(
-        "  {} {name} removed · {} actually freed · {} links released",
-        util::green(util::GLYPH_PASS),
+        "  {} {} nominal — {} actually freed · {} links released",
+        util::dim("result:   "),
+        human_bytes(bytes),
         human_bytes(unique),
         human_bytes(shared)
     );
+    println!();
+    println!("  {} {name} removed", util::green(util::GLYPH_PASS));
     println!(
         "  {}",
         util::dim("the vault is untouched — a job dir is a view")
     );
     Ok(())
+}
+
+/// Rename into the tombstone, retrying the transient access-denied Windows
+/// returns while antivirus/indexers briefly inspect the tree. Other platforms
+/// rename once: a permission error there is an ACL problem, not a race.
+fn isolate_dir(path: &Path, tombstone: &Path) -> std::io::Result<()> {
+    let attempts = if cfg!(windows) { 4 } else { 1 };
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..attempts {
+        match fs::rename(path, tombstone) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if attempt + 1 < attempts && err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                last = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.expect("a failed attempt records its error"))
+}
+
+/// Is the process working directory inside `path`? Canonical paths compare
+/// the same way for a plain dir and one reached through a junction.
+fn cwd_is_within(path: &Path) -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let (Ok(cwd), Ok(target)) = (cwd.canonicalize(), path.canonicalize()) else {
+        return false;
+    };
+    path_is_within(&cwd, &target)
+}
+
+fn path_is_within(cwd: &Path, target: &Path) -> bool {
+    cwd == target || cwd.starts_with(target)
 }
 
 /// `--work-dir` targets: a job id (plain or `work/<id>`), or a path that is a
@@ -662,11 +767,16 @@ fn resolve_work_dir(work_root: &Path, target: &str) -> Result<PathBuf> {
     } else {
         PathBuf::from(target)
     };
-    let candidate_meta = fs::symlink_metadata(&candidate)?;
-    if !candidate_meta.is_dir()
-        || candidate_meta.file_type().is_symlink()
-        || crate::util::is_reparse_point(&candidate_meta)
-    {
+    let candidate_meta = match metadata_nofollow(&candidate) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no job dir named {target:?} — `epicenter vault` shows the work tier")
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", candidate.display()));
+        }
+    };
+    if !candidate_meta.is_dir() {
         bail!("no job dir named {target:?} — `epicenter vault` shows the work tier");
     }
     let inside = candidate
@@ -731,10 +841,21 @@ fn evict_work_dirs(
             continue;
         }
         let path = entry.path();
-        if fs::symlink_metadata(&path)
-            .map(|meta| crate::util::is_reparse_point(&meta))
-            .unwrap_or(true)
-        {
+        let meta = match metadata_nofollow(&path) {
+            Ok(meta) => meta,
+            // The entry vanished or became a link while we scanned it.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue;
+            }
+            // One unreadable job dir must not block collection of the rest.
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
             continue;
         }
         let newest = dir_newest(&path);
@@ -787,7 +908,7 @@ fn evict_work_dirs(
         };
         println!(
             "  {icon} {:<40} {:>9} · {:>4} file(s)  {:>10} old  {note}",
-            row.name,
+            util::safe_display(std::ffi::OsStr::new(&row.name)),
             human_bytes(row.bytes),
             row.files,
             row.newest.map(human_age).unwrap_or_else(|| "?".into()),
@@ -852,11 +973,20 @@ fn evict_work_dirs(
                 continue;
             }
         };
-        let Some(_cargo_locks) = crate::exec::cargo_locks(&row.path)? else {
-            report.in_use += 1;
-            continue;
+        let cargo_locks = match crate::exec::cargo_locks(&row.path)? {
+            Some(locks) => locks,
+            None => {
+                report.in_use += 1;
+                continue;
+            }
         };
-        match fs::remove_dir_all(&row.path) {
+        // Same Windows rule as `--work-dir`: an open handle inside the tree
+        // blocks the directory removal.
+        #[cfg(windows)]
+        drop(cargo_locks);
+        #[cfg(not(windows))]
+        let _cargo_locks = cargo_locks;
+        match crate::util::force_remove_dir(&row.path) {
             Ok(()) => {
                 report.removed += 1;
                 freed_unique += row.unique;
@@ -937,7 +1067,7 @@ fn dir_accounting(dir: &Path) -> (u64, u64, u64, u64) {
 /// the `work/` prefix) = that job dir; anything else = a directory path.
 fn resolve_view(build_root: &Path, work: &str) -> Result<PathBuf> {
     if work == "build" {
-        return Ok(build_root.to_path_buf());
+        return crate::util::validate_state_root(build_root, "build view");
     }
     let work_root = crate::exec::work_root(build_root);
     // Only a plain job id (or `work/<id>`) may use the join shortcut. An
@@ -946,11 +1076,8 @@ fn resolve_view(build_root: &Path, work: &str) -> Result<PathBuf> {
     let job_id = work.strip_prefix("work/").unwrap_or(work);
     if crate::util::validate_component(job_id, "job id").is_ok() {
         let job = work_root.join(job_id);
-        if let Ok(meta) = fs::symlink_metadata(&job) {
-            if meta.is_dir()
-                && !meta.file_type().is_symlink()
-                && !crate::util::is_reparse_point(&meta)
-            {
+        if let Ok(meta) = metadata_nofollow(&job) {
+            if meta.is_dir() {
                 // Apply containment to the join shortcut too: a junction
                 // inside work/ must not point outside the work root.
                 if let (Ok(root), Ok(canon)) = (work_root.canonicalize(), job.canonicalize()) {
@@ -962,10 +1089,8 @@ fn resolve_view(build_root: &Path, work: &str) -> Result<PathBuf> {
         }
     }
     let path = PathBuf::from(work);
-    if fs::symlink_metadata(&path)
-        .map(|meta| {
-            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
-        })
+    if metadata_nofollow(&path)
+        .map(|meta| meta.is_dir())
         .unwrap_or(false)
     {
         let canonical = path.canonicalize()?;
@@ -1037,61 +1162,6 @@ fn remove_view_unit(root: &Path, unit: &Unit, arts: &ArtifactInfo, errors: &mut 
     }
     for (path, _, _) in &arts.paths {
         remove_file(path, errors);
-    }
-}
-
-/// (nominal, actually freed, released, file count) of a set of paths about to
-/// be unlinked. A file frees its bytes only when every one of its links is in
-/// the set; inodes are counted once, so hard links never inflate the total.
-fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
-    #[cfg(unix)]
-    {
-        use std::collections::{HashMap, HashSet};
-        use std::os::unix::fs::MetadataExt;
-
-        let mut per_inode: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
-        let mut seen: HashSet<&Path> = HashSet::new();
-        let mut count = 0u64;
-        for path in files {
-            if !seen.insert(path.as_path()) {
-                continue;
-            }
-            let Ok(meta) = fs::metadata(path) else {
-                continue;
-            };
-            count += 1;
-            let entry =
-                per_inode
-                    .entry((meta.dev(), meta.ino()))
-                    .or_insert((meta.len(), meta.nlink(), 0));
-            entry.2 += 1;
-        }
-        let mut nominal = 0u64;
-        let mut freed = 0u64;
-        for (size, links, planned) in per_inode.values() {
-            nominal += size;
-            if planned >= links {
-                freed += size;
-            }
-        }
-        (nominal, freed, nominal - freed, count)
-    }
-    #[cfg(not(unix))]
-    {
-        // No link counts here: report the paths as freed (single-link ceiling).
-        let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
-        let mut nominal = 0u64;
-        let mut count = 0u64;
-        for path in files {
-            if !seen.insert(path.as_path()) {
-                continue;
-            }
-            if let Ok(meta) = fs::metadata(path) {
-                nominal += meta.len();
-                count += 1;
-            }
-        }
-        (nominal, nominal, 0, count)
     }
 }
 
@@ -1188,10 +1258,7 @@ fn known_views(build_root: &Path) -> Vec<(String, PathBuf)> {
             if name.starts_with('.') {
                 continue;
             }
-            if fs::symlink_metadata(entry.path())
-                .map(|meta| crate::util::is_reparse_point(&meta))
-                .unwrap_or(true)
-            {
+            if metadata_nofollow(&entry.path()).is_err() {
                 continue;
             }
             views.push((format!("work/{name}"), entry.path()));
@@ -1335,7 +1402,7 @@ fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Resu
         }
     }
 
-    let (nominal, freed, released, count) = account_files(&files);
+    let (nominal, freed, released, count) = util::account_files(&files);
     println!(
         "{}",
         util::heading(if opts.delete {
@@ -1391,11 +1458,11 @@ fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Resu
     let mut errors = 0u64;
     let mut unlinked_views = 0usize;
     for (label, root, units) in &views {
-        if crate::exec::dir_locked(root) {
+        let Some(_cargo_locks) = crate::exec::cargo_locks(root)? else {
             errors += 1;
             eprintln!("view {label} became busy — skipped");
             continue;
-        }
+        };
         let _job_lock = if let Some(name) = label.strip_prefix("work/") {
             match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(
                 &crate::exec::work_root(build_root),
@@ -1536,7 +1603,7 @@ fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<
     for (unit, arts) in &chosen {
         files.extend(view_unit_files(unit, arts));
     }
-    let (nominal, freed, released, count) = account_files(&files);
+    let (nominal, freed, released, count) = util::account_files(&files);
 
     for (unit, arts) in &chosen {
         println!(
@@ -1630,6 +1697,10 @@ mod tests {
         let unit_dir = root.join("debug/.fingerprint/pkg-1122334455667788");
         fs::create_dir_all(&unit_dir)?;
         fs::write(unit_dir.join("lib-pkg"), "0011223344556677")?;
+        fs::write(
+            unit_dir.join("lib-pkg.json"),
+            r#"{"rustc":1,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"config":4,"deps":[]}"#,
+        )?;
         fs::write(unit_dir.join("dep-lib-pkg"), [0u8; 8])?;
         fs::create_dir_all(root.join("debug/deps"))?;
         fs::write(
@@ -1647,6 +1718,14 @@ mod tests {
         fs::write(
             unit.join("fingerprint").join(format!("lib-{package}")),
             "0011223344556677",
+        )?;
+        fs::write(
+            unit.join("fingerprint").join(format!("dep-lib-{package}")),
+            [0u8; 8],
+        )?;
+        fs::write(
+            unit.join("fingerprint").join(format!("lib-{package}.json")),
+            r#"{"rustc":1,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"config":4,"deps":[]}"#,
         )?;
         fs::write(
             unit.join("out").join(format!("lib{package}-{hash}.rlib")),
@@ -1719,6 +1798,18 @@ mod tests {
         assert!(resolve_view(&build, "/tmp/escape").is_err());
         assert!(resolve_view(&build, ".. ").is_err());
         assert!(resolve_view(&build, "CON.txt").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_view_rejects_a_symlinked_build_root() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        let build = home.path().join("build");
+        std::os::unix::fs::symlink(victim.path(), &build)?;
+        let err = resolve_view(&build, "build").unwrap_err();
+        assert!(format!("{err:#}").contains("symlink/reparse"), "{err:#}");
         Ok(())
     }
 
@@ -1905,6 +1996,15 @@ mod tests {
     }
 
     #[test]
+    fn path_containment_distinguishes_siblings_and_descendants() {
+        let root = Path::new("/cache/work/job");
+        assert!(path_is_within(root, root));
+        assert!(path_is_within(Path::new("/cache/work/job/debug"), root));
+        assert!(!path_is_within(Path::new("/cache/work/job-2"), root));
+        assert!(!path_is_within(Path::new("/cache/work"), root));
+    }
+
+    #[test]
     fn work_dir_removal_ignores_the_age_window() -> Result<()> {
         let home = tier_home()?;
         let build = home.path().join("build");
@@ -1929,6 +2029,25 @@ mod tests {
             !home.path().join("work/.lock-orphan").exists(),
             "orphan lock debris is swept"
         );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn work_dir_removal_releases_lock_handles_before_renaming() -> Result<()> {
+        let home = tier_home()?;
+        let build = home.path().join("build");
+        let job = aged_job(home.path(), "win-job", 0)?;
+        fs::create_dir_all(job.join("debug"))?;
+        // Windows refuses to rename a directory while this file is open.
+        fs::write(job.join("debug/.cargo-build-lock"), b"")?;
+        let opts = Options {
+            work_dir: Some("win-job"),
+            delete: true,
+            ..no_selectors()
+        };
+        run(&build, &opts)?;
+        assert!(!job.exists(), "the job dir is gone");
         Ok(())
     }
 
@@ -2241,11 +2360,22 @@ mod tests {
         let store = home.path().join("store");
         let parity = crate::vault::parity_key()?;
         fs::write(store.join(".lock-9.9.9-deadbeef"), b"")?;
-        fs::create_dir_all(store.join("9.9.9-deadbeef/units"))?;
+        let husk = store.join("9.9.9-deadbeef");
+        fs::create_dir_all(husk.join("units"))?;
+        fs::write(husk.join(crate::vault::GENERATION_MARKER), b"")?;
+        // An unmarked sibling is not an epicenter generation: it must survive
+        // even though it has no manifest and no units.
+        let unrelated = store.join("unrelated");
+        fs::create_dir_all(unrelated.join("units"))?;
+        fs::write(unrelated.join("precious.txt"), b"keep")?;
 
         crate::vault::sweep_store_debris(&store);
         assert!(!store.join(".lock-9.9.9-deadbeef").exists());
         assert!(!store.join("9.9.9-deadbeef").exists());
+        assert!(
+            unrelated.join("precious.txt").is_file(),
+            "unrelated directory survives"
+        );
         assert!(store.join(&parity).is_dir(), "the live generation is kept");
         assert!(
             store.join(format!(".lock-{parity}")).is_file(),
@@ -2357,6 +2487,7 @@ mod tests {
             toolchain: "rustc 0.0.0".into(),
             created: 1,
             updated: 1,
+            signature: String::new(),
             units: vec![crate::vault::UnitEntry {
                 name: "oldpkg-0000111122223333".into(),
                 profile: "debug".into(),
@@ -2370,6 +2501,7 @@ mod tests {
                     size: 16,
                     sha256: "0".repeat(64),
                     role: "memo".into(),
+                    object: None,
                 }],
             }],
             mac: String::new(),
@@ -2408,11 +2540,11 @@ mod tests {
 
         // Both links of `b` are in the plan → its bytes are actually freed.
         let (nominal, freed, released, count) =
-            account_files(&[a.clone(), b.clone(), store_copy.clone()]);
+            util::account_files(&[a.clone(), b.clone(), store_copy.clone()]);
         assert_eq!((nominal, freed, released, count), (300, 300, 0, 3));
 
         // Only the view's links are removed → `b` is released, not freed.
-        let (nominal, freed, released, count) = account_files(&[a, b]);
+        let (nominal, freed, released, count) = util::account_files(&[a, b]);
         assert_eq!((nominal, freed, released, count), (300, 100, 200, 2));
         Ok(())
     }

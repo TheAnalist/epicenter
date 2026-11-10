@@ -31,47 +31,84 @@ pub enum Flavor {
     Msvc,
 }
 
-/// The bundled LLD for the active rustup toolchain.
+/// Which managed linker a plan describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkerKind {
+    Lld,
+    Wild,
+    Mold,
+    Gold,
+}
+
+/// One `[target.<triple>] rustflags` edit.
+#[derive(Debug, Clone)]
+pub struct TargetPlan {
+    pub target: String,
+    pub flags: Vec<String>,
+    /// Exact `rustflags = [...]` literal written by this version.
+    pub literal: String,
+    /// Older literals that may be migrated/removed.
+    pub legacy: Vec<String>,
+}
+
+/// A managed linker for the active rustup toolchain.
 #[derive(Debug, Clone)]
 pub struct FastLinker {
+    pub kind: LinkerKind,
     /// Host triple the flags apply to (`x86_64-unknown-linux-gnu`).
     pub host: String,
     /// `…/lib/rustlib/<host>/bin/gcc-ld`.
     pub lld_dir: PathBuf,
-    /// `ld.lld` (ELF) or `rust-lld.exe` (COFF), the binary the flags point at.
+    /// `ld.lld` / `rust-lld.exe` / `wild`, the binary the flags point at.
     pub linker: PathBuf,
     pub flavor: Flavor,
+    /// Host target flags.
+    pub flags: Vec<String>,
+    /// Optional `wasm32-unknown-unknown` flags (Wild only, when installed).
+    pub wasm: Option<Vec<String>>,
 }
 
 impl FastLinker {
-    /// rustc flags for `[target.<host>] rustflags`.
+    /// rustc flags for the host target.
     pub fn rustflags(&self) -> Vec<String> {
-        match self.flavor {
-            Flavor::Gnu => vec![
-                "-C".to_string(),
-                "link-arg=-fuse-ld=lld".to_string(),
-                "-C".to_string(),
-                format!("link-arg=-B{}", forward(&self.lld_dir)),
-            ],
-            Flavor::Msvc => vec![
-                "-C".to_string(),
-                format!("linker={}", forward(&self.linker)),
-            ],
-        }
+        self.flags.clone()
     }
 
-    /// The `rustflags = [...]` value, ready for the config line.
+    /// The host `rustflags = [...]` value, ready for the config line.
     pub fn rustflags_toml(&self) -> String {
-        toml_array(&self.rustflags())
+        toml_array(&self.flags)
+    }
+
+    /// All target edits this plan owns: host, plus wasm for Wild.
+    pub fn plans(&self) -> Vec<TargetPlan> {
+        let mut plans = vec![TargetPlan {
+            target: self.host.clone(),
+            flags: self.flags.clone(),
+            literal: toml_array(&self.flags),
+            legacy: self.legacy_rustflags_toml(),
+        }];
+        if let Some(wasm) = &self.wasm {
+            plans.push(TargetPlan {
+                target: "wasm32-unknown-unknown".to_string(),
+                flags: wasm.clone(),
+                literal: toml_array(wasm),
+                legacy: Vec::new(),
+            });
+        }
+        plans
     }
 
     /// TOML literals written by older epicenter versions for this host.
     ///
     /// 0.0.7 pointed MSVC at `gcc-ld/lld-link.exe`. rustc recognizes the
     /// `lld-link` name and switches to the generic LLD protocol
-    /// (`-flavor link`), which the COFF driver rejects. `--fast` migrates
-    /// these values to `rust-lld.exe`; `--without-fast` removes them.
+    /// (`-flavor link`), which the COFF driver rejects. `--linker lld`
+    /// migrates these values to `rust-lld.exe`; `--linker system` removes
+    /// them.
     pub fn legacy_rustflags_toml(&self) -> Vec<String> {
+        if self.kind != LinkerKind::Lld {
+            return Vec::new();
+        }
         match self.flavor {
             Flavor::Msvc => {
                 let old = self.lld_dir.join("lld-link.exe");
@@ -114,6 +151,65 @@ fn toml_array(items: &[String]) -> String {
 
 /// Detect the bundled LLD for the active toolchain's host.
 pub fn detect() -> Result<FastLinker> {
+    let (host, sysroot) = rustc_host_and_sysroot()?;
+    locate(&sysroot, &host)
+}
+
+/// Detect a standalone mold linker and a usable clang driver.
+pub fn detect_mold() -> Result<FastLinker> {
+    detect_external(LinkerKind::Mold, "mold", &["mold"])
+}
+
+/// Detect GNU gold and a usable clang driver.
+pub fn detect_gold() -> Result<FastLinker> {
+    detect_external(LinkerKind::Gold, "gold", &["ld.gold", "gold"])
+}
+
+fn detect_external(kind: LinkerKind, label: &str, names: &[&str]) -> Result<FastLinker> {
+    let (host, sysroot) = rustc_host_and_sysroot()?;
+    if !host.contains("linux") {
+        bail!("--linker {label} supports Linux ELF only (host {host}); use lld or system");
+    }
+    let linker = names
+        .iter()
+        .find_map(|name| crate::util::which_path(name))
+        .ok_or_else(|| {
+            anyhow::anyhow!("`{label}` is not on PATH — install it or use --linker lld")
+        })?;
+    let clang = usable_clang().ok_or_else(|| {
+        anyhow::anyhow!("{label} needs clang as the driver — install clang or use --linker lld")
+    })?;
+    let flags = vec![
+        "-C".to_string(),
+        "linker=clang".to_string(),
+        "-C".to_string(),
+        format!("link-arg=-fuse-ld={}", forward(&linker)),
+    ];
+    let lld_dir = sysroot
+        .join("lib")
+        .join("rustlib")
+        .join(&host)
+        .join("bin")
+        .join("gcc-ld");
+    let _ = clang;
+    Ok(FastLinker {
+        kind,
+        host,
+        lld_dir,
+        linker,
+        flavor: Flavor::Gnu,
+        flags,
+        wasm: None,
+    })
+}
+
+/// Detect the standalone Wild linker and a usable C driver for it.
+pub fn detect_wild() -> Result<FastLinker> {
+    let (host, sysroot) = rustc_host_and_sysroot()?;
+    detect_wild_at(&sysroot, &host)
+}
+
+fn rustc_host_and_sysroot() -> Result<(String, PathBuf)> {
     let mut rustc = crate::util::command_for("rustc")?;
     let output = rustc
         .arg("-vV")
@@ -140,7 +236,120 @@ pub fn detect() -> Result<FastLinker> {
         bail!("`rustc --print sysroot` failed — is a toolchain installed?");
     }
     let sysroot = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    locate(&sysroot, &host)
+    Ok((host, sysroot))
+}
+
+/// Wild needs a C driver that understands `wild`; no driver means a clear
+/// refusal instead of a broken build.
+fn detect_wild_at(sysroot: &Path, host: &str) -> Result<FastLinker> {
+    if !host.contains("linux") {
+        bail!("--linker wild supports Linux ELF and wasm32 only (host {host}); use lld or system");
+    }
+    let wild = crate::util::which_path("wild")
+        .ok_or_else(|| anyhow::anyhow!("`wild` is not on PATH — install it or use --linker lld"))?;
+    let cc = command_version("cc");
+    let has_clang = usable_clang().is_some();
+    let flags = if cc
+        .as_deref()
+        .is_some_and(|text| text.to_ascii_lowercase().contains("clang"))
+    {
+        // `cc` is already clang; keep it as the driver.
+        vec!["-C".to_string(), "link-arg=--ld-path=wild".to_string()]
+    } else if has_clang {
+        // Wild's documented Rust integration: clang is the driver and
+        // resolves wild through `--ld-path`.
+        vec![
+            "-C".to_string(),
+            "linker=clang".to_string(),
+            "-C".to_string(),
+            "link-arg=--ld-path=wild".to_string(),
+        ]
+    } else if let Some((major, minor)) = cc.as_deref().and_then(parse_compiler_version) {
+        if (major, minor) >= (16, 1) {
+            vec!["-C".to_string(), "link-arg=-fuse-ld=wild".to_string()]
+        } else {
+            bail!(
+                "wild found at {}, but no usable driver: cc is GCC {major}.{minor} (need >= 16.1) and clang is not usable",
+                wild.display()
+            );
+        }
+    } else {
+        bail!(
+            "wild found at {}, but no usable driver: install clang or GCC >= 16.1",
+            wild.display()
+        );
+    };
+    let wasm = sysroot
+        .join("lib")
+        .join("rustlib")
+        .join("wasm32-unknown-unknown")
+        .is_dir()
+        .then(|| {
+            vec![
+                "-C".to_string(),
+                format!("linker={}", forward(&wild)),
+                "-C".to_string(),
+                "linker-flavor=wasm-ld".to_string(),
+            ]
+        });
+    let lld_dir = sysroot
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("bin")
+        .join("gcc-ld");
+    Ok(FastLinker {
+        kind: LinkerKind::Wild,
+        host: host.to_string(),
+        lld_dir,
+        linker: wild,
+        flavor: Flavor::Gnu,
+        flags,
+        wasm,
+    })
+}
+
+fn command_version(program: &str) -> Option<String> {
+    let output = crate::util::command_for(program)
+        .ok()?
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// The kache `clang` shim exits non-zero when no real clang exists behind it.
+fn usable_clang() -> Option<PathBuf> {
+    let path = crate::util::tool_path("clang").ok()?;
+    let output = std::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // The kache shim prints an error and can still exit zero; a real clang
+    // always announces itself on stdout.
+    let version = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    // Real clang says "clang version ..." or "Apple clang version ..."; the
+    // kache shim's error also contains the word clang, so be specific.
+    (output.status.success() && version.contains("clang version")).then_some(path)
+}
+
+fn parse_compiler_version(text: &str) -> Option<(u32, u32)> {
+    let first = text.lines().next()?;
+    first.split_whitespace().rev().find_map(|token| {
+        let token = token.trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.');
+        let mut parts = token.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+        Some((major, minor))
+    })
 }
 
 /// Pure detection against a known sysroot/host (unit-testable).
@@ -181,11 +390,23 @@ pub fn locate(sysroot: &Path, host: &str) -> Result<FastLinker> {
                 search_dir.display()
             )
         })?;
+    let flags = match flavor {
+        Flavor::Gnu => vec![
+            "-C".to_string(),
+            "link-arg=-fuse-ld=lld".to_string(),
+            "-C".to_string(),
+            format!("link-arg=-B{}", forward(&lld_dir)),
+        ],
+        Flavor::Msvc => vec!["-C".to_string(), format!("linker={}", forward(&linker))],
+    };
     Ok(FastLinker {
+        kind: LinkerKind::Lld,
         host: host.to_string(),
         lld_dir,
         linker,
         flavor,
+        flags,
+        wasm: None,
     })
 }
 
@@ -279,5 +500,42 @@ mod tests {
         assert!(err.to_string().contains("ld64"), "{err}");
         let err = locate(root.path(), "x86_64-unknown-linux-gnu").unwrap_err();
         assert!(err.to_string().contains("bundled LLD"), "{err}");
+    }
+    #[test]
+    fn parses_compiler_versions() {
+        assert_eq!(
+            parse_compiler_version("cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"),
+            Some((11, 4))
+        );
+        assert_eq!(parse_compiler_version("gcc (GCC) 16.1.0"), Some((16, 1)));
+        assert_eq!(parse_compiler_version("not a compiler"), None);
+    }
+
+    #[test]
+    fn wild_plan_includes_the_wasm_target() {
+        let linker = FastLinker {
+            kind: LinkerKind::Wild,
+            host: "x86_64-unknown-linux-gnu".to_string(),
+            lld_dir: PathBuf::from("/sysroot/gcc-ld"),
+            linker: PathBuf::from("/bin/wild"),
+            flavor: Flavor::Gnu,
+            flags: vec![
+                "-C".to_string(),
+                "linker=clang".to_string(),
+                "-C".to_string(),
+                "link-arg=--ld-path=wild".to_string(),
+            ],
+            wasm: Some(vec![
+                "-C".to_string(),
+                "linker=/bin/wild".to_string(),
+                "-C".to_string(),
+                "linker-flavor=wasm-ld".to_string(),
+            ]),
+        };
+        let plans = linker.plans();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].target, "x86_64-unknown-linux-gnu");
+        assert_eq!(plans[1].target, "wasm32-unknown-unknown");
+        assert!(plans[1].literal.contains("wasm-ld"));
     }
 }

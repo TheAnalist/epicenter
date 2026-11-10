@@ -1,7 +1,8 @@
 //! `epicenter exec` — run one command against a fresh per-job build dir
 //! seeded from the vault.
 //!
-//! A job gets its own directory under `{cargo-cache-home}/epicenter/work/<id>/`
+//! A job gets its own directory under the per-user OS work root
+//! (`$XDG_CACHE_HOME/epicenter/work/<id>/`, overridable with `--work-root`)
 //! that plays the role of Cargo's build dir for the child process
 //! (`CARGO_BUILD_BUILD_DIR` — no config file is written). The vault's unit
 //! groups are hard-linked in first, so the build starts warm; the units the
@@ -18,6 +19,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use walkdir::WalkDir;
@@ -25,13 +27,92 @@ use walkdir::WalkDir;
 use anyhow::{Context, Result, bail};
 
 use crate::fingerprint;
-use crate::util::{self, GLYPH_FAIL, GLYPH_INFO, GLYPH_PASS, human_bytes, human_duration};
+use crate::settings::LinkPolicy;
+use crate::util::{
+    self, GLYPH_FAIL, GLYPH_INFO, GLYPH_PASS, human_bytes, human_duration, metadata_nofollow,
+};
 use crate::vault;
 
-/// `{cargo-cache-home}/epicenter/work` — the home of per-job working dirs,
-/// a sibling of `build/` and `store/`.
+static WORK_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Marker written into a newly created job dir. `--reuse` refuses a
+/// pre-existing directory without it, so a shared work root cannot be seeded
+/// with a bare directory. The token is not a secret; `O_EXCL` creation is the
+/// primary guard.
+pub const JOB_MARKER: &str = ".epicenter-job";
+const JOB_MARKER_VERSION: &str = "epicenter-job-v1";
+
+/// Install the CLI's resolved work root once per process. Callers that use
+/// the library directly still get the legacy build-sibling fallback.
+pub fn set_work_root_override(path: PathBuf) -> Result<()> {
+    WORK_ROOT_OVERRIDE
+        .set(path)
+        .map_err(|_| anyhow::anyhow!("work root override is already installed"))
+}
+
+/// The local per-VM work root: explicit policy override when installed, else
+/// the legacy build sibling for library/test callers.
 pub fn work_root(build_root: &Path) -> PathBuf {
-    build_root.parent().unwrap_or(build_root).join("work")
+    WORK_ROOT_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| build_root.parent().unwrap_or(build_root).join("work"))
+}
+
+fn job_marker_path(work_dir: &Path) -> PathBuf {
+    work_dir.join(JOB_MARKER)
+}
+
+fn write_job_marker(work_dir: &Path) -> Result<()> {
+    let mut token = [0u8; 16];
+    getrandom::fill(&mut token).map_err(|err| anyhow::anyhow!("generating job token: {err}"))?;
+    let token_hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
+    let body = format!("{JOB_MARKER_VERSION}\n{token_hex}\n");
+    crate::util::write_atomic_private(&job_marker_path(work_dir), body.as_bytes())
+        .with_context(|| format!("writing job marker in {}", work_dir.display()))
+}
+
+fn has_job_marker(work_dir: &Path) -> Result<bool> {
+    let text = match crate::util::read_trusted_config(&job_marker_path(work_dir), 1024) {
+        Ok(text) => text,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.kind() == std::io::ErrorKind::InvalidInput =>
+        {
+            return Ok(false);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading job marker in {}", work_dir.display()));
+        }
+    };
+    Ok(text.starts_with(JOB_MARKER_VERSION)
+        && text
+            .lines()
+            .nth(1)
+            .is_some_and(|token| token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
+fn create_job_dir(work_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(work_dir)
+            .with_context(|| format!("creating job dir {}", work_dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(work_dir)
+            .with_context(|| format!("creating job dir {}", work_dir.display()))?;
+        crate::util::ensure_private_dir(work_dir)?;
+    }
+    if let Err(err) = write_job_marker(work_dir) {
+        let _ = fs::remove_dir(work_dir);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// One job dir as the read-only summary sees it.
@@ -66,14 +147,11 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
         if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = util::safe_display(&entry.file_name());
         if name.starts_with('.') {
             continue;
         }
-        if std::fs::symlink_metadata(entry.path())
-            .map(|meta| util::is_reparse_point(&meta))
-            .unwrap_or(true)
-        {
+        if metadata_nofollow(&entry.path()).is_err() {
             continue;
         }
         let mut info = WorkDirInfo {
@@ -127,6 +205,10 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
     // Cargo puts the lock at `<build>/<profile>/.cargo-build-lock` or, with
     // `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
     // bounded depth and take every lock, not just direct children.
+    //
+    // Windows refuses to rename a directory while any file inside it is open
+    // (even with FILE_SHARE_DELETE), so a caller that renames/removes `dir`
+    // must drop these handles first.
     let entries = WalkDir::new(dir)
         .min_depth(1)
         .max_depth(3)
@@ -214,6 +296,8 @@ pub struct Options<'a> {
     pub cwd: Option<PathBuf>,
     /// Store the units the job produced back into the vault.
     pub harvest_back: bool,
+    /// Compress copied artifacts when harvesting.
+    pub compress: bool,
     /// Remove the work dir after the run — success or failure. Without it
     /// the dir is kept for inspection.
     pub remove_on_success: bool,
@@ -223,6 +307,10 @@ pub struct Options<'a> {
     /// The child's `CARGO_TARGET_DIR`: `Some("job")` means `<work dir>/target`
     /// (per-job finals — the fully parallel case); any other value is a path.
     pub target_dir: Option<&'a str>,
+    /// Preset override for `CARGO_INCREMENTAL`; `None` leaves Cargo's config.
+    pub incremental: Option<bool>,
+    /// How dependencies are installed into the job dir.
+    pub link: LinkPolicy,
     /// The command, argv-style.
     pub command: &'a [String],
 }
@@ -274,7 +362,9 @@ fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
         .and_then(|arg| arg.strip_prefix('+'))
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let mut probe = std::process::Command::new(program);
+    let Ok(mut probe) = crate::util::command_for(program) else {
+        return (selector, None);
+    };
     if let Some(selector) = &selector {
         probe.arg(format!("+{selector}"));
     }
@@ -330,7 +420,8 @@ fn manifest_arg(command: &[String]) -> Option<PathBuf> {
 
 /// Package names from a `Cargo.lock` (all formats: `[[package]] name = …`).
 fn parse_lock(path: &Path) -> Option<HashSet<String>> {
-    let lock: toml::Value = fs::read_to_string(path).ok()?.parse().ok()?;
+    let text = crate::util::read_small_text(path, 4 * 1024 * 1024).ok()?;
+    let lock: toml::Value = text.parse().ok()?;
     let names: HashSet<String> = lock
         .get("package")?
         .as_array()?
@@ -349,10 +440,41 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         Some(id) => sanitize_job_id(id)?,
         None => default_job_id(),
     };
+    // The work root is local per VM and must never overlap the vault: a
+    // shared/read-only store is not a place to create job dirs, and a work
+    // root that is an ancestor of the store could make `evict --work-dirs`
+    // treat the store as a job dir.
+    if work_root
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!(
+            "work root {} contains `..`; use a normalized path",
+            work_root.display()
+        );
+    }
+    if work_root.starts_with(store_root) || store_root.starts_with(work_root) {
+        bail!(
+            "work root {} overlaps the vault {} — choose a separate local directory",
+            work_root.display(),
+            store_root.display()
+        );
+    }
     // Private work root + per-job epicenter lock (outside the job dir, so
     // --rm can remove the dir while the lock is held).
     crate::util::ensure_windows_user_path(work_root, "work root")?;
     crate::util::create_private_dir_all(work_root)?;
+    let work_root = crate::util::validate_state_root(work_root, "work root")?;
+    if let Ok(store) = store_root.canonicalize() {
+        if work_root.starts_with(&store) || store.starts_with(&work_root) {
+            bail!(
+                "work root {} overlaps the vault {} — choose a separate local directory",
+                work_root.display(),
+                store.display()
+            );
+        }
+    }
+    let work_root = work_root.as_path();
     // Acquire the per-job lock BEFORE looking at/creating the dir: the bulk
     // work-dir GC takes the same lock and must never see an unlocked empty dir.
     let job_lock = match crate::util::FileLock::try_acquire(&job_lock_path(work_root, &job_id))? {
@@ -365,17 +487,23 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let work_dir = work_root.join(&job_id);
     let mut reused = false;
     let mut reuse_locks: Option<Vec<fs::File>> = None;
-    if fs::symlink_metadata(&work_dir).is_ok() {
+    if let Ok(meta) = metadata_nofollow(&work_dir) {
         if !opts.reuse {
             bail!(
                 "job dir {} already exists — pick another --id, pass --reuse to continue in it, or remove it",
                 work_dir.display()
             );
         }
-        let meta = fs::symlink_metadata(&work_dir)
-            .with_context(|| format!("inspecting {}", work_dir.display()))?;
-        if !meta.is_dir() || meta.file_type().is_symlink() || crate::util::is_reparse_point(&meta) {
+        if !meta.is_dir() {
             bail!("{} exists and is not a real directory", work_dir.display());
+        }
+        crate::util::ensure_private_dir(&work_dir)?;
+        if !has_job_marker(&work_dir)? {
+            bail!(
+                "job dir {} was not created by epicenter (missing {}); refusing --reuse",
+                work_dir.display(),
+                JOB_MARKER
+            );
         }
         let Some(locks) = cargo_locks(&work_dir)? else {
             bail!(
@@ -389,7 +517,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         reuse_locks = Some(locks);
         reused = true;
     } else {
-        crate::util::create_private_dir_all(&work_dir)?;
+        create_job_dir(&work_dir)?;
     }
     let target_dir = opts
         .target_dir
@@ -432,6 +560,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         layout,
         selector.as_deref(),
         false,
+        opts.link,
     )?;
     if restore.fatal_errors > 0 {
         bail!(
@@ -487,6 +616,9 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     if let Some(target) = &target_dir {
         child.env("CARGO_TARGET_DIR", target);
     }
+    if let Some(incremental) = opts.incremental {
+        child.env("CARGO_INCREMENTAL", if incremental { "1" } else { "0" });
+    }
     if let Some(dir) = &opts.cwd {
         child.current_dir(dir);
     }
@@ -495,6 +627,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         .with_context(|| format!("cannot run `{program}` — is it installed and on PATH?"))?;
     let elapsed = started.elapsed();
     let code = exit_code(&status);
+    record_build(&opts.command, elapsed);
 
     let harvested = if opts.harvest_back {
         Some(vault::harvest_with(
@@ -504,6 +637,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             false,
             selector.as_deref(),
             layout,
+            opts.compress,
         )?)
     } else {
         None
@@ -571,6 +705,45 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
 }
 
 /// Signals use the shell convention: 128 + signal number.
+/// Record the last job's wall time and peak child RSS for `doctor`.
+/// Unix-only; Windows has no cheap equivalent for the whole child tree.
+pub fn record_build(command: &[String], elapsed: std::time::Duration) {
+    #[cfg(unix)]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+            return;
+        }
+        let rss_bytes = if cfg!(target_os = "macos") {
+            usage.ru_maxrss as u64
+        } else {
+            usage.ru_maxrss as u64 * 1024
+        };
+        let Ok(home) = crate::paths::cargo_home() else {
+            return;
+        };
+        let path = home.join("epicenter").join("last-build.json");
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if crate::util::create_private_dir_all(parent).is_err() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "command": command.join(" "),
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "peak_rss_bytes": rss_bytes,
+            "at_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+        });
+        if let Ok(text) = serde_json::to_string(&payload) {
+            let _ = crate::util::write_atomic_private(&path, text.as_bytes());
+        }
+    }
+}
+
 fn exit_code(status: &ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -682,6 +855,10 @@ mod tests {
         let unit = build.path().join("debug/.fingerprint/x-1122334455667788");
         fs::create_dir_all(&unit)?;
         fs::write(unit.join("lib-x"), "aaaabbbbccccdddd")?;
+        fs::write(
+            unit.join("lib-x.json"),
+            r#"{"rustc":1,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"config":4,"deps":[]}"#,
+        )?;
         fs::write(unit.join("dep-lib-x"), [0u8; 4])?;
         fs::create_dir_all(build.path().join("debug/deps"))?;
         fs::write(
@@ -717,9 +894,12 @@ mod tests {
             job_id: Some("jobtest"),
             cwd: Some(project.path().to_path_buf()),
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &command,
         };
         let code = run(store.path(), work.path(), &opts)?;
@@ -750,9 +930,12 @@ mod tests {
             job_id: Some("filtered"),
             cwd: Some(project.path().to_path_buf()),
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -796,9 +979,12 @@ mod tests {
             job_id: Some("j-ok"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: true,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -819,9 +1005,12 @@ mod tests {
             job_id: Some("j-bad"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: true,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &bad,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 1);
@@ -840,9 +1029,12 @@ mod tests {
             job_id: Some("j-keep"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &kept,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -889,9 +1081,12 @@ mod tests {
             job_id: Some("taken"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -929,9 +1124,12 @@ mod tests {
             job_id: Some("j1"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: false,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -953,6 +1151,7 @@ mod tests {
         let work = tempfile::tempdir()?;
         let debug = work.path().join("busy/debug");
         fs::create_dir_all(&debug)?;
+        write_job_marker(&work.path().join("busy"))?;
         let lock = debug.join(".cargo-build-lock");
         fs::write(&lock, b"")?;
         let held = fs::OpenOptions::new().write(true).open(&lock)?;
@@ -963,9 +1162,12 @@ mod tests {
             job_id: Some("busy"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: true,
             target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &cmd,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -999,6 +1201,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn new_job_dirs_are_marked_and_reuse_requires_the_marker() -> Result<()> {
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let command: Vec<String> = vec!["true".into()];
+        let fresh = Options {
+            job_id: Some("marked"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
+        assert!(has_job_marker(&work.path().join("marked"))?);
+
+        fs::remove_file(work.path().join("marked").join(JOB_MARKER))?;
+        let reuse = Options {
+            reuse: true,
+            ..fresh
+        };
+        let err = run(store.path(), work.path(), &reuse).unwrap_err();
+        assert!(err.to_string().contains("missing .epicenter-job"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn default_work_root_is_not_derived_from_the_build_root() -> Result<()> {
+        let default = crate::paths::default_work_root()?;
+        assert!(default.is_absolute(), "{}", default.display());
+        assert!(
+            default.ends_with("epicenter/work"),
+            "unexpected default {}",
+            default.display()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn exec_exports_a_per_job_target_dir() -> Result<()> {
         let (_build, store) = seeded_store()?;
         let work = tempfile::tempdir()?;
@@ -1015,9 +1260,12 @@ mod tests {
             job_id: Some("t1"),
             cwd: None,
             harvest_back: false,
+            compress: true,
             remove_on_success: false,
             reuse: false,
             target_dir: Some("job"),
+            incremental: None,
+            link: LinkPolicy::Auto,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
