@@ -1902,9 +1902,12 @@ pub(crate) fn compress_file_hashed(
                     final_path.display()
                 );
             }
-            let existing = sha256_file(&final_path)
-                .with_context(|| format!("hashing existing blob {}", final_path.display()))?;
-            if existing != sha {
+            // The name is the hash of the *decoded* content, so hash the
+            // blob after decompression; hashing the gzip bytes would reject
+            // every duplicate artifact in the same harvest.
+            let (existing_size, existing_sha) = decompress_file_hashed(&final_path, true, size)
+                .with_context(|| format!("verifying existing blob {}", final_path.display()))?;
+            if existing_size != size || existing_sha != sha {
                 let _ = fs::remove_file(&tmp_path);
                 anyhow::bail!(
                     "content-addressed blob {} does not match its name",
@@ -1945,8 +1948,9 @@ pub(crate) fn compress_file_hashed(
                 if !meta.is_file() {
                     anyhow::bail!("blob path {} is not a regular file", final_path.display());
                 }
-                let existing = sha256_file(&final_path)?;
-                if existing != sha {
+                let (existing_size, existing_sha) = decompress_file_hashed(&final_path, true, size)
+                    .with_context(|| format!("verifying blob {}", final_path.display()))?;
+                if existing_size != size || existing_sha != sha {
                     anyhow::bail!(
                         "content-addressed blob {} does not match its name",
                         final_path.display()
@@ -2645,6 +2649,19 @@ mod tests {
         encoder.finish()?;
         let err = decompress_file_hashed(&path, true, 1024).unwrap_err();
         assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn recompressing_identical_content_accepts_the_existing_blob() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("generation");
+        fs::create_dir_all(&root)?;
+        let src = dir.path().join("artifact");
+        fs::write(&src, vec![b'x'; 8 * 1024])?;
+        let first = compress_file_hashed(&src, &root)?.expect("compressed");
+        let second = compress_file_hashed(&src, &root)?.expect("reused");
+        assert_eq!(first, second);
         Ok(())
     }
 

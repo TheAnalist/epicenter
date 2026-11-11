@@ -1,10 +1,10 @@
 //! Editing epicenter's **global** state: Cargo's `config.toml` and the
-//! global `epicenter.toml` next to it.
+//! machine-level `epicenter.toml`.
 //!
 //! The shared-cache decision lives in `$CARGO_HOME/config.toml` as the
 //! `[build] build-dir` key, where cargo (and any other tool) can read it.
-//! Policy intent (preset/linker) lives in `$CARGO_HOME/epicenter.toml`;
-//! project `epicenter.toml` files are read-only inputs.
+//! Policy intent (preset/linker) lives in the OS config path, independent of
+//! `CARGO_HOME`; project `epicenter.toml` files are read-only inputs.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -262,8 +262,9 @@ fn is_target_header(line: &str, target: &str) -> bool {
 }
 
 /// Does this `rustflags` value look like a linker setting epicenter manages?
-/// Used to migrate/remove old `--fast`/wild values instead of reporting a
-/// false conflict with the user's own flags.
+/// Used to migrate/remove values written by older releases (including the
+/// former `--fast` alias) instead of reporting a false conflict with the
+/// user's own flags.
 fn is_managed_linker_flags(value: &str) -> bool {
     let compact = value.replace([' ', '\t'], "");
     compact.contains("-fuse-ld=lld")
@@ -275,7 +276,7 @@ fn is_managed_linker_flags(value: &str) -> bool {
 
 /// Insert `rustflags = ...` into `[target.<target>]`, preserving every other
 /// line and comment. Existing `rustflags` are **never** overwritten, except
-/// literals in `stale` (written by an older `--fast`), which are migrated.
+/// literals in `stale` (written by an older release), which are migrated.
 /// The second return value reports a real conflict instead.
 fn set_target_rustflags(
     text: &mut String,
@@ -324,9 +325,9 @@ fn set_target_rustflags(
     }
 }
 
-/// Remove the `--fast` `rustflags` from `[target.<target>]` only when the
-/// value matches what `--fast` writes (or a `stale` literal from an older
-/// version). Anything else is left alone.
+/// Remove epicenter-managed linker `rustflags` from `[target.<target>]` only
+/// when the value matches what this version or an older release wrote.
+/// Anything else is left alone.
 fn remove_target_rustflags(
     text: &mut String,
     target: &str,
@@ -371,7 +372,7 @@ fn remove_target_rustflags(
     }
 }
 
-/// Enable Cargo incremental compilation in `[build]`. `--fast` only does this
+/// Enable Cargo incremental compilation in `[build]`. Setup only does this
 /// when no `rustc-wrapper` remains: wrapper caches and incremental state work
 /// against each other.
 fn set_incremental(text: &mut String, enabled: bool) -> CargoEdit {
@@ -766,8 +767,9 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
     }
 
     // Persist only the keys the user explicitly selected. The project file is
-    // never written; the global file sits next to Cargo's config.
-    let settings_path = paths::cargo_home()?.join(settings::FILE_NAME);
+    // never written; the global file lives in the OS config directory so it
+    // can be read before the effective Cargo home is known.
+    let settings_path = paths::global_config_path()?;
     let settings_existed = settings_path.is_file();
     let mut settings_text = if settings_existed {
         crate::util::read_trusted_config(&settings_path, 1024 * 1024)
@@ -855,10 +857,7 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
         cargo_before,
         cargo_after: text,
         settings_before,
-        settings_after: (opts.preset.is_some()
-            || opts.linker.is_some()
-            || opts.memory_text.is_some())
-        .then_some(settings_text),
+        settings_after: settings_changed.then_some(settings_text),
         settings_path,
     })
 }
@@ -1139,10 +1138,7 @@ pub fn revert_config() -> Result<RevertReport> {
 /// epicenter.toml. Returns one report per file that had a backup.
 pub fn revert_backups(dry_run: bool) -> Result<Vec<RevertReport>> {
     let mut out = Vec::new();
-    for path in [
-        cargo_config_path()?,
-        paths::cargo_home()?.join(settings::FILE_NAME),
-    ] {
+    for path in [cargo_config_path()?, paths::global_config_path()?] {
         let Some(backup) = latest_backup(&path)? else {
             continue;
         };
@@ -1262,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn inserts_fast_flags_into_an_existing_target_table() {
+    fn inserts_lld_flags_into_an_existing_target_table() {
         let mut src = "[build]\nbuild-dir = '/c'\n\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\n[net]\nx = 1\n".to_string();
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\", \"-C\", \"link-arg=-B/tmp/gcc-ld\"]"#;
         let (edit, conflict) =
@@ -1283,7 +1279,7 @@ mod tests {
         assert!(src.contains(literal));
     }
     #[test]
-    fn fast_flags_are_never_overwritten() {
+    fn lld_flags_are_never_overwritten() {
         let mut src =
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"custom\"]\n".to_string();
         let original = src.clone();
@@ -1297,7 +1293,7 @@ mod tests {
         assert!(conflict);
         assert_eq!(src, original, "existing flags untouched");
 
-        // Re-running --fast with the same value is a clean no-op.
+        // Re-running the same linker choice is a clean no-op.
         let mut same =
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"ours\"]\n".to_string();
         let original = same.clone();
@@ -1312,7 +1308,7 @@ mod tests {
         assert_eq!(same, original);
     }
     #[test]
-    fn removes_only_our_fast_flags() {
+    fn removes_only_our_lld_flags() {
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
         let mut src = format!(
             "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrustflags = {literal}\n\n[net]\nx = 1\n"
@@ -1341,7 +1337,7 @@ mod tests {
         assert_eq!(custom, original, "custom flags untouched");
     }
     #[test]
-    fn fast_flags_create_the_target_table_when_missing() {
+    fn lld_flags_create_the_target_table_when_missing() {
         let literal = r#"[\"-C\", \"link-arg=-fuse-ld=lld\"]"#;
         let mut src = "[build]\nbuild-dir = '/c'\n".to_string();
         let (edit, conflict) =
@@ -1549,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn without_fast_removes_the_old_msvc_lld_link_flags() {
+    fn system_removes_the_old_msvc_lld_link_flags() {
         let target = "x86_64-pc-windows-msvc";
         let old = r#"["-C", "linker=C:/rust/gcc-ld/lld-link.exe"]"#;
         let new = r#"["-C", "linker=C:/rust/bin/rust-lld.exe"]"#;

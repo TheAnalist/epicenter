@@ -4,7 +4,8 @@
 //!
 //! - project file: the nearest `epicenter.toml` walking up from the working
 //!   directory (never outside it);
-//! - global file: `$CARGO_HOME/epicenter.toml`, next to Cargo's own config;
+//! - global file: the OS config path (`$XDG_CONFIG_HOME`, Application Support
+//!   or `%APPDATA%`), independent of `CARGO_HOME`;
 //! - auto: `CI` selects the CI preset, otherwise the dev preset; memory and
 //!   cores come from the machine.
 //!
@@ -16,7 +17,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// Cargo's home-adjacent epicenter config file name.
+use crate::util::metadata_nofollow;
+
+/// Machine-level (and project-level) epicenter policy file name.
 pub const FILE_NAME: &str = "epicenter.toml";
 
 /// Conservative per-job memory footprint for the auto job cap. The measured
@@ -185,8 +188,26 @@ struct Loaded {
 
 impl Loaded {
     fn read(path: &Path) -> Result<Option<Self>> {
-        if !path.is_file() {
-            return Ok(None);
+        let meta = match metadata_nofollow(path) {
+            Ok(meta) => meta,
+            // A missing project file is normal; a missing global file means
+            // "no explicit policy", not an error.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                anyhow::bail!(
+                    "configuration path {} is a symlink/reparse or not a regular file",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", path.display()));
+            }
+        };
+        if !meta.is_file() {
+            anyhow::bail!(
+                "configuration path {} is a symlink/reparse or not a regular file",
+                path.display()
+            );
         }
         let text = crate::util::read_trusted_config(path, 1024 * 1024)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -223,8 +244,9 @@ pub fn load(cwd: &Path) -> Result<Settings> {
 impl Settings {
     /// Load the nearest project file and the global file. `cwd` is the
     /// command's working directory (`exec --cwd` uses the child's directory).
+    /// The global path is resolved without consulting `CARGO_HOME`.
     pub fn load(cwd: &Path) -> Result<Self> {
-        let global = crate::paths::cargo_home()?.join(FILE_NAME);
+        let global = crate::paths::global_config_path()?;
         Self::load_at(cwd, Some(&global))
     }
 
@@ -717,6 +739,56 @@ mod tests {
 
     fn write(path: &Path, text: &str) {
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn missing_global_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("missing.toml");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.global_path().is_none());
+    }
+
+    #[test]
+    fn non_regular_global_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global-dir");
+        std::fs::create_dir(&global).unwrap();
+        let err = Settings::load_at(dir.path(), Some(&global)).unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_symlink_is_ignored_and_global_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        write(&real, "preset = \"ci\"\n");
+        let project_link = dir.path().join(FILE_NAME);
+        symlink(&real, &project_link).unwrap();
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        assert!(
+            settings.project_path().is_none(),
+            "a symlinked project policy must not be read"
+        );
+
+        let global_link = dir.path().join("global-link.toml");
+        symlink(&real, &global_link).unwrap();
+        let err = Settings::load_at(dir.path(), Some(&global_link)).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink/reparse"), "{err:#}");
+    }
+
+    #[test]
+    fn global_config_path_is_absolute_and_named() {
+        let path = crate::paths::global_config_path().unwrap();
+        assert!(path.is_absolute(), "{} must be absolute", path.display());
+        assert_eq!(path.file_name(), Some(std::ffi::OsStr::new(FILE_NAME)));
+        assert_eq!(
+            path.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("epicenter"))
+        );
     }
 
     #[test]

@@ -227,7 +227,7 @@ fn flags_digest(host: &str) -> String {
                 }
             }
             // Target-scoped flags are part of the fingerprint too — `setup
-            // --fast` writes them, so the vault generation must follow.
+            // --linker` writes them, so the vault generation must follow.
             let target_table = format!("target.{host}");
             for key in ["rustflags", "rustdocflags", "linker"] {
                 if let Some(value) = crate::config::read_table_key(&text, &target_table, key) {

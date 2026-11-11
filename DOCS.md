@@ -19,7 +19,7 @@
 <p align="center">
     <b>Three-Tier Build State &amp; Shared Dependency Cache for Rust</b>
     <br>
-    <i>Shared build cache + durable fingerprint vault + lock-free per-job work dirs + fast linkers + honest eviction + zero rustc shims.</i>
+    <i>Shared build cache + durable fingerprint vault + lock-free per-job work dirs + explicit linker choices + honest eviction + zero rustc shims.</i>
 </p>
 
 <br>
@@ -69,8 +69,8 @@ epicenter doctor
 
 Straight-to-the-point commands for humans and AI agents:
 
-### Fast Local Compilation & Linkers
-* **You want plug-and-play shared builds with the bundled fast LLVM linker (`lld`, no extra install needed):**
+### Local Compilation & Linker Choices
+* **You want plug-and-play shared builds with the bundled LLVM linker (`lld`, no extra install needed):**
   ```bash
   epicenter setup --preset dev --linker lld
   ```
@@ -269,10 +269,15 @@ Cargo's `~/.cargo/config.toml` owns `[build] build-dir`. Epicenter's policy live
 For every setting, Epicenter resolves values in this exact order:
 1. **CLI flags** (highest priority)
 2. **Project `epicenter.toml`** (nearest file walking up from current directory; read-only, never modified by Epicenter)
-3. **Global `$CARGO_HOME/epicenter.toml`** (`~/.cargo/epicenter.toml`; updated when you pass `--preset`, `--memory`, or `--linker` to `epicenter setup`)
+3. **Global `epicenter.toml`** in the per-user OS config directory (updated when you pass `--preset`, `--memory`, `--linker`, or `--work-root` to `epicenter setup`):
+   - Linux/BSD: `${XDG_CONFIG_HOME:-$HOME/.config}/epicenter/epicenter.toml`
+   - macOS: `$HOME/Library/Application Support/epicenter/epicenter.toml`
+   - Windows: `%APPDATA%\epicenter\epicenter.toml`
 4. **`auto` defaults** (lowest priority)
 
-### The 5 Keys of `epicenter.toml`
+The old `$CARGO_HOME/epicenter.toml` is no longer read or written. `doctor` reports it as legacy and prints the move command. Make relative `store` and `work` values absolute before moving the file; the new location is their base.
+
+### The 6 Keys of `epicenter.toml`
 
 All keys are top-level (no `[section]` headers).
 
@@ -282,6 +287,7 @@ preset = "dev"                   # "auto" | "dev" | "ci"
 memory = "16GiB"                 # RAM budget for job calculation (e.g. "16GiB", "8192MiB", or 16384)
 linker = "lld"                   # "auto" | "system" | "lld" | "wild"
 store  = "~/.cargo/epicenter/store" # Path to the durable vault
+work   = "~/.cache/epicenter/work"  # Global-only job-dir root
 link   = "auto"                  # "auto" | "copy" | "link"
 ```
 
@@ -289,8 +295,9 @@ link   = "auto"                  # "auto" | "copy" | "link"
 |---|---|---|---|
 | `preset` | `"auto"`, `"dev"`, `"ci"` | `"auto"` | Controls `incremental` and `build.jobs`. See table below. |
 | `memory` | `"16GiB"`, `"8192MiB"`, or integer MiB | Physical RAM | Sets `build.jobs = min(cores, floor(memory / 2 GiB))` (minimum 1). |
-| `linker` | `"auto"`, `"system"`, `"lld"`, `"wild"` | `"auto"` | `auto` leaves flags untouched; `system` removes Epicenter linker flags; `lld`/`wild` configure fast linking. (CLI also accepts `mold` and `gold`). |
+| `linker` | `"auto"`, `"system"`, `"lld"`, `"wild"` | `"auto"` | `auto` leaves flags untouched; `system` removes Epicenter linker flags; `lld`/`wild` select a linker explicitly. (CLI also accepts `mold` and `gold`). |
 | `store` | File path string | `$CARGO_HOME/epicenter/store` | Location of the durable vault. |
+| `work` | File path string | Per-user OS cache | Local job-dir root for `exec`, `evict --work-dirs`, `status` and `doctor`. Global-only; a project cannot set it. |
 | `link` | `"auto"`, `"copy"`, `"link"` | `"auto"` | How `restore`/`exec` materialize `.rlib`/`.a` files. `auto` hard-links from a private local store (owner-only ACL on Windows) and copies from network/shared mounts (`9p`, `drvfs`, `NFS`, `SMB`, etc.) or a Windows store with a permissive DACL. `copy` never hard-links. `link` forces hard links on a trusted store but still copies from a mutable store whose Windows DACL is not owner-only (only allowed in global `epicenter.toml`, projects can only tighten to `auto` or `copy`). |
 
 ### Presets Explained (`auto`, `dev`, `ci`)
@@ -305,10 +312,13 @@ link   = "auto"                  # "auto" | "copy" | "link"
 
 | Linker Flag | OS / Target Support | Requirements |
 |---|---|---|
-| `--linker lld` (or `--fast`) | Linux, BSD, Windows MSVC | **None** — uses the `lld` already bundled inside your `rustup` toolchain. (Refused on macOS). |
+| `--linker lld` | Linux, BSD, Windows MSVC | **None** — uses the `lld` already bundled inside your `rustup` toolchain. (Refused on macOS). |
 | `--linker wild` | Linux ELF, `wasm32` | `wild` on `PATH` + `clang` (or GCC 16.1+). |
 | `--linker mold` | Linux ELF | `mold` on `PATH` + `clang`. |
 | `--linker gold` | Linux ELF | `gold` on `PATH` + `clang`. |
+
+The old `--fast`/`--without-fast` aliases were removed; use `--linker lld` or
+`--linker system` explicitly. LLD is not advertised as a speed win.
 | `--linker system` | All | Removes any linker flags managed by Epicenter. |
 | `--linker auto` | All | Leaves existing `rustflags` completely alone. |
 
@@ -426,7 +436,7 @@ epicenter store evict --work-dir agent-1 --yes
 |---|---|
 | `epicenter setup` | Configure shared build dir with `auto` preset; backs up touched config files |
 | `epicenter setup --preset auto\|dev\|ci` | Set build jobs and incremental compilation policy |
-| `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | Configure fast linker flags in global Cargo config |
+| `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | Configure linker flags in global Cargo config |
 | `epicenter setup --memory <SIZE>` | Set RAM budget (e.g. `16GiB`) for `2 GiB/job` concurrency calculation |
 | `epicenter setup --write-profile [--dev-debug full\|line\|none]` | Write recommended profile settings to workspace `Cargo.toml` (with backup) |
 | `epicenter setup --measure` | Run a calibration `cargo build` after setup to record wall time and peak RSS |

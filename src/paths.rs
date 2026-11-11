@@ -1,6 +1,9 @@
-//! Where things live: `$HOME`, `$CARGO_HOME`, and the shared cache root.
+//! Where things live: the per-user policy root, `$CARGO_HOME`, and the shared
+//! cache root.
 //!
-//! Everything epicenter touches derives from two roots:
+//! Everything epicenter touches derives from three roots:
+//! - the policy root (`$XDG_CONFIG_HOME`, Application Support or `%APPDATA%`):
+//!   the machine-level `epicenter.toml`, deliberately independent of Cargo;
 //! - Cargo's home (`$CARGO_HOME` or `~/.cargo`): global `config.toml`,
 //!   the already-shared source registry — and the shared build cache.
 //! - epicenter's own dir (`~/.epicenter`): reserved for epicenter files.
@@ -48,6 +51,57 @@ pub fn cargo_home() -> Result<PathBuf> {
         }
     }
     Ok(home()?.join(".cargo"))
+}
+
+/// The per-user directory that holds epicenter's machine-level policy.
+///
+/// This is intentionally independent of `CARGO_HOME`: the global
+/// `epicenter.toml` can set `cargo_home`, so it must be readable before the
+/// effective Cargo home is known. A relative `XDG_CONFIG_HOME`/`APPDATA` is
+/// ignored, as the XDG base-directory spec requires.
+pub fn global_config_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(base) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join("epicenter"));
+            }
+        }
+        return Ok(home()?.join("AppData").join("Roaming").join("epicenter"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(home()?
+            .join("Library")
+            .join("Application Support")
+            .join("epicenter"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join("epicenter"));
+            }
+        }
+        return Ok(home()?.join(".config").join("epicenter"));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("no supported global config directory on this platform")
+    }
+}
+
+/// The one machine-level policy file.
+pub fn global_config_path() -> Result<PathBuf> {
+    Ok(global_config_dir()?.join(crate::settings::FILE_NAME))
+}
+
+/// The pre-0.1.0 global policy location. Only the doctor uses this to print a
+/// migration hint; it is never read as policy.
+pub fn legacy_global_config_path() -> Result<PathBuf> {
+    Ok(cargo_home()?.join(crate::settings::FILE_NAME))
 }
 
 /// The `[build] build-dir` value from the **global**

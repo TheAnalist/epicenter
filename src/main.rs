@@ -95,7 +95,7 @@ struct SetupArgs {
     #[arg(long, value_enum)]
     preset: Option<PresetArg>,
     /// Toolchain linker: auto (keep what is configured), system, lld, wild, mold, gold.
-    #[arg(long, value_enum, conflicts_with_all = ["fast", "without_fast"])]
+    #[arg(long, value_enum)]
     linker: Option<LinkerArg>,
     /// External compile cache: kache, sccache, or none (remove it).
     #[arg(long, value_enum, conflicts_with_all = ["with_wrapper", "without_wrapper"])]
@@ -141,20 +141,12 @@ struct SetupArgs {
             "linker",
             "wrapper",
             "memory",
-            "fast",
-            "without_fast",
             "with_wrapper",
             "without_wrapper",
             "write_profile"
         ]
     )]
     revert: bool,
-    /// Alias for --linker lld (kept for one release).
-    #[arg(long, hide = true, conflicts_with = "without_fast")]
-    fast: bool,
-    /// Alias for --linker system (kept for one release).
-    #[arg(long, hide = true)]
-    without_fast: bool,
     /// Legacy form of --wrapper <name> (kept for one release).
     #[arg(long, hide = true, conflicts_with = "without_wrapper")]
     with_wrapper: Option<String>,
@@ -551,13 +543,7 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
     };
 
     let preset = args.preset.map(Into::into);
-    let linker = if args.fast {
-        Some(settings::LinkerChoice::Lld)
-    } else if args.without_fast {
-        Some(settings::LinkerChoice::System)
-    } else {
-        args.linker.map(Into::into)
-    };
+    let linker = args.linker.map(Into::into);
     let wrapper = match (&args.wrapper, &args.with_wrapper, args.without_wrapper) {
         (Some(WrapperArg::Kache), _, _) => Some(config::WrapperAction::Set("kache")),
         (Some(WrapperArg::Sccache), _, _) => Some(config::WrapperAction::Set("sccache")),
@@ -1823,12 +1809,17 @@ mod cli_tests {
     }
 
     #[test]
-    fn linker_flags_conflict() {
-        let err = match Cli::try_parse_from(["epicenter", "setup", "--fast", "--linker", "lld"]) {
-            Ok(_) => panic!("expected a conflict"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("cannot be used with"), "{err}");
+    fn fast_aliases_are_gone() {
+        for alias in ["--fast", "--without-fast"] {
+            let err = match Cli::try_parse_from(["epicenter", "setup", alias]) {
+                Ok(_) => panic!("{alias} must not parse"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("unexpected argument"),
+                "{alias}: {err}"
+            );
+        }
     }
 
     #[test]

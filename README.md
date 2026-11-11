@@ -134,7 +134,7 @@ hidden aliases for one release.
 |---|---|
 | `epicenter setup` | apply a preset + linker + wrapper to the **global** config; backs up every file it changes |
 | `epicenter setup --preset auto\|dev\|ci [--write-profile] [--dev-debug full\|line\|none] [--measure]` | one intent: auto (CI-aware), local dev loop, or cold CI; `--write-profile` explicitly writes recommended Cargo profile values; `--measure` runs one calibration build |
-| `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | linker policy; `auto` keeps what is configured, `--fast` is an alias for `lld`; mold/gold require Linux + clang |
+| `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | linker policy; `auto` keeps what is configured; choose lld/wild/mold/gold explicitly; mold/gold require Linux + clang |
 | `epicenter setup --wrapper kache\|sccache\|none` | external compile cache; epicenter never wraps rustc itself |
 | `epicenter setup --cache-root PATH` / `--use-default` | choose or reset the shared build dir |
 | `epicenter setup --work-root PATH` | choose the local per-VM job-dir root; same as the global-only `work` key |
@@ -253,8 +253,9 @@ parentheses still work for one release.
 
 Cargo's global config owns the build dir; `epicenter.toml` owns the policy.
 Precedence for every key: **CLI > project `epicenter.toml` > global
-`$CARGO_HOME/epicenter.toml` > auto**. The `work` key is the exception: it is
-global-only and a project file cannot set it.
+`epicenter.toml` > auto**. The global file lives in the per-user OS config
+directory, not under `CARGO_HOME`; see **Locations** below. The `work` key is
+the exception: it is global-only and a project file cannot set it.
 
 The supported keys are exactly these six; all are optional. They are
 top-level keys (no `[section]`); unknown keys are ignored (they are not errors)
@@ -288,8 +289,21 @@ Locations:
 
 - **Project file:** the nearest `epicenter.toml` walking up from the working
   directory (`exec --cwd DIR` uses `DIR`). It is read-only for epicenter.
-- **Global file:** `$CARGO_HOME/epicenter.toml` (`~/.cargo/epicenter.toml`).
-  `setup --preset`, `--linker`, and `--memory` write the explicit value here.
+- **Global file:** the per-user OS config path. It is deliberately independent
+  of `CARGO_HOME`, so a future `cargo_home` policy can be read before Cargo's
+  home is resolved. `setup --preset`, `--linker`, `--memory`, and
+  `--work-root` write the explicit value here.
+
+  | OS | Global file |
+  |---|---|
+  | Linux/BSD | `${XDG_CONFIG_HOME:-$HOME/.config}/epicenter/epicenter.toml` |
+  | macOS | `$HOME/Library/Application Support/epicenter/epicenter.toml` |
+  | Windows | `%APPDATA%\epicenter\epicenter.toml` |
+
+  `$CARGO_HOME/epicenter.toml` is the old location. It is no longer read or
+  written; `doctor` reports it and prints the move command. Moving the file
+  changes the base for relative `store` and `work` values, so make those
+  absolute before moving.
 
 Examples:
 
@@ -302,7 +316,7 @@ store = "~/.cargo/epicenter/store"
 ```
 
 ```toml
-# global $CARGO_HOME/epicenter.toml: a laptop default
+# global OS-path epicenter.toml: a laptop default
 preset = "dev"
 memory = "16GiB"
 ```
@@ -336,9 +350,8 @@ package, no `clang` needed for LLD:
     ld.lld   lld-link   ld64.lld   wasm-ld
 ```
 
-`epicenter setup --linker lld` (or `--fast`) detects that directory for the
-active host and writes one `[target.<host>] rustflags` line into
-`~/.cargo/config.toml`:
+`epicenter setup --linker lld` detects that directory for the active host and
+writes one `[target.<host>] rustflags` line into `~/.cargo/config.toml`:
 
 - **Linux / BSD (ELF)** - `-C link-arg=-fuse-ld=lld -C link-arg=-B<gcc-ld>`.
   The system C compiler stays the driver; it does not have to be clang.
@@ -349,8 +362,9 @@ active host and writes one `[target.<host>] rustflags` line into
   linker.
 
 `--linker system` removes the managed flags again (including old wild-shaped
-values); `--without-fast` is its legacy alias. Custom `rustflags` are never
-touched. The change is backed up (`config.toml.epicenter-bak`) like every
+values). The old `--fast`/`--without-fast` aliases are removed: they implied a
+speed win where none is guaranteed. Custom `rustflags` are never touched. The
+change is backed up (`config.toml.epicenter-bak`) like every
 setup edit. Enabling it changes RUSTFLAGS, so every unit re-keys once and the
 vault opens a new generation - build once, then `epicenter store harvest`.
 
@@ -419,7 +433,7 @@ place: `epicenter setup --cache-root ~/bigdisk/rust-cache` replaces the key's
 value with your path.
 
 Epicenter policy lives in `epicenter.toml` (see the exact six-key contract
-above): the nearest project file, else `$CARGO_HOME/epicenter.toml`. Cargo
+above): the nearest project file, else the per-user OS config file. Cargo
 config owns the build dir; `epicenter.toml` owns `preset`, `memory`, `linker`,
 `link`, `store` and the global-only `work` root; the vault is the `store`
 directory. `doctor` verifies both files.

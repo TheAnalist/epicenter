@@ -993,6 +993,7 @@ pub struct ProfileSummary {
     pub jobs: usize,
     pub jobs_source: String,
     pub job_cap: usize,
+    pub global_config: String,
     pub store: String,
     pub project: Option<String>,
     pub dev: ProfileValues,
@@ -1020,6 +1021,7 @@ impl ProfileSummary {
             "jobs": self.jobs,
             "jobs_source": self.jobs_source,
             "job_cap": self.job_cap,
+            "global_config": self.global_config,
             "store": self.store,
             "project": self.project,
             "dev": {
@@ -1083,6 +1085,7 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
         jobs,
         jobs_source,
         job_cap,
+        global_config: crate::paths::global_config_path()?.display().to_string(),
         store: store.display().to_string(),
         project: project.map(|path| path.display().to_string()),
         dev,
@@ -1097,6 +1100,53 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
 pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)> {
     let profile = profile(settings)?;
     let mut checks = Vec::new();
+    let global_path = crate::paths::global_config_path()?;
+    checks.push(check(
+        SEC_CONFIG,
+        if settings.global_path().is_some() {
+            Level::Info
+        } else {
+            Level::Warn
+        },
+        if settings.global_path().is_some() {
+            format!("global policy: {}", global_path.display())
+        } else {
+            format!(
+                "no global policy at {} — defaults apply; run `epicenter setup` to persist intent",
+                global_path.display()
+            )
+        },
+    ));
+    // The old location is never read as policy. Keep the hint concrete so a
+    // user can move the file without guessing the new OS path.
+    if let Ok(legacy) = crate::paths::legacy_global_config_path() {
+        if legacy != global_path && legacy.exists() {
+            let parent = global_path.parent().unwrap_or_else(|| Path::new("."));
+            let move_hint = if cfg!(windows) {
+                format!(
+                    "mkdir \"{}\" && move \"{}\" \"{}\"",
+                    parent.display(),
+                    legacy.display(),
+                    global_path.display()
+                )
+            } else {
+                format!(
+                    "mkdir -p '{}' && mv -n '{}' '{}'",
+                    parent.display(),
+                    legacy.display(),
+                    global_path.display()
+                )
+            };
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!(
+                    "legacy global policy {} is no longer read; make relative `store`/`work` absolute, then move it: {move_hint}",
+                    legacy.display()
+                ),
+            ));
+        }
+    }
     let memory_label = if profile.memory_source == "auto" {
         "physical memory"
     } else {

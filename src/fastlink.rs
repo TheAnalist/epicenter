@@ -1,11 +1,11 @@
-//! Zero-install fast linker.
+//! Zero-install LLD linker setup.
 //!
 //! rustup ships LLVM's linkers inside every toolchain, next to the target's
 //! std: `<sysroot>/lib/rustlib/<host>/bin/gcc-ld/` contains `ld.lld`
 //! (ELF), `lld-link` (COFF/MSVC) and the Apple/WebAssembly variants. No
 //! `mold`, no `lld` package, no `clang` needed.
 //!
-//! `epicenter setup --fast` wires that directory into Cargo:
+//! `epicenter setup --linker lld` wires that directory into Cargo:
 //!
 //! - GNU/ELF hosts keep the system C compiler as the linker *driver* and pass
 //!   `-C link-arg=-fuse-ld=lld -C link-arg=-B<gcc-ld>` — a flag GCC and Clang
@@ -15,8 +15,8 @@
 //!   that name and appends `-flavor link`; `gcc-ld/lld-link.exe` is already
 //!   the COFF driver and rejects that flag.
 //!
-//! Apple's `ld64.lld` is not a drop-in for the system linker, so `--fast`
-//! refuses macOS instead of producing fragile builds.
+//! Apple's `ld64.lld` is not a drop-in for the system linker, so
+//! `--linker lld` refuses macOS instead of producing fragile builds.
 
 use std::path::{Path, PathBuf};
 
@@ -356,7 +356,7 @@ fn parse_compiler_version(text: &str) -> Option<(u32, u32)> {
 pub fn locate(sysroot: &Path, host: &str) -> Result<FastLinker> {
     if host.contains("apple-darwin") {
         bail!(
-            "--fast supports ELF and COFF hosts; lld is not a drop-in for Apple's ld64 — \
+            "--linker lld supports ELF and COFF hosts; lld is not a drop-in for Apple's ld64 — \
              leave the default Apple linker in place"
         );
     }
@@ -378,7 +378,9 @@ pub fn locate(sysroot: &Path, host: &str) -> Result<FastLinker> {
     {
         (Flavor::Gnu, &lld_dir, &["ld.lld", "ld.lld.exe"])
     } else {
-        bail!("--fast is not supported on host {host} (supported: Linux/BSD ELF and Windows)");
+        bail!(
+            "--linker lld is not supported on host {host} (supported: Linux/BSD ELF and Windows)"
+        );
     };
     let linker = names
         .iter()
