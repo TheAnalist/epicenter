@@ -994,6 +994,8 @@ pub struct ProfileSummary {
     pub jobs_source: String,
     pub job_cap: usize,
     pub global_config: String,
+    pub cargo_home: String,
+    pub cargo_home_source: String,
     pub store: String,
     pub project: Option<String>,
     pub dev: ProfileValues,
@@ -1022,6 +1024,8 @@ impl ProfileSummary {
             "jobs_source": self.jobs_source,
             "job_cap": self.job_cap,
             "global_config": self.global_config,
+            "cargo_home": self.cargo_home,
+            "cargo_home_source": self.cargo_home_source,
             "store": self.store,
             "project": self.project,
             "dev": {
@@ -1056,6 +1060,7 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
     let job_cap = settings::job_cap(cores, memory);
     let (jobs, jobs_source) = effective_jobs(cores, job_cap);
     let (link, link_source) = settings.link()?;
+    let (cargo_home, cargo_home_source) = settings.cargo_home()?;
     let (active_linker, _) = active_linker();
     let wrapper = crate::config::cargo_configured("rustc-wrapper")?;
     let build_root = crate::config::cache_root().ok();
@@ -1086,6 +1091,8 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
         jobs_source,
         job_cap,
         global_config: crate::paths::global_config_path()?.display().to_string(),
+        cargo_home: cargo_home.display().to_string(),
+        cargo_home_source: cargo_home_source.as_str().to_string(),
         store: store.display().to_string(),
         project: project.map(|path| path.display().to_string()),
         dev,
@@ -1145,6 +1152,147 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
                     legacy.display()
                 ),
             ));
+        }
+    }
+    let (cargo_home, cargo_home_source) = settings.cargo_home()?;
+    checks.push(check(
+        SEC_CONFIG,
+        Level::Info,
+        format!(
+            "cargo home: {} ({})",
+            cargo_home.display(),
+            cargo_home_source.as_str()
+        ),
+    ));
+    if cargo_home_source == settings::Source::Global {
+        match metadata_nofollow(&cargo_home) {
+            Ok(meta) if meta.is_dir() => {
+                match crate::util::validate_private_dir(&cargo_home, "cargo home") {
+                    Ok(()) => checks.push(check(
+                        SEC_CONFIG,
+                        Level::Pass,
+                        format!(
+                            "cargo home is private and writable: {}",
+                            cargo_home.display()
+                        ),
+                    )),
+                    Err(err) => checks.push(check(
+                        SEC_CONFIG,
+                        Level::Fail,
+                        format!("cargo home {}: {err:#}", cargo_home.display()),
+                    )),
+                }
+            }
+            Ok(_) => checks.push(check(
+                SEC_CONFIG,
+                Level::Fail,
+                format!(
+                    "configured cargo home {} is not a directory",
+                    cargo_home.display()
+                ),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!(
+                    "configured cargo home {} is missing — run `epicenter setup --cargo-home {}`",
+                    cargo_home.display(),
+                    cargo_home.display()
+                ),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => checks.push(check(
+                SEC_CONFIG,
+                Level::Fail,
+                format!(
+                    "configured cargo home {} is a symlink/reparse point",
+                    cargo_home.display()
+                ),
+            )),
+            Err(err) => checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!(
+                    "could not inspect cargo home {}: {err}",
+                    cargo_home.display()
+                ),
+            )),
+        }
+        if let Some(shell) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+            let shell = PathBuf::from(shell);
+            if shell != cargo_home {
+                checks.push(check(
+                    SEC_CONFIG,
+                    Level::Warn,
+                    format!(
+                        "shell CARGO_HOME {} differs from the configured {} — raw `cargo` will miss remote units",
+                        shell.display(),
+                        cargo_home.display()
+                    ),
+                ));
+            }
+        }
+    }
+    match crate::config::cargo_config_path() {
+        Ok(config) => checks.push(check(
+            SEC_CONFIG,
+            if config.is_file() {
+                Level::Pass
+            } else {
+                Level::Warn
+            },
+            format!(
+                "cargo config: {}{}",
+                config.display(),
+                if config.is_file() {
+                    ""
+                } else {
+                    " (missing — run `epicenter setup`)"
+                }
+            ),
+        )),
+        Err(err) => checks.push(check(
+            SEC_CONFIG,
+            Level::Warn,
+            format!("could not resolve Cargo's global config: {err:#}"),
+        )),
+    }
+    let registry = cargo_home.join("registry");
+    checks.push(check(
+        SEC_CONFIG,
+        if registry.is_dir() {
+            Level::Info
+        } else {
+            Level::Warn
+        },
+        format!(
+            "cargo registry: {}{}",
+            registry.display(),
+            if registry.is_dir() {
+                ""
+            } else {
+                " (missing — the first build fetches it)"
+            }
+        ),
+    ));
+    if let Ok(state) = paths::state_dir() {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("epicenter state: {}", state.display()),
+        ));
+        if let Ok(legacy_home) = paths::ambient_cargo_home() {
+            let legacy = legacy_home.join("epicenter");
+            if legacy.join("manifest.ed25519").is_file() || legacy.join("manifest.key").is_file() {
+                checks.push(check(
+                    SEC_CONFIG,
+                    Level::Warn,
+                    format!(
+                        "legacy vault keys in {} — move them to {} to keep the writer identity stable",
+                        legacy.display(),
+                        state.display()
+                    ),
+                ));
+            }
         }
     }
     let memory_label = if profile.memory_source == "auto" {
@@ -1368,12 +1516,22 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
 }
 
 fn read_last_build() -> Option<String> {
-    let path = crate::paths::cargo_home()
-        .ok()?
-        .join("epicenter")
-        .join("last-build.json");
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let state = crate::paths::state_dir().ok()?.join("last-build.json");
+    let path = if state.is_file() {
+        state
+    } else {
+        let legacy = crate::paths::ambient_cargo_home()
+            .ok()?
+            .join("epicenter")
+            .join("last-build.json");
+        if legacy.is_file() {
+            legacy
+        } else {
+            return None;
+        }
+    };
+    let text = crate::util::read_small_text(&path, 1024 * 1024).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let command = value.get("command")?.as_str()?;
     let seconds = value.get("elapsed_secs")?.as_f64()?;
     let rss = value.get("peak_rss_bytes")?.as_u64()?;

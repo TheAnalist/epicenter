@@ -15,6 +15,7 @@
 //! WSL (ext4) and native Windows (NTFS).
 
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 
@@ -41,16 +42,82 @@ pub fn home() -> Result<PathBuf> {
         .with_context(|| "could not determine the user home directory")
 }
 
-/// Cargo's home dir: `$CARGO_HOME`, or `~/.cargo`. Holds the global
-/// `config.toml`, the already-shared source cache (`registry/`) — and,
-/// and the shared build cache.
+/// Process-wide effective Cargo home, installed once the policy is loaded.
+static CARGO_HOME_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn cargo_home_override() -> &'static RwLock<Option<PathBuf>> {
+    CARGO_HOME_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the resolved effective Cargo home for this process. `None` restores
+/// the shell/default `CARGO_HOME` fallback.
+pub fn set_cargo_home_override(path: Option<PathBuf>) {
+    let mut guard = cargo_home_override()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = path;
+}
+
+/// Cargo's home dir: the effective policy override when installed, otherwise
+/// `$CARGO_HOME` or `~/.cargo`.
 pub fn cargo_home() -> Result<PathBuf> {
+    {
+        let guard = cargo_home_override()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(path) = guard.as_ref() {
+            return Ok(path.clone());
+        }
+    }
+    ambient_cargo_home()
+}
+
+/// The shell/default Cargo home, ignoring the epicenter `cargo_home` policy.
+/// This is the fallback for the global policy value and for legacy state
+/// migration; internal callers normally want [`cargo_home`].
+pub fn ambient_cargo_home() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CARGO_HOME") {
         if !dir.is_empty() {
             return Ok(PathBuf::from(dir));
         }
     }
     Ok(home()?.join(".cargo"))
+}
+
+/// Per-user state (vault keys, last-build diagnostics), independent of both
+/// `CARGO_HOME` and the policy config path.
+pub fn state_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join("epicenter"));
+            }
+        }
+        return Ok(home()?.join("AppData").join("Local").join("epicenter"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(home()?
+            .join("Library")
+            .join("Application Support")
+            .join("epicenter"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(base) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join("epicenter"));
+            }
+        }
+        return Ok(home()?.join(".local").join("state").join("epicenter"));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("no supported state directory on this platform")
+    }
 }
 
 /// The per-user directory that holds epicenter's machine-level policy.
@@ -99,9 +166,10 @@ pub fn global_config_path() -> Result<PathBuf> {
 }
 
 /// The pre-0.1.0 global policy location. Only the doctor uses this to print a
-/// migration hint; it is never read as policy.
+/// migration hint; it is never read as policy. Always uses the ambient
+/// `CARGO_HOME`, not the configured `cargo_home`.
 pub fn legacy_global_config_path() -> Result<PathBuf> {
-    Ok(cargo_home()?.join(crate::settings::FILE_NAME))
+    Ok(ambient_cargo_home()?.join(crate::settings::FILE_NAME))
 }
 
 /// The `[build] build-dir` value from the **global**
@@ -242,5 +310,12 @@ mod tests {
     #[test]
     fn unknown_template_tokens_are_rejected() {
         assert!(resolve_template("{workspace-root}/build").is_err());
+    }
+
+    #[test]
+    fn state_dir_is_absolute_and_named() {
+        let state = state_dir().unwrap();
+        assert!(state.is_absolute(), "{} must be absolute", state.display());
+        assert_eq!(state.file_name(), Some(std::ffi::OsStr::new("epicenter")));
     }
 }

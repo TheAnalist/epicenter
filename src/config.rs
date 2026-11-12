@@ -64,7 +64,7 @@ pub fn cargo_config_path() -> Result<PathBuf> {
             }
             if !crate::util::owned_by_us(&cargo_home, &meta) {
                 anyhow::bail!(
-                    "CARGO_HOME {} is owned by another user",
+                    "CARGO_HOME {} is owned by an untrusted principal",
                     cargo_home.display()
                 );
             }
@@ -78,6 +78,13 @@ pub fn cargo_config_path() -> Result<PathBuf> {
                         meta.mode() & 0o777
                     );
                 }
+            }
+            #[cfg(windows)]
+            if crate::util::windows_acl_is_private(&cargo_home) != Some(true) {
+                anyhow::bail!(
+                    "CARGO_HOME {} DACL grants write access to an untrusted principal",
+                    cargo_home.display()
+                );
             }
         }
         // A missing CARGO_HOME is allowed here: setup creates it. The caller
@@ -105,7 +112,7 @@ pub fn cargo_config_path() -> Result<PathBuf> {
             }
             if !crate::util::owned_by_us(&path, &meta) {
                 anyhow::bail!(
-                    "global cargo config {} is owned by another user",
+                    "global cargo config {} is owned by an untrusted principal",
                     path.display()
                 );
             }
@@ -119,6 +126,13 @@ pub fn cargo_config_path() -> Result<PathBuf> {
                         meta.mode() & 0o777
                     );
                 }
+            }
+            #[cfg(windows)]
+            if crate::util::windows_acl_is_private(&path) != Some(true) {
+                anyhow::bail!(
+                    "global cargo config {} DACL grants write access to an untrusted principal",
+                    path.display()
+                );
             }
         }
         // No global cargo config yet; the caller returns the path it would
@@ -534,6 +548,9 @@ pub struct PolicyReport {
     pub linker: LinkerChoice,
     pub linker_source: Source,
     pub wrapper: Option<String>,
+    /// Effective Cargo home and where it came from.
+    pub cargo_home: PathBuf,
+    pub cargo_home_source: Source,
     pub store: Option<PathBuf>,
     pub work_root: PathBuf,
     pub work_root_source: Source,
@@ -562,6 +579,14 @@ pub enum WrapperAction<'a> {
     Remove,
 }
 
+/// What `--cargo-home` asked for. `Keep` leaves the policy file untouched.
+#[derive(Debug, Clone, Copy)]
+pub enum CargoHomeAction<'a> {
+    Keep,
+    Set(&'a Path),
+    Clear,
+}
+
 /// Inputs that come from the CLI; file values are layered underneath.
 pub struct SetupOptions<'a> {
     pub root_arg: Option<&'a str>,
@@ -573,6 +598,7 @@ pub struct SetupOptions<'a> {
     pub memory: Option<u64>,
     pub memory_text: Option<&'a str>,
     pub work_root_arg: Option<&'a str>,
+    pub cargo_home: CargoHomeAction<'a>,
     pub dry_run: bool,
 }
 
@@ -629,6 +655,18 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
         Some(bytes) => (Some(bytes), Source::Cli),
         None => settings.memory_bytes(),
     };
+    let (cargo_home, cargo_home_source) = match opts.cargo_home {
+        CargoHomeAction::Set(path) => (path.to_path_buf(), Source::Cli),
+        CargoHomeAction::Clear => (paths::ambient_cargo_home()?, Source::Cli),
+        CargoHomeAction::Keep => settings.cargo_home()?,
+    };
+    // Make the Cargo config and the default {cargo-cache-home} template use
+    // the effective home even when this function is called directly.
+    match opts.cargo_home {
+        CargoHomeAction::Set(path) => paths::set_cargo_home_override(Some(path.to_path_buf())),
+        CargoHomeAction::Clear => paths::set_cargo_home_override(None),
+        CargoHomeAction::Keep => {}
+    }
     let cores = settings::available_cores();
     let jobs = settings::job_cap(cores, memory);
     let store = settings.store()?.map(|(path, _)| path);
@@ -811,6 +849,19 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
             );
         }
     }
+    match opts.cargo_home {
+        CargoHomeAction::Keep => {}
+        CargoHomeAction::Set(path) => {
+            settings_changed |= set_top_key(
+                &mut settings_text,
+                "cargo_home",
+                &toml_string(&path.to_string_lossy()),
+            );
+        }
+        CargoHomeAction::Clear => {
+            settings_changed |= remove_top_key(&mut settings_text, "cargo_home");
+        }
+    }
     let mut settings_backup = None;
     if settings_changed && !opts.dry_run {
         if let Some(parent) = settings_path.parent() {
@@ -837,6 +888,8 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
         linker,
         linker_source,
         wrapper: wrapper.clone(),
+        cargo_home,
+        cargo_home_source,
         store,
         work_root,
         work_root_source,

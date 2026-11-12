@@ -311,6 +311,9 @@ pub struct Options<'a> {
     pub incremental: Option<bool>,
     /// How dependencies are installed into the job dir.
     pub link: LinkPolicy,
+    /// Global `cargo_home` policy; `None` leaves the child's environment
+    /// untouched.
+    pub cargo_home: Option<&'a Path>,
     /// The command, argv-style.
     pub command: &'a [String],
 }
@@ -436,6 +439,9 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let Some(program) = opts.command.first() else {
         bail!("exec needs a command — `epicenter exec -- <cmd>`");
     };
+    if let Some(cargo_home) = opts.cargo_home {
+        crate::util::validate_private_dir(cargo_home, "cargo home")?;
+    }
     let job_id = match opts.job_id {
         Some(id) => sanitize_job_id(id)?,
         None => default_job_id(),
@@ -589,6 +595,13 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         "  {} CARGO_BUILD_BUILD_DIR (this job only; no config change)",
         util::dim(&format!("{:<11}", "build-dir"))
     );
+    if let Some(cargo_home) = opts.cargo_home {
+        eprintln!(
+            "  {} {} (global cargo_home policy)",
+            util::dim(&format!("{:<11}", "cargo home")),
+            cargo_home.display()
+        );
+    }
     if let (Some(layout), Some(version)) = (layout, cargo_version.as_deref()) {
         eprintln!(
             "  {} {} · {}",
@@ -613,6 +626,9 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let mut child = crate::util::command_for(program)?;
     child.args(&opts.command[1..]);
     child.env("CARGO_BUILD_BUILD_DIR", &work_dir);
+    if let Some(cargo_home) = opts.cargo_home {
+        child.env("CARGO_HOME", cargo_home);
+    }
     if let Some(target) = &target_dir {
         child.env("CARGO_TARGET_DIR", target);
     }
@@ -622,12 +638,16 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     if let Some(dir) = &opts.cwd {
         child.current_dir(dir);
     }
+    let mut child = child
+        .spawn()
+        .with_context(|| format!("cannot run `{program}` — is it installed and on PATH?"))?;
+    let memory = ChildMemory::start(&child);
     let status = child
-        .status()
+        .wait()
         .with_context(|| format!("cannot run `{program}` — is it installed and on PATH?"))?;
     let elapsed = started.elapsed();
     let code = exit_code(&status);
-    record_build(&opts.command, elapsed);
+    record_build(opts.command, elapsed, memory.finish());
 
     let harvested = if opts.harvest_back {
         Some(vault::harvest_with(
@@ -704,46 +724,299 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     Ok(code)
 }
 
-/// Signals use the shell convention: 128 + signal number.
-/// Record the last job's wall time and peak child RSS for `doctor`.
-/// Unix-only; Windows has no cheap equivalent for the whole child tree.
-pub fn record_build(command: &[String], elapsed: std::time::Duration) {
-    #[cfg(unix)]
-    {
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
-            return;
+/// Samples the resident set of a child's whole process tree while it runs.
+///
+/// Unix gets this after the fact from `RUSAGE_CHILDREN`. Windows has no
+/// equivalent: once the child is reaped its memory counters are gone, so the
+/// tree has to be observed while it is alive. The child is placed in a Job
+/// object; the sampler then asks that job for its own member PIDs, never the
+/// machine's process list. Start it immediately after `spawn`, keep it alive
+/// across `wait`, then call [`finish`](Self::finish).
+pub struct ChildMemory {
+    #[cfg(windows)]
+    sampler: Option<win_rss::Sampler>,
+}
+
+impl ChildMemory {
+    pub fn start(child: &std::process::Child) -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                sampler: win_rss::Sampler::start(child.id()),
+            }
         }
-        let rss_bytes = if cfg!(target_os = "macos") {
-            usage.ru_maxrss as u64
-        } else {
-            usage.ru_maxrss as u64 * 1024
-        };
-        let Ok(home) = crate::paths::cargo_home() else {
-            return;
-        };
-        let path = home.join("epicenter").join("last-build.json");
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if crate::util::create_private_dir_all(parent).is_err() {
-            return;
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Self {}
         }
-        let payload = serde_json::json!({
-            "command": command.join(" "),
-            "elapsed_secs": elapsed.as_secs_f64(),
-            "peak_rss_bytes": rss_bytes,
-            "at_unix": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0),
-        });
-        if let Ok(text) = serde_json::to_string(&payload) {
-            let _ = crate::util::write_atomic_private(&path, text.as_bytes());
+    }
+
+    /// Peak RSS in bytes, or `None` when the tree was too short-lived to
+    /// observe (or the platform has no sampler).
+    pub fn finish(self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            self.sampler?.finish()
+        }
+        #[cfg(not(windows))]
+        {
+            None
         }
     }
 }
 
+#[cfg(windows)]
+mod win_rss {
+    use std::ffi::c_void;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        PROCESS_VM_READ,
+    };
+
+    /// Frequent enough to catch cargo's short rustc invocations, cheap enough
+    /// to disappear next to a build.
+    const SAMPLE_EVERY: Duration = Duration::from_millis(100);
+
+    /// Concurrent build processes are bounded by Cargo's jobserver; 1024
+    /// leaves a wide margin while keeping the query buffer on the stack.
+    const MAX_JOB_PROCESSES: usize = 1024;
+
+    /// `JOBOBJECT_BASIC_PROCESS_ID_LIST` with room for more than one PID.
+    /// Win32 declares `ProcessIdList[1]`; callers pass a larger trailing
+    /// array and the matching buffer size.
+    #[repr(C)]
+    struct ProcessIdList {
+        _assigned: u32,
+        listed: u32,
+        ids: [usize; MAX_JOB_PROCESSES],
+    }
+
+    /// Owns the job handle. Closing it does not terminate members because no
+    /// kill-on-close limit is set.
+    struct Job(HANDLE);
+
+    // A kernel handle is process-wide and safe to use from another thread.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        fn create(process_id: u32) -> Option<Self> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let job = Self(handle);
+            // Explicit breakaway stays allowed: epicenter observes the build,
+            // it does not sandbox it. A tool that asks to leave is simply not
+            // counted, rather than failing to launch.
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&limits).cast::<c_void>(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            } != 0;
+            if !configured {
+                return None;
+            }
+            let process =
+                unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, process_id) };
+            if process.is_null() {
+                return None;
+            }
+            let assigned = unsafe { AssignProcessToJobObject(job.0, process) } != 0;
+            unsafe { CloseHandle(process) };
+            assigned.then_some(job)
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub struct Sampler {
+        stop: Option<mpsc::Sender<()>>,
+        worker: Option<JoinHandle<u64>>,
+    }
+
+    impl Sampler {
+        pub fn start(root_pid: u32) -> Option<Self> {
+            let job = Job::create(root_pid)?;
+            let (stop, stopped) = mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("epicenter-rss".into())
+                .spawn(move || sample_loop(job, &stopped))
+                .ok()?;
+            Some(Self {
+                stop: Some(stop),
+                worker: Some(worker),
+            })
+        }
+
+        pub fn finish(mut self) -> Option<u64> {
+            self.stop.take();
+            let peak = self.worker.take()?.join().ok()?;
+            (peak > 0).then_some(peak)
+        }
+    }
+
+    impl Drop for Sampler {
+        fn drop(&mut self) {
+            self.stop.take();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn sample_loop(job: Job, stop: &mpsc::Receiver<()>) -> u64 {
+        let mut peak = 0u64;
+        loop {
+            peak = peak.max(job_rss(job.0));
+            match stop.recv_timeout(SAMPLE_EVERY) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return peak,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    /// Fill `list` with the job's current members and return how many IDs
+    /// were written.
+    fn job_pids(job: HANDLE, list: &mut ProcessIdList) -> Option<usize> {
+        let mut returned = 0u32;
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicProcessIdList,
+                std::ptr::from_mut(list).cast::<c_void>(),
+                std::mem::size_of::<ProcessIdList>() as u32,
+                &mut returned,
+            )
+        };
+        (ok != 0).then(|| (list.listed as usize).min(MAX_JOB_PROCESSES))
+    }
+
+    /// Sum the working sets of the job's current members. The job contains
+    /// only epicenter's child and its descendants — no machine-wide scan.
+    fn job_rss(job: HANDLE) -> u64 {
+        let mut list: ProcessIdList = unsafe { std::mem::zeroed() };
+        let Some(count) = job_pids(job, &mut list) else {
+            return 0;
+        };
+        list.ids[..count]
+            .iter()
+            .filter_map(|&pid| working_set(pid as u32))
+            .sum()
+    }
+
+    fn working_set(pid: u32) -> Option<u64> {
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) } != 0;
+        unsafe { CloseHandle(handle) };
+        ok.then_some(counters.WorkingSetSize as u64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn job_lists_the_child_and_its_descendants() -> std::io::Result<()> {
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+                .spawn()?;
+            let job = Job::create(child.id()).expect("assigning the child to a job");
+            let mut count = 0;
+            for _ in 0..10 {
+                let mut list: ProcessIdList = unsafe { std::mem::zeroed() };
+                count = job_pids(job.0, &mut list).unwrap_or(0);
+                if count >= 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let status = child.wait()?;
+            assert!(status.success());
+            assert!(count >= 2, "job members: {count}");
+            Ok(())
+        }
+    }
+}
+
+/// Record the last job's wall time and peak child RSS for `doctor`.
+pub fn record_build(command: &[String], elapsed: std::time::Duration, sampled_rss: Option<u64>) {
+    // Windows must sample while the child is alive; Unix keeps its original
+    // post-wait `RUSAGE_CHILDREN` accounting when no sample was supplied.
+    #[cfg(unix)]
+    let rss_bytes = sampled_rss.or_else(unix_peak_rss);
+    #[cfg(not(unix))]
+    let rss_bytes = sampled_rss;
+    let Some(rss_bytes) = rss_bytes else {
+        return;
+    };
+    let Ok(state) = crate::paths::state_dir() else {
+        return;
+    };
+    let path = state.join("last-build.json");
+    if crate::util::create_private_dir_all(&state).is_err() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "command": command.join(" "),
+        "elapsed_secs": elapsed.as_secs_f64(),
+        "peak_rss_bytes": rss_bytes,
+        "at_unix": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    });
+    if let Ok(text) = serde_json::to_string(&payload) {
+        let _ = crate::util::write_atomic_private(&path, text.as_bytes());
+    }
+}
+
+/// Peak RSS of all waited-for children: `RUSAGE_CHILDREN` includes waited-for
+/// descendants, so it covers Cargo and every `rustc`/linker it ran.
+///
+/// `ru_maxrss` is bytes on macOS and KiB on the other Unixes.
+#[cfg(unix)]
+fn unix_peak_rss() -> Option<u64> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+        return None;
+    }
+    Some(if cfg!(target_os = "macos") {
+        usage.ru_maxrss as u64
+    } else {
+        usage.ru_maxrss as u64 * 1024
+    })
+}
+
+/// Signals use the shell convention: 128 + signal number.
 fn exit_code(status: &ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -900,6 +1173,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         let code = run(store.path(), work.path(), &opts)?;
@@ -910,6 +1184,37 @@ mod tests {
                 .is_file(),
             "the vault seeded the job"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_sets_the_configured_cargo_home_in_the_child() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let cargo = tempfile::tempdir()?;
+        fs::set_permissions(cargo.path(), fs::Permissions::from_mode(0o700))?;
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test \"$CARGO_HOME\" = '{}'", cargo.path().display()),
+        ];
+        let opts = Options {
+            job_id: Some("cargo-home"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: Some(cargo.path()),
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
         Ok(())
     }
 
@@ -936,6 +1241,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -985,6 +1291,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1011,6 +1318,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &bad,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 1);
@@ -1035,6 +1343,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &kept,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1087,6 +1396,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1130,6 +1440,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1168,6 +1479,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &cmd,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1215,6 +1527,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1227,6 +1540,23 @@ mod tests {
         };
         let err = run(store.path(), work.path(), &reuse).unwrap_err();
         assert!(err.to_string().contains("missing .epicenter-job"), "{err}");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_memory_sampler_sees_the_child_tree() -> Result<()> {
+        // cmd spawns ping, so this also exercises job membership across
+        // descendants. ping keeps both alive for about a second — several
+        // sample ticks.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()?;
+        let memory = ChildMemory::start(&child);
+        let status = child.wait()?;
+        let peak = memory.finish();
+        assert!(status.success());
+        assert!(peak.is_some(), "no working set sampled for the child tree");
         Ok(())
     }
 
@@ -1266,6 +1596,7 @@ mod tests {
             target_dir: Some("job"),
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);

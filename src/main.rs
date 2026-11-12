@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use epicenter_cli::{config, doctor, exec, profile, prune, settings, status, util, vault};
+use epicenter_cli::{config, doctor, exec, paths, profile, prune, settings, status, util, vault};
 
 #[derive(Parser)]
 #[command(
@@ -116,6 +116,11 @@ struct SetupArgs {
     /// `default` clears the override.
     #[arg(long, value_name = "PATH")]
     work_root: Option<String>,
+    /// Global machine-level CARGO_HOME used by `exec`. Must be absolute and
+    /// identical on every machine/VM that shares remote units; `default`
+    /// clears the override.
+    #[arg(long, value_name = "PATH")]
+    cargo_home: Option<String>,
     /// Print the effective policy and the exact config diff; write nothing.
     #[arg(long)]
     dry_run: bool,
@@ -137,6 +142,7 @@ struct SetupArgs {
             "cache_root",
             "use_default",
             "work_root",
+            "cargo_home",
             "preset",
             "linker",
             "wrapper",
@@ -419,6 +425,10 @@ fn run() -> Result<()> {
         _ => std::env::current_dir()?,
     };
     let settings = settings::load(&cwd)?;
+    match settings.cargo_home()? {
+        (path, settings::Source::Global) => paths::set_cargo_home_override(Some(path)),
+        _ => paths::set_cargo_home_override(None),
+    }
     if let Some((store, _)) = settings.store()? {
         vault::set_store_override(store)?;
     }
@@ -569,6 +579,28 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         .as_deref()
         .map(settings::parse_memory)
         .transpose()?;
+    let cargo_home_path: Option<PathBuf> = match args.cargo_home.as_deref() {
+        Some("default") => {
+            paths::set_cargo_home_override(None);
+            None
+        }
+        Some(raw) => {
+            let path = settings::resolve_cargo_home(raw)?;
+            settings::prepare_cargo_home(&path, args.dry_run)?;
+            paths::set_cargo_home_override(Some(path.clone()));
+            Some(path)
+        }
+        None => None,
+    };
+    let cargo_home_action = match args.cargo_home.as_deref() {
+        Some("default") => config::CargoHomeAction::Clear,
+        Some(_) => config::CargoHomeAction::Set(
+            cargo_home_path
+                .as_deref()
+                .expect("cargo home path is resolved"),
+        ),
+        None => config::CargoHomeAction::Keep,
+    };
     let opts = config::SetupOptions {
         root_arg: args.cache_root.as_deref(),
         use_default: args.use_default,
@@ -578,6 +610,7 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         memory,
         memory_text: args.memory.as_deref(),
         work_root_arg: args.work_root.as_deref(),
+        cargo_home: cargo_home_action,
         dry_run: args.dry_run,
     };
     let report = config::setup(&opts, settings)?;
@@ -806,13 +839,15 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
             println!();
             println!("{}", util::heading("calibration build — cargo build"));
             let started = Instant::now();
-            let status = util::command_for("cargo")?
+            let mut child = util::command_for("cargo")?
                 .arg("build")
-                .status()
+                .spawn()
                 .context("running calibration build")?;
+            let memory = exec::ChildMemory::start(&child);
+            let status = child.wait().context("running calibration build")?;
             let elapsed = started.elapsed();
             let command = ["cargo".to_string(), "build".to_string()];
-            exec::record_build(&command, elapsed);
+            exec::record_build(&command, elapsed, memory.finish());
             println!(
                 "  {} cargo build · {:.2}s",
                 util::green(util::GLYPH_PASS),
@@ -902,6 +937,12 @@ fn print_policy(policy: &config::PolicyReport) {
         label("linker"),
         policy.linker.as_str(),
         policy.linker_source.as_str()
+    );
+    println!(
+        "  {} {} ({})",
+        label("cargo home"),
+        policy.cargo_home.display(),
+        policy.cargo_home_source.as_str()
     );
     println!(
         "  {} {}",
@@ -1265,6 +1306,10 @@ fn cmd_exec(
     command: &[String],
 ) -> Result<()> {
     let root = config::cache_root()?;
+    let cargo_home = match settings.cargo_home()? {
+        (path, settings::Source::Global) => Some(path),
+        _ => None,
+    };
     let work_root = match work_root {
         Some(path) => {
             if path
@@ -1300,6 +1345,7 @@ fn cmd_exec(
         target_dir,
         incremental: exec_incremental(settings),
         link: settings.link()?.0,
+        cargo_home: cargo_home.as_deref(),
         command,
     };
     let code = exec::run(&vault::store_root(&root), &work_root, &opts)?;

@@ -299,11 +299,15 @@ pub fn euid() -> u32 {
     0
 }
 
-/// Is this file owned by the current effective user?
+/// Is this file owned by the current effective user, or by a trusted Windows
+/// system principal?
 ///
 /// Unix checks the uid from the already-open metadata. Windows has no uid;
-/// inspect the file's owner SID against the current process token. This is
-/// the path-aware check that closes the "owned_by_us is always true" gap.
+/// inspect the file's owner SID against the current process token. An owner
+/// of `Administrators` or `SYSTEM` is trusted: those principals can already
+/// modify the file, and a user profile `.cargo` created by an elevated
+/// installer is commonly admin-owned while granting the user write access.
+/// Callers that need integrity still check the DACL separately.
 pub fn owned_by_us(path: &Path, meta: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -314,7 +318,7 @@ pub fn owned_by_us(path: &Path, meta: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         let _ = meta;
-        windows_owner_is_current(path).unwrap_or(false)
+        windows_owner_is_trusted(path).unwrap_or(false)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -353,11 +357,12 @@ fn windows_token_user() -> Option<Vec<usize>> {
 }
 
 #[cfg(windows)]
-fn windows_owner_is_current(path: &Path) -> Option<bool> {
+fn windows_owner_is_trusted(path: &Path) -> Option<bool> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_USER,
+        EqualSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        TOKEN_USER, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
 
     // Canonical Windows paths can carry a `\\?\` verbatim prefix; the
@@ -393,12 +398,14 @@ fn windows_owner_is_current(path: &Path) -> Option<bool> {
         unsafe { LocalFree(descriptor) };
         return None;
     };
-    let same = unsafe {
+    let trusted = unsafe {
         let user = &*(token_user.as_ptr() as *const TOKEN_USER);
         EqualSid(owner, user.User.Sid) != 0
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+            || IsWellKnownSid(owner, WinLocalSystemSid) != 0
     };
     unsafe { LocalFree(descriptor) };
-    Some(same)
+    Some(trusted)
 }
 
 /// Does this path's DACL grant write access only to the current user,
@@ -850,7 +857,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     }
     if !owned_by_us(path, &meta) {
         anyhow::bail!(
-            "{} is owned by another user — refusing a shared/untrusted cache",
+            "{} is owned by an untrusted principal — refusing a shared/untrusted cache",
             path.display()
         );
     }
@@ -861,6 +868,74 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("securing {}", path.display()))?;
         }
+    }
+    #[cfg(windows)]
+    if windows_acl_is_private(path) != Some(true) {
+        anyhow::bail!(
+            "{} DACL grants write access to an untrusted principal",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Validate an existing private directory without changing its permissions.
+/// Used for a user-supplied Cargo home: it must be a real directory, owned by
+/// the current user, writable, and not group/world-writable (owner-only DACL
+/// on Windows).
+pub fn validate_private_dir(path: &Path, what: &str) -> Result<()> {
+    let meta = match metadata_nofollow(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} {} is a symlink/reparse point", what, path.display());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("{} {} does not exist", what, path.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {} {}", what, path.display()));
+        }
+    };
+    if !meta.is_dir() {
+        anyhow::bail!("{} {} is not a real directory", what, path.display());
+    }
+    if !owned_by_us(path, &meta) {
+        anyhow::bail!("{} {} is owned by another user", what, path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "{} {} is group/world-writable (mode {:o})",
+                what,
+                path.display(),
+                mode
+            );
+        }
+        if mode & 0o300 != 0o300 {
+            anyhow::bail!(
+                "{} {} is not writable by its owner (mode {:o})",
+                what,
+                path.display(),
+                mode
+            );
+        }
+    }
+    #[cfg(windows)]
+    match windows_acl_is_private(path) {
+        Some(true) => {}
+        Some(false) => anyhow::bail!(
+            "{} {} grants write access outside the owner/SYSTEM/Administrators",
+            what,
+            path.display()
+        ),
+        None => anyhow::bail!(
+            "{} {} DACL could not be inspected; refusing an unverified directory",
+            what,
+            path.display()
+        ),
     }
     Ok(())
 }
@@ -1553,7 +1628,7 @@ pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<Strin
     if !owned_by_us(path, &meta) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "config file is owned by another user",
+            "config file is owned by an untrusted principal",
         ));
     }
     #[cfg(unix)]
@@ -1565,6 +1640,13 @@ pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<Strin
                 "config file is group/world-writable",
             ));
         }
+    }
+    #[cfg(windows)]
+    if windows_acl_is_private(path) != Some(true) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "config file DACL grants write access to an untrusted principal",
+        ));
     }
     let mut text = String::new();
     file.read_to_string(&mut text)?;
