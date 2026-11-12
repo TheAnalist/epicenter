@@ -191,6 +191,7 @@ epicenter store verify
 epicenter store restore
 ```
 
+* **Performance & Reflinks:** `harvest` and `restore` process independent unit groups in parallel (1 worker per core, capped at 8). On Unix, `harvest` copies or reflinks (`FICLONE` on btrfs/XFS/ZFS) artifacts into the vault so build outputs and `0444` store files never share a mutable inode.
 * **CPU-starved hosts:** By default, copied artifacts in the vault use content-addressed gzip compression (while `.rlib`/`.a` library outputs stay raw). To skip compression during harvest, pass `--no-compress`:
   ```bash
   epicenter store harvest --no-compress
@@ -213,9 +214,10 @@ How `epicenter exec` works:
 4. Passes through the child command's `stdout`, `stderr`, and exit code unchanged.
 
 Common `exec` flags:
-* `--id <NAME>`: Name the job directory (`work/<NAME>/`).
-* `--reuse`: Reuse an existing job directory with the same `--id` (refuses safely if another build is actively holding the lock).
+* `--id <NAME>`: Name the job directory (`work/<NAME>/`). New job directories are created with `O_EXCL` and stamped with `.epicenter-job`.
+* `--reuse`: Reuse an existing job directory with the same `--id` (refuses safely if another build is holding the lock or if the directory is unmarked/foreign-owned).
 * `--target-dir [DIR]`: Give the job its own `CARGO_TARGET_DIR` (defaults to `<work-dir>/target` if no path is given) so final binaries don't collide either.
+* `--work-root <PATH>`: Override the per-VM work directory root for this run.
 * `--harvest`: After the command succeeds, harvest newly built units back into the vault.
 * `--no-compress`: Skip gzip compression when used with `--harvest`.
 * `--rm`: Delete the job directory as soon as the command finishes.
@@ -234,6 +236,7 @@ In CI or multi-VM agent fleets, share the **read-only vault** (`store/`) across 
    Keep disposable job directories on fast local VM disk (never on the read-only vault or slow `/mnt/c` mounts). The default is the per-user OS cache; `work` is global-only:
    ```bash
    epicenter setup --work-root /var/lib/epicenter/work
+   epicenter setup --work-root default   # reset to OS cache default
    # Or override per job:
    epicenter exec --work-root /var/lib/epicenter/work -- cargo test
    ```
@@ -242,7 +245,7 @@ In CI or multi-VM agent fleets, share the **read-only vault** (`store/`) across 
    * **Tip:** Set `debug = "line-tables-only"` (for shared dev+CI fleets) or `debug = 0` (for CI-only fleets) in `Cargo.toml`. Different `debug` levels produce different unit hashes and prevent sharing. (`strip` only affects the final binary, not dependency units.)
    * **Audit profile/package duplication:** Run `epicenter store overlap` (or `--json`) to see if mismatched profiles are storing duplicate variants of the same package in the vault.
 4. **Manifest authenticity across machines:**
-   The vault manifest is Ed25519-signed. The writer keeps the private key in `$CARGO_HOME/epicenter/manifest.ed25519`; readers need only the public key stored in the vault as `.epicenter-pubkey`. HMAC remains the legacy/local fallback for old manifests and single-trust-domain stores.
+   The vault manifest is Ed25519-signed. The writer keeps the private key in the per-user epicenter state directory (`${XDG_STATE_HOME:-$HOME/.local/state}/epicenter` on Linux, `~/Library/Application Support/epicenter` on macOS, `%LOCALAPPDATA%\epicenter` on Windows); readers need only the public key stored in the vault as `.epicenter-pubkey`. HMAC remains the legacy/local fallback for old manifests and single-trust-domain stores. Legacy keys under `$CARGO_HOME/epicenter` are still honored, and `doctor` reports them for migration.
 5. **Builder / Uploader job (writable vault):**
    ```bash
    epicenter exec --harvest -- cargo build --locked
@@ -269,7 +272,7 @@ Cargo's `~/.cargo/config.toml` owns `[build] build-dir`. Epicenter's policy live
 For every setting, Epicenter resolves values in this exact order:
 1. **CLI flags** (highest priority)
 2. **Project `epicenter.toml`** (nearest file walking up from current directory; read-only, never modified by Epicenter)
-3. **Global `epicenter.toml`** in the per-user OS config directory (updated when you pass `--preset`, `--memory`, `--linker`, or `--work-root` to `epicenter setup`):
+3. **Global `epicenter.toml`** in the per-user OS config directory (updated when you pass `--preset`, `--memory`, `--linker`, `--work-root`, or `--cargo-home` to `epicenter setup`):
    - Linux/BSD: `${XDG_CONFIG_HOME:-$HOME/.config}/epicenter/epicenter.toml`
    - macOS: `$HOME/Library/Application Support/epicenter/epicenter.toml`
    - Windows: `%APPDATA%\epicenter\epicenter.toml`
@@ -277,7 +280,7 @@ For every setting, Epicenter resolves values in this exact order:
 
 The old `$CARGO_HOME/epicenter.toml` is no longer read or written. `doctor` reports it as legacy and prints the move command. Make relative `store` and `work` values absolute before moving the file; the new location is their base.
 
-### The 6 Keys of `epicenter.toml`
+### The 7 Keys of `epicenter.toml`
 
 All keys are top-level (no `[section]` headers).
 
@@ -288,6 +291,7 @@ memory = "16GiB"                 # RAM budget for job calculation (e.g. "16GiB",
 linker = "lld"                   # "auto" | "system" | "lld" | "wild"
 store  = "~/.cargo/epicenter/store" # Path to the durable vault
 work   = "~/.cache/epicenter/work"  # Global-only job-dir root
+cargo_home = "/opt/epicenter/cargo" # Global-only, absolute, identical on every VM
 link   = "auto"                  # "auto" | "copy" | "link"
 ```
 
@@ -298,7 +302,10 @@ link   = "auto"                  # "auto" | "copy" | "link"
 | `linker` | `"auto"`, `"system"`, `"lld"`, `"wild"` | `"auto"` | `auto` leaves flags untouched; `system` removes Epicenter linker flags; `lld`/`wild` select a linker explicitly. (CLI also accepts `mold` and `gold`). |
 | `store` | File path string | `$CARGO_HOME/epicenter/store` | Location of the durable vault. |
 | `work` | File path string | Per-user OS cache | Local job-dir root for `exec`, `evict --work-dirs`, `status` and `doctor`. Global-only; a project cannot set it. |
+| `cargo_home` | Absolute path string | Shell `CARGO_HOME` or `~/.cargo` | Global-only `CARGO_HOME` for `exec`. Must be identical on every machine/VM that shares remote units; no `~`, relative path or `..`. A project cannot set it. |
 | `link` | `"auto"`, `"copy"`, `"link"` | `"auto"` | How `restore`/`exec` materialize `.rlib`/`.a` files. `auto` hard-links from a private local store (owner-only ACL on Windows) and copies from network/shared mounts (`9p`, `drvfs`, `NFS`, `SMB`, etc.) or a Windows store with a permissive DACL. `copy` never hard-links. `link` forces hard links on a trusted store but still copies from a mutable store whose Windows DACL is not owner-only (only allowed in global `epicenter.toml`, projects can only tighten to `auto` or `copy`). |
+
+`cargo_home` is opt-in and global-only. `epicenter setup --cargo-home PATH` creates a missing directory with private permissions (or validates an existing real directory), never copies the registry or Cargo credentials, and pins `exec`'s child `CARGO_HOME` to that absolute path. `epicenter setup --cargo-home default` clears it. The same absolute path must be used by the CI publisher and every reader; a different path changes Cargo's source `path` hash and the remote unit is a miss. Raw `cargo` outside `exec` still uses the shell's `CARGO_HOME`; `doctor` warns when the two differ.
 
 ### Presets Explained (`auto`, `dev`, `ci`)
 
@@ -438,10 +445,12 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter setup --preset auto\|dev\|ci` | Set build jobs and incremental compilation policy |
 | `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | Configure linker flags in global Cargo config |
 | `epicenter setup --memory <SIZE>` | Set RAM budget (e.g. `16GiB`) for `2 GiB/job` concurrency calculation |
+| `epicenter setup --cargo-home PATH\|default` | Set or clear the global absolute `CARGO_HOME` used by `exec` |
 | `epicenter setup --write-profile [--dev-debug full\|line\|none]` | Write recommended profile settings to workspace `Cargo.toml` (with backup) |
 | `epicenter setup --measure` | Run a calibration `cargo build` after setup to record wall time and peak RSS |
 | `epicenter setup --wrapper kache\|sccache\|none` | Configure an external `rustc-wrapper` |
 | `epicenter setup --cache-root <PATH>` / `--use-default` | Set a custom shared build dir path or reset to default |
+| `epicenter setup --work-root <PATH\|default>` | Set or reset the local per-VM job-dir root (`work` in global `epicenter.toml`) |
 | `epicenter setup --dry-run` | Print effective policy and config diffs without writing anything |
 | `epicenter setup --revert` | Restore the newest backups of Cargo config and global `epicenter.toml` |
 | `epicenter status [--json]` | Show cache sizes and tier summary |

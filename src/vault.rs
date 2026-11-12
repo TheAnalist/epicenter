@@ -653,15 +653,33 @@ impl Manifest {
     }
 }
 
+/// Per-user epicenter state file, independent of CARGO_HOME.
+fn state_file_path(name: &str) -> Result<PathBuf> {
+    let path = crate::paths::state_dir()?.join(name);
+    #[cfg(windows)]
+    crate::util::ensure_windows_user_path(&path, "epicenter state")?;
+    Ok(path)
+}
+
+/// Pre-0.1.1 state location under the ambient Cargo home. Read-only fallback
+/// so moving `cargo_home` never rotates a writer identity.
+fn legacy_state_file_path(name: &str) -> Result<PathBuf> {
+    let path = crate::paths::ambient_cargo_home()?
+        .join("epicenter")
+        .join(name);
+    #[cfg(windows)]
+    crate::util::ensure_windows_user_path(&path, "legacy epicenter state")?;
+    Ok(path)
+}
+
 /// Where the per-user vault MAC key lives. Outside the store on purpose:
 /// a store-write attacker must not be able to rewrite the key as well.
 fn manifest_key_path() -> Result<PathBuf> {
-    let path = crate::paths::cargo_home()?
-        .join("epicenter")
-        .join("manifest.key");
-    #[cfg(windows)]
-    crate::util::ensure_windows_user_path(&path, "vault key")?;
-    Ok(path)
+    state_file_path("manifest.key")
+}
+
+fn legacy_manifest_key_path() -> Result<PathBuf> {
+    legacy_state_file_path("manifest.key")
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -783,9 +801,26 @@ fn write_new_key_file(path: &Path, key: &[u8; 32]) -> Result<Vec<u8>> {
     }
 }
 
+fn read_existing_key(path: &Path) -> Result<Option<Vec<u8>>> {
+    match util::metadata_nofollow(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(read_key_file(path)?)),
+        Ok(_) => anyhow::bail!("vault key {} is not a regular file", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("vault key {} is a symlink/reparse point", path.display());
+        }
+        Err(err) => Err(err).with_context(|| format!("inspecting vault key {}", path.display())),
+    }
+}
+
 fn manifest_key() -> Result<Vec<u8>> {
     let path = manifest_key_path()?;
-    if let Ok(key) = read_key_file(&path) {
+    if let Some(key) = read_existing_key(&path)? {
+        return Ok(key);
+    }
+    // Keep using an existing legacy key instead of rotating the MAC.
+    let legacy = legacy_manifest_key_path()?;
+    if let Some(key) = read_existing_key(&legacy)? {
         return Ok(key);
     }
     let mut key = [0u8; 32];
@@ -794,40 +829,58 @@ fn manifest_key() -> Result<Vec<u8>> {
 }
 
 fn manifest_signing_key_path() -> Result<PathBuf> {
-    let path = crate::paths::cargo_home()?
-        .join("epicenter")
-        .join("manifest.ed25519");
-    #[cfg(windows)]
-    crate::util::ensure_windows_user_path(&path, "vault signing key")?;
-    Ok(path)
+    state_file_path("manifest.ed25519")
 }
 
-fn manifest_signing_key() -> Result<SigningKey> {
-    let path = manifest_signing_key_path()?;
-    let bytes = if let Ok(key) = read_key_file(&path) {
-        key
-    } else {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key)
-            .map_err(|err| anyhow::anyhow!("generating signing key: {err}"))?;
-        write_new_key_file(&path, &key)?
-    };
+fn legacy_manifest_signing_key_path() -> Result<PathBuf> {
+    legacy_state_file_path("manifest.ed25519")
+}
+
+fn signing_key_from_bytes(bytes: Vec<u8>, path: &Path) -> Result<SigningKey> {
     let seed: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("signing key {} is malformed", path.display()))?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
+fn load_or_migrate_signing_key(path: &Path, legacy: &Path) -> Result<SigningKey> {
+    if let Some(bytes) = read_existing_key(path)? {
+        return signing_key_from_bytes(bytes, path);
+    }
+    // A writer migrates the old key explicitly instead of minting a new
+    // identity. Readers still fall back to the legacy path in
+    // `existing_signing_key`.
+    if let Some(bytes) = read_existing_key(legacy)? {
+        let seed: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("signing key {} is malformed", legacy.display()))?;
+        let stored = write_new_key_file(path, &seed)?;
+        return signing_key_from_bytes(stored, path);
+    }
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|err| anyhow::anyhow!("generating signing key: {err}"))?;
+    let bytes = write_new_key_file(path, &key)?;
+    signing_key_from_bytes(bytes, path)
+}
+
+fn manifest_signing_key() -> Result<SigningKey> {
+    load_or_migrate_signing_key(
+        &manifest_signing_key_path()?,
+        &legacy_manifest_signing_key_path()?,
+    )
+}
+
 fn existing_signing_key() -> Result<Option<SigningKey>> {
     let path = manifest_signing_key_path()?;
-    if !path.is_file() {
-        return Ok(None);
+    if let Some(bytes) = read_existing_key(&path)? {
+        return Ok(Some(signing_key_from_bytes(bytes, &path)?));
     }
-    let bytes = read_key_file(&path)?;
-    let seed: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("signing key {} is malformed", path.display()))?;
-    Ok(Some(SigningKey::from_bytes(&seed)))
+    let legacy = legacy_manifest_signing_key_path()?;
+    if let Some(bytes) = read_existing_key(&legacy)? {
+        return Ok(Some(signing_key_from_bytes(bytes, &legacy)?));
+    }
+    Ok(None)
 }
 
 fn manifest_body(manifest: &Manifest) -> Result<Vec<u8>> {
@@ -1004,7 +1057,8 @@ fn load_manifest_at(store_root: &Path, parity: &str, repair: bool) -> Result<Opt
     if !manifest.signature.is_empty() {
         verify_manifest_signature(store_root, &manifest, &path)?;
     } else {
-        let local_hmac_key = manifest_key_path()?.is_file();
+        let local_hmac_key =
+            manifest_key_path()?.is_file() || legacy_manifest_key_path()?.is_file();
         if !local_hmac_key {
             anyhow::bail!(
                 "manifest {} has no Ed25519 signature and the local HMAC key is missing; re-harvest it on the writer",
@@ -5618,6 +5672,27 @@ mod tests {
             0,
             "generation 0700"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn signing_key_migrates_from_the_legacy_cargo_home_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state/manifest.ed25519");
+        let legacy = dir.path().join("cargo/epicenter/manifest.ed25519");
+        let legacy_seed = [7u8; 32];
+        write_new_key_file(&legacy, &legacy_seed)?;
+
+        let key = load_or_migrate_signing_key(&state, &legacy)?;
+        assert_eq!(key.to_bytes(), legacy_seed);
+        assert!(state.is_file(), "the writer migrates the key");
+        assert_eq!(read_key_file(&state)?, legacy_seed);
+
+        let state_seed = [9u8; 32];
+        fs::remove_file(&state)?;
+        write_new_key_file(&state, &state_seed)?;
+        let key = load_or_migrate_signing_key(&state, &legacy)?;
+        assert_eq!(key.to_bytes(), state_seed, "the state key wins");
         Ok(())
     }
 

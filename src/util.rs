@@ -865,6 +865,67 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate an existing private directory without changing its permissions.
+/// Used for a user-supplied Cargo home: it must be a real directory, owned by
+/// the current user, writable, and not group/world-writable (owner-only DACL
+/// on Windows).
+pub fn validate_private_dir(path: &Path, what: &str) -> Result<()> {
+    let meta = match metadata_nofollow(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} {} is a symlink/reparse point", what, path.display());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("{} {} does not exist", what, path.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {} {}", what, path.display()));
+        }
+    };
+    if !meta.is_dir() {
+        anyhow::bail!("{} {} is not a real directory", what, path.display());
+    }
+    if !owned_by_us(path, &meta) {
+        anyhow::bail!("{} {} is owned by another user", what, path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "{} {} is group/world-writable (mode {:o})",
+                what,
+                path.display(),
+                mode
+            );
+        }
+        if mode & 0o300 != 0o300 {
+            anyhow::bail!(
+                "{} {} is not writable by its owner (mode {:o})",
+                what,
+                path.display(),
+                mode
+            );
+        }
+    }
+    #[cfg(windows)]
+    match windows_acl_is_private(path) {
+        Some(true) => {}
+        Some(false) => anyhow::bail!(
+            "{} {} grants write access outside the owner/SYSTEM/Administrators",
+            what,
+            path.display()
+        ),
+        None => anyhow::bail!(
+            "{} {} DACL could not be inspected; refusing an unverified directory",
+            what,
+            path.display()
+        ),
+    }
+    Ok(())
+}
+
 /// Check that `base/rel` is a chain of real directories ending in a regular
 /// file, with no symlink at any component. Read-only; used before hashing or
 /// restoring a store file.

@@ -311,6 +311,9 @@ pub struct Options<'a> {
     pub incremental: Option<bool>,
     /// How dependencies are installed into the job dir.
     pub link: LinkPolicy,
+    /// Global `cargo_home` policy; `None` leaves the child's environment
+    /// untouched.
+    pub cargo_home: Option<&'a Path>,
     /// The command, argv-style.
     pub command: &'a [String],
 }
@@ -436,6 +439,9 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let Some(program) = opts.command.first() else {
         bail!("exec needs a command — `epicenter exec -- <cmd>`");
     };
+    if let Some(cargo_home) = opts.cargo_home {
+        crate::util::validate_private_dir(cargo_home, "cargo home")?;
+    }
     let job_id = match opts.job_id {
         Some(id) => sanitize_job_id(id)?,
         None => default_job_id(),
@@ -589,6 +595,13 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         "  {} CARGO_BUILD_BUILD_DIR (this job only; no config change)",
         util::dim(&format!("{:<11}", "build-dir"))
     );
+    if let Some(cargo_home) = opts.cargo_home {
+        eprintln!(
+            "  {} {} (global cargo_home policy)",
+            util::dim(&format!("{:<11}", "cargo home")),
+            cargo_home.display()
+        );
+    }
     if let (Some(layout), Some(version)) = (layout, cargo_version.as_deref()) {
         eprintln!(
             "  {} {} · {}",
@@ -613,6 +626,9 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let mut child = crate::util::command_for(program)?;
     child.args(&opts.command[1..]);
     child.env("CARGO_BUILD_BUILD_DIR", &work_dir);
+    if let Some(cargo_home) = opts.cargo_home {
+        child.env("CARGO_HOME", cargo_home);
+    }
     if let Some(target) = &target_dir {
         child.env("CARGO_TARGET_DIR", target);
     }
@@ -719,14 +735,11 @@ pub fn record_build(command: &[String], elapsed: std::time::Duration) {
         } else {
             usage.ru_maxrss as u64 * 1024
         };
-        let Ok(home) = crate::paths::cargo_home() else {
+        let Ok(state) = crate::paths::state_dir() else {
             return;
         };
-        let path = home.join("epicenter").join("last-build.json");
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if crate::util::create_private_dir_all(parent).is_err() {
+        let path = state.join("last-build.json");
+        if crate::util::create_private_dir_all(&state).is_err() {
             return;
         }
         let payload = serde_json::json!({
@@ -900,6 +913,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         let code = run(store.path(), work.path(), &opts)?;
@@ -910,6 +924,37 @@ mod tests {
                 .is_file(),
             "the vault seeded the job"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_sets_the_configured_cargo_home_in_the_child() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let cargo = tempfile::tempdir()?;
+        fs::set_permissions(cargo.path(), fs::Permissions::from_mode(0o700))?;
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test \"$CARGO_HOME\" = '{}'", cargo.path().display()),
+        ];
+        let opts = Options {
+            job_id: Some("cargo-home"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: Some(cargo.path()),
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
         Ok(())
     }
 
@@ -936,6 +981,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -985,6 +1031,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1011,6 +1058,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &bad,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 1);
@@ -1035,6 +1083,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &kept,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1087,6 +1136,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1130,6 +1180,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1168,6 +1219,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &cmd,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1215,6 +1267,7 @@ mod tests {
             target_dir: None,
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1266,6 +1319,7 @@ mod tests {
             target_dir: Some("job"),
             incremental: None,
             link: LinkPolicy::Auto,
+            cargo_home: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);

@@ -172,6 +172,7 @@ pub struct FileConfig {
     pub link: Option<LinkPolicy>,
     pub store: Option<String>,
     pub work: Option<String>,
+    pub cargo_home: Option<String>,
 }
 
 /// One resolved config file, with the directory used for relative paths.
@@ -184,6 +185,7 @@ struct Loaded {
     link: Option<LinkPolicy>,
     store: Option<String>,
     work: Option<String>,
+    cargo_home: Option<String>,
 }
 
 impl Loaded {
@@ -221,6 +223,7 @@ impl Loaded {
             link: config.link,
             store: config.store,
             work: config.work,
+            cargo_home: config.cargo_home,
         }))
     }
 
@@ -360,6 +363,29 @@ impl Settings {
             }
         }
         Ok(None)
+    }
+
+    /// Effective Cargo home: global `cargo_home` > shell `CARGO_HOME` >
+    /// `~/.cargo`. A project file cannot set it: the same absolute path must
+    /// be used on every machine that shares remote units.
+    pub fn cargo_home(&self) -> Result<(PathBuf, Source)> {
+        if self
+            .project
+            .as_ref()
+            .and_then(|file| file.cargo_home.as_deref())
+            .is_some()
+        {
+            bail!(
+                "`cargo_home` is only allowed in the global epicenter.toml; \
+                 a project must not redirect Cargo's home"
+            );
+        }
+        if let Some(file) = &self.global {
+            if let Some(raw) = file.cargo_home.as_deref() {
+                return Ok((resolve_cargo_home(raw)?, Source::Global));
+            }
+        }
+        Ok((crate::paths::ambient_cargo_home()?, Source::Auto))
     }
 
     /// Global-only local work root. A project file cannot redirect job dirs:
@@ -586,6 +612,65 @@ fn resolve_path(raw: &str, base: &Path) -> Result<PathBuf> {
     resolve_policy_path(raw, base, "store")
 }
 
+/// Resolve a global `cargo_home` value. It must be an absolute path that is
+/// identical on every machine/VM: no `~`, no relative path and no `..`.
+pub fn resolve_cargo_home(raw: &str) -> Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("`cargo_home` must not be empty");
+    }
+    if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        bail!(
+            "`cargo_home` must be an absolute path, not `~` — the same path must exist on every machine/VM"
+        );
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        bail!(
+            "`cargo_home` {} must be an absolute path shared by every machine/VM",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("`cargo_home` must not contain `..`; use a normalized absolute path");
+    }
+    if path.parent().is_none() {
+        bail!("`cargo_home` must not be a filesystem root");
+    }
+    if let Ok(home) = crate::paths::home() {
+        if path == home || home.starts_with(&path) {
+            bail!(
+                "`cargo_home` {} must not be the home directory or its ancestor",
+                path.display()
+            );
+        }
+    }
+    Ok(normalize(path))
+}
+
+/// Create a missing Cargo home with private permissions, or validate an
+/// existing one. A dry run validates what exists but creates nothing.
+pub fn prepare_cargo_home(path: &Path, dry_run: bool) -> Result<()> {
+    match crate::util::metadata_nofollow(path) {
+        Ok(meta) if meta.is_dir() => crate::util::validate_private_dir(path, "cargo home"),
+        Ok(_) => bail!("cargo home {} is not a real directory", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if dry_run {
+                return Ok(());
+            }
+            crate::util::create_private_dir_all(path)?;
+            crate::util::validate_private_dir(path, "cargo home")
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            bail!("cargo home {} is a symlink/reparse point", path.display());
+        }
+        Err(err) => Err(err).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
 /// Lexically remove `.`/`..` so reported store paths are stable.
 fn normalize(path: PathBuf) -> PathBuf {
     use std::path::Component;
@@ -739,6 +824,73 @@ mod tests {
 
     fn write(path: &Path, text: &str) {
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn global_cargo_home_wins_and_is_global_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("cargo-home");
+        let global = dir.path().join("global.toml");
+        write(
+            &global,
+            &format!("cargo_home = {:?}\n", cargo.to_string_lossy()),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(
+            settings.cargo_home().unwrap(),
+            (cargo.clone(), Source::Global)
+        );
+
+        write(
+            &dir.path().join(FILE_NAME),
+            &format!("cargo_home = {:?}\n", cargo.to_string_lossy()),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.cargo_home().unwrap_err();
+        assert!(err.to_string().contains("global"), "{err}");
+    }
+
+    #[test]
+    fn cargo_home_rejects_relative_and_home_paths() {
+        assert!(resolve_cargo_home("relative/cargo").is_err());
+        assert!(resolve_cargo_home("~/cargo").is_err());
+        assert!(resolve_cargo_home("/").is_err());
+        if let Ok(home) = crate::paths::home() {
+            assert!(resolve_cargo_home(&home.to_string_lossy()).is_err());
+        }
+        let absolute = std::env::temp_dir().join("epicenter-cargo-home-test");
+        assert_eq!(
+            resolve_cargo_home(&absolute.to_string_lossy()).unwrap(),
+            absolute
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_must_be_private_and_real() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let cargo = dir.path().join("cargo");
+        std::fs::create_dir(&cargo)?;
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700))?;
+        prepare_cargo_home(&cargo, false)?;
+
+        let world = dir.path().join("world");
+        std::fs::create_dir(&world)?;
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o777))?;
+        assert!(prepare_cargo_home(&world, false).is_err());
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&cargo, &link)?;
+        assert!(prepare_cargo_home(&link, false).is_err());
+
+        let missing = dir.path().join("missing");
+        prepare_cargo_home(&missing, true)?;
+        assert!(!missing.exists(), "dry run must not create the directory");
+        prepare_cargo_home(&missing, false)?;
+        assert!(missing.is_dir());
+        Ok(())
     }
 
     #[test]
