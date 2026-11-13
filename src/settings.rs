@@ -15,7 +15,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::util::metadata_nofollow;
 
@@ -122,6 +124,87 @@ impl LinkPolicy {
     }
 }
 
+/// Remote artifact tier. `libraries` excludes executable build-script and
+/// proc-macro units; `full` includes them for a trusted, homogeneous fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteTier {
+    Libraries,
+    Full,
+}
+
+impl RemoteTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteTier::Libraries => "libraries",
+            RemoteTier::Full => "full",
+        }
+    }
+}
+
+/// Transport derived from the remote URL scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTransport {
+    /// Anonymous HTTPS GET; no credentials.
+    AnonymousHttps,
+    /// Authenticated S3-compatible access; credentials and region come from
+    /// the standard AWS environment.
+    S3,
+}
+
+impl RemoteTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteTransport::AnonymousHttps => "https",
+            RemoteTransport::S3 => "s3",
+        }
+    }
+}
+
+/// The `[remote]` table as written in one policy file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFileConfig {
+    pub tier: Option<RemoteTier>,
+    pub url: Option<String>,
+    /// Pinned Ed25519 publisher public key, 64 hex characters.
+    pub publisher_key: Option<String>,
+}
+
+impl RemoteFileConfig {
+    /// A project may only tighten the tier; the endpoint and publisher key are
+    /// machine-level trust anchors.
+    fn has_non_tier(&self) -> bool {
+        self.url.is_some() || self.publisher_key.is_some()
+    }
+}
+
+/// The validated effective remote policy.
+#[derive(Debug, Clone)]
+pub struct RemotePolicy {
+    pub tier: RemoteTier,
+    pub tier_source: Source,
+    pub enabled: bool,
+    pub url: Option<String>,
+    pub publisher_key: Option<String>,
+    /// Stable, short key id derived from the public-key fingerprint.
+    pub key_id: Option<String>,
+    /// Local import/cache directory; always the per-user OS default.
+    pub cache: PathBuf,
+    pub transport: RemoteTransport,
+    /// S3 region from the environment, when the transport is S3.
+    pub region: Option<String>,
+}
+
+impl RemotePolicy {
+    /// Endpoint suitable for logs: no query string, fragment or credentials.
+    pub fn redacted_url(&self) -> Option<String> {
+        let url = self.url.as_deref()?;
+        let end = url.find(['?', '#']).unwrap_or(url.len());
+        Some(url[..end].to_string())
+    }
+}
+
 /// Where an effective value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -173,6 +256,7 @@ pub struct FileConfig {
     pub store: Option<String>,
     pub work: Option<String>,
     pub cargo_home: Option<String>,
+    pub remote: Option<RemoteFileConfig>,
 }
 
 /// One resolved config file, with the directory used for relative paths.
@@ -186,6 +270,7 @@ struct Loaded {
     store: Option<String>,
     work: Option<String>,
     cargo_home: Option<String>,
+    remote: Option<RemoteFileConfig>,
 }
 
 impl Loaded {
@@ -224,6 +309,7 @@ impl Loaded {
             store: config.store,
             work: config.work,
             cargo_home: config.cargo_home,
+            remote: config.remote,
         }))
     }
 
@@ -388,6 +474,85 @@ impl Settings {
         Ok((crate::paths::ambient_cargo_home()?, Source::Auto))
     }
 
+    /// Effective remote distribution policy. Only the tier may come from a
+    /// project file; the endpoint, publisher key and writable cache are
+    /// global-only trust anchors.
+    pub fn remote(&self) -> Result<RemotePolicy> {
+        let project = self.project.as_ref().and_then(|file| file.remote.as_ref());
+        if project.is_some_and(RemoteFileConfig::has_non_tier) {
+            bail!(
+                "`[remote]` endpoint/key/cache/auth fields are only allowed in the \
+                 global epicenter.toml; a project may only set `[remote] tier`"
+            );
+        }
+        let project_tier = project.and_then(|remote| remote.tier);
+        let global = self.global.as_ref().and_then(|file| file.remote.as_ref());
+        let global_tier = global.and_then(|remote| remote.tier);
+        let (tier, tier_source) = match project_tier {
+            Some(RemoteTier::Full) if global_tier != Some(RemoteTier::Full) => bail!(
+                "project `[remote] tier = \"full\"` requires the global \
+                 `[remote] tier = \"full\"`; a project cannot enable executable \
+                 build-script/proc-macro units on its own"
+            ),
+            Some(tier) => (tier, Source::Project),
+            None => global_tier
+                .map(|tier| (tier, Source::Global))
+                .unwrap_or((RemoteTier::Libraries, Source::Auto)),
+        };
+
+        let cache = crate::paths::default_remote_cache()?;
+        let Some(global) = global else {
+            return Ok(RemotePolicy {
+                tier,
+                tier_source,
+                enabled: false,
+                url: None,
+                publisher_key: None,
+                key_id: None,
+                cache,
+                transport: RemoteTransport::AnonymousHttps,
+                region: None,
+            });
+        };
+        let (url, transport) = match global.url.as_deref() {
+            Some(raw) => {
+                let (url, transport) = validate_remote_url(raw)?;
+                (Some(url), transport)
+            }
+            None => (None, RemoteTransport::AnonymousHttps),
+        };
+        let (publisher_key, key_id) = match global.publisher_key.as_deref() {
+            Some(raw) => {
+                let key = normalize_remote_publisher_key(raw)?;
+                let id = remote_key_id(&key)?;
+                (Some(key), Some(id))
+            }
+            None => (None, None),
+        };
+        if url.is_some() && publisher_key.is_none() {
+            bail!(
+                "`[remote] url` requires `publisher_key`; readers must pin the \
+                 publisher identity from a trusted CI/admin channel"
+            );
+        }
+        let region = if transport == RemoteTransport::S3 {
+            aws_region()
+        } else {
+            None
+        };
+        Ok(RemotePolicy {
+            tier,
+            tier_source,
+            enabled: url.is_some(),
+            url,
+            publisher_key,
+            key_id,
+            cache,
+            transport,
+            region,
+        })
+    }
+
     /// Global-only local work root. A project file cannot redirect job dirs:
     /// `exec` creates and removes directories there, so the same rule as
     /// `store` applies. `None` means the per-user OS-local default.
@@ -426,6 +591,12 @@ impl Settings {
 
     pub fn global_path(&self) -> Option<&Path> {
         self.global.as_ref().map(|file| file.path.as_path())
+    }
+
+    /// Raw global `[remote]` table, for setup to edit even when the existing
+    /// policy is invalid and `remote()` would reject it.
+    pub fn global_remote(&self) -> Option<&RemoteFileConfig> {
+        self.global.as_ref().and_then(|file| file.remote.as_ref())
     }
 
     /// `auto` is dev on a workstation and ci when the environment says so.
@@ -661,6 +832,117 @@ pub fn resolve_cargo_home(raw: &str) -> Result<PathBuf> {
     Ok(normalize(path))
 }
 
+fn validate_remote_text(raw: &str, what: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("`[remote] {what}` must not be empty");
+    }
+    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        bail!("`[remote] {what}` must not contain whitespace or control characters");
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_remote_url(raw: &str) -> Result<(String, RemoteTransport)> {
+    let raw = validate_remote_text(raw, "url")?;
+    if raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        let rest = &raw[8..];
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.is_empty() {
+            bail!("`[remote] url` is missing a host");
+        }
+        if authority.contains('@') {
+            bail!("`[remote] url` must not embed credentials; use the environment path");
+        }
+        if rest.contains(['?', '#']) {
+            bail!(
+                "`[remote] url` must not contain a query or fragment; \
+                 do not put signed tokens or credentials in the config"
+            );
+        }
+        return Ok((raw, RemoteTransport::AnonymousHttps));
+    }
+    if raw
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3://"))
+    {
+        let rest = &raw[5..];
+        let bucket = rest.split('/').next().unwrap_or_default();
+        if bucket.is_empty() {
+            bail!("`[remote] url` s3:// URL is missing a bucket");
+        }
+        if bucket.contains('@') || rest.contains(['?', '#']) {
+            bail!(
+                "`[remote] url` must not embed credentials, a query or a fragment; \
+                 use AWS environment credentials"
+            );
+        }
+        return Ok((raw, RemoteTransport::S3));
+    }
+    bail!(
+        "`[remote] url` must be https:// for anonymous reads or s3://bucket/prefix \
+         for authenticated S3; TLS is mandatory"
+    )
+}
+
+/// Normalize and validate an `https://` or `s3://` remote endpoint.
+pub fn normalize_remote_url(raw: &str) -> Result<String> {
+    Ok(validate_remote_url(raw)?.0)
+}
+
+/// Normalize and validate the pinned Ed25519 publisher public key.
+pub fn normalize_remote_publisher_key(raw: &str) -> Result<String> {
+    let raw = validate_remote_text(raw, "publisher_key")?;
+    let raw = raw.strip_prefix("ed25519:").unwrap_or(&raw);
+    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "`[remote] publisher_key` must be 64 hex characters \
+             (an Ed25519 public key)"
+        );
+    }
+    let mut bytes = [0u8; 32];
+    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).expect("validated hex is ASCII");
+        bytes[index] = u8::from_str_radix(text, 16).expect("validated hex pair");
+    }
+    VerifyingKey::from_bytes(&bytes).map_err(|err| {
+        anyhow::anyhow!("`[remote] publisher_key` is not a valid Ed25519 key: {err}")
+    })?;
+    Ok(raw.to_ascii_lowercase())
+}
+
+/// Stable short id derived from the public-key fingerprint.
+pub fn remote_key_id(public_key: &str) -> Result<String> {
+    if public_key.len() != 64 || !public_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("remote public key must be 64 hex characters");
+    }
+    let mut bytes = [0u8; 32];
+    for (index, pair) in public_key.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).expect("validated hex is ASCII");
+        bytes[index] = u8::from_str_radix(text, 16).expect("validated hex pair");
+    }
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(format!("ed25519:{hex}"))
+}
+
+fn aws_region() -> Option<String> {
+    ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
 /// Create a missing Cargo home with private permissions, or validate an
 /// existing one. A dry run validates what exists but creates nothing.
 pub fn prepare_cargo_home(path: &Path, dry_run: bool) -> Result<()> {
@@ -836,6 +1118,15 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    fn test_public_key() -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        key.verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     #[test]
     fn global_cargo_home_wins_and_is_global_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -901,6 +1192,132 @@ mod tests {
         prepare_cargo_home(&missing, false)?;
         assert!(missing.is_dir());
         Ok(())
+    }
+
+    #[test]
+    fn remote_policy_parses_the_minimal_nested_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let publisher_key = test_public_key();
+        write(
+            &global,
+            &format!(
+                "[remote]\n\
+                 tier = \"full\"\n\
+                 url = \"https://cache.example/root\"\n\
+                 publisher_key = \"{publisher_key}\"\n"
+            ),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.tier, RemoteTier::Full);
+        assert_eq!(remote.tier_source, Source::Global);
+        assert!(remote.enabled);
+        assert_eq!(remote.transport, RemoteTransport::AnonymousHttps);
+        assert_eq!(remote.region, None);
+        assert_eq!(
+            remote.publisher_key.as_deref(),
+            Some(publisher_key.as_str())
+        );
+        assert_eq!(
+            remote.key_id.as_deref(),
+            Some(remote_key_id(&publisher_key).unwrap().as_str())
+        );
+        assert_eq!(remote.cache, crate::paths::default_remote_cache().unwrap());
+        assert_eq!(
+            remote.redacted_url().as_deref(),
+            Some("https://cache.example/root")
+        );
+
+        write(
+            &global,
+            &format!(
+                "[remote]\n\
+                 tier = \"libraries\"\n\
+                 url = \"s3://bucket/prefix\"\n\
+                 publisher_key = \"{publisher_key}\"\n"
+            ),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.transport, RemoteTransport::S3);
+        assert_eq!(remote.redacted_url().as_deref(), Some("s3://bucket/prefix"));
+    }
+
+    #[test]
+    fn project_remote_may_only_tighten_a_global_full_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        write(&global, "[remote]\ntier = \"full\"\n");
+        write(
+            &dir.path().join(FILE_NAME),
+            "[remote]\ntier = \"libraries\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.tier, RemoteTier::Libraries);
+        assert_eq!(remote.tier_source, Source::Project);
+
+        write(&dir.path().join(FILE_NAME), "[remote]\ntier = \"full\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(settings.remote().unwrap().tier, RemoteTier::Full);
+
+        write(&global, "[remote]\ntier = \"libraries\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.remote().unwrap_err();
+        assert!(err.to_string().contains("requires the global"), "{err}");
+
+        write(
+            &dir.path().join(FILE_NAME),
+            "[remote]\nurl = \"https://evil.example/root\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.remote().unwrap_err();
+        assert!(err.to_string().contains("global"), "{err}");
+    }
+
+    #[test]
+    fn remote_defaults_are_disabled_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        write(&global, "");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.tier, RemoteTier::Libraries);
+        assert_eq!(remote.tier_source, Source::Auto);
+        assert!(!remote.enabled);
+
+        write(&global, "[remote]\nurl = \"http://cache.example/root\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "TLS is mandatory");
+
+        write(
+            &global,
+            "[remote]\nurl = \"https://user:pass@cache.example/root\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "credentials in URL are refused");
+
+        write(
+            &global,
+            "[remote]\nurl = \"https://cache.example/root?token=secret\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "query tokens are refused");
+
+        write(&global, "[remote]\nurl = \"s3://bucket/prefix\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(
+            settings.remote().is_err(),
+            "a remote URL requires a pinned publisher key"
+        );
+
+        write(
+            &global,
+            "[remote]\nurl = \"https://cache.example/root\"\npublisher_key = \"nope\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "publisher keys are validated");
     }
 
     #[test]

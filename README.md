@@ -103,7 +103,7 @@ Read **[`DOCS.md`](DOCS.md)** for the complete user and agent guide:
 2. **[Installation & 30-Second Quickstart](DOCS.md#2-installation--30-second-quickstart)** — Getting started and safe rollback.
 3. **[Practical Recipes ("I want to...")](DOCS.md#3-practical-recipes-i-want-to)** — Copy-paste setups for `lld`/`wild`/`mold`/`gold`, memory limits, profiles, `cargo clean` recovery, multiple git worktrees, and parallel agents.
 4. **[Detailed Workflows](DOCS.md#4-detailed-workflows)** — Daily development, Vault persistence, lock-free git worktrees & AI agents (`exec`), and CI/CD multi-VM fleets.
-5. **[Configuration Reference (`epicenter.toml` & Presets)](DOCS.md#5-configuration-reference-epicentertoml--presets)** — Precedence, the 7 policy keys, presets (`auto`, `dev`, `ci`), and linker support.
+5. **[Configuration Reference (`epicenter.toml` & Presets)](DOCS.md#5-configuration-reference-epicentertoml--presets)** — Precedence, the 7 policy keys, the `[remote]` trust gate, presets (`auto`, `dev`, `ci`), and linker support.
 6. **[Observability & Diagnostics (`status` & `doctor`)](DOCS.md#6-observability--diagnostics-status--doctor)** — Unit forensics and health checks.
 7. **[Reclaiming Disk Space (`prune` vs `evict`)](DOCS.md#7-reclaiming-disk-space-prune-vs-evict)** — Age-based housekeeping vs deliberate tiered eviction.
 8. **[Cross-OS & Toolchain Notes](DOCS.md#8-cross-os--toolchain-notes)** — Linux, WSL, macOS, Windows, and Cargo 1.91+ vs 1.100+ layouts.

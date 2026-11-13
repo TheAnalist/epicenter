@@ -221,6 +221,12 @@ pub fn default_work_root() -> Result<PathBuf> {
     }
 }
 
+/// Default local cache for verified remote imports. Never the shared vault:
+/// a reader may have a read-only store.
+pub fn default_remote_cache() -> Result<PathBuf> {
+    Ok(default_work_root()?.with_file_name("remote"))
+}
+
 /// epicenter's (former) own directory — only kept for the doctor's
 /// legacy-file advisory; the shared-cache decision lives in
 /// `~/.cargo/config.toml` now.

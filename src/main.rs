@@ -65,6 +65,21 @@ impl From<LinkerArg> for settings::LinkerChoice {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum RemoteTierArg {
+    Libraries,
+    Full,
+}
+
+impl From<RemoteTierArg> for settings::RemoteTier {
+    fn from(value: RemoteTierArg) -> Self {
+        match value {
+            RemoteTierArg::Libraries => settings::RemoteTier::Libraries,
+            RemoteTierArg::Full => settings::RemoteTier::Full,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum WrapperArg {
     Kache,
     Sccache,
@@ -121,6 +136,23 @@ struct SetupArgs {
     /// clears the override.
     #[arg(long, value_name = "PATH")]
     cargo_home: Option<String>,
+    /// Remote endpoint: `https://…` for anonymous reads or
+    /// `s3://bucket/prefix` for authenticated S3.
+    #[arg(long, value_name = "URL", conflicts_with = "remote_off")]
+    remote_url: Option<String>,
+    /// Pinned Ed25519 publisher public key, as 64 hex characters or a file
+    /// containing it. Obtain it from CI/admin, never from the bucket.
+    #[arg(long, value_name = "HEX|FILE", conflicts_with = "remote_off")]
+    remote_key: Option<String>,
+    /// Remote artifact tier written to the global `[remote]` table.
+    #[arg(long, value_enum, conflicts_with = "remote_off")]
+    remote_tier: Option<RemoteTierArg>,
+    /// Remove the global `[remote]` policy table.
+    #[arg(
+        long,
+        conflicts_with_all = ["remote_url", "remote_key", "remote_tier"]
+    )]
+    remote_off: bool,
     /// Print the effective policy and the exact config diff; write nothing.
     #[arg(long)]
     dry_run: bool,
@@ -143,6 +175,10 @@ struct SetupArgs {
             "use_default",
             "work_root",
             "cargo_home",
+            "remote_url",
+            "remote_key",
+            "remote_tier",
+            "remote_off",
             "preset",
             "linker",
             "wrapper",
@@ -285,6 +321,9 @@ struct RestoreArgs {
     /// Only units whose name contains this (package or hash fragment).
     #[arg(long)]
     unit: Option<String>,
+    /// Skip remote compatible-unit fetch.
+    #[arg(long)]
+    no_remote: bool,
     /// Show what would be linked, without touching any file.
     #[arg(long)]
     dry_run: bool,
@@ -325,6 +364,9 @@ enum Command {
         /// Store copied artifacts raw instead of gzip blobs.
         #[arg(long)]
         no_compress: bool,
+        /// Skip remote compatible-unit fetch for this job.
+        #[arg(long)]
+        no_remote: bool,
         /// Per-job work dir root; overrides the global `work` policy.
         #[arg(long, value_name = "PATH")]
         work_root: Option<PathBuf>,
@@ -444,20 +486,27 @@ fn run() -> Result<()> {
         Command::Why { unit } => epicenter_cli::who::explain(&config::cache_root()?, &unit),
         Command::Evict(args) => cmd_evict(&args),
         Command::Harvest(args) => cmd_harvest(args.unit.as_deref(), args.dry_run, args.no_compress),
-        Command::Restore(args) => cmd_restore(
-            link,
-            args.into.as_deref(),
-            args.unit.as_deref(),
-            args.dry_run,
-        ),
+        Command::Restore(args) => {
+            if !args.no_remote {
+                let _ = settings.remote()?;
+            }
+            cmd_restore(
+                link,
+                args.into.as_deref(),
+                args.unit.as_deref(),
+                args.no_remote,
+                args.dry_run,
+            )
+        }
         Command::Vault => cmd_vault(),
         Command::Verify => cmd_verify(),
-        Command::Store { command } => cmd_store(command, link),
+        Command::Store { command } => cmd_store(command, &settings),
         Command::Exec {
             id,
             cwd,
             harvest,
             no_compress,
+            no_remote,
             work_root,
             rm,
             reuse,
@@ -469,6 +518,7 @@ fn run() -> Result<()> {
             cwd,
             harvest,
             !no_compress,
+            no_remote,
             work_root.as_deref(),
             reuse,
             target_dir.as_deref(),
@@ -478,7 +528,8 @@ fn run() -> Result<()> {
     }
 }
 
-fn cmd_store(command: StoreCommand, link: settings::LinkPolicy) -> Result<()> {
+fn cmd_store(command: StoreCommand, settings: &settings::Settings) -> Result<()> {
+    let link = settings.link()?.0;
     match command {
         StoreCommand::Vault => cmd_vault(),
         StoreCommand::Verify => cmd_verify(),
@@ -487,12 +538,18 @@ fn cmd_store(command: StoreCommand, link: settings::LinkPolicy) -> Result<()> {
         StoreCommand::Harvest(args) => {
             cmd_harvest(args.unit.as_deref(), args.dry_run, args.no_compress)
         }
-        StoreCommand::Restore(args) => cmd_restore(
-            link,
-            args.into.as_deref(),
-            args.unit.as_deref(),
-            args.dry_run,
-        ),
+        StoreCommand::Restore(args) => {
+            if !args.no_remote {
+                let _ = settings.remote()?;
+            }
+            cmd_restore(
+                link,
+                args.into.as_deref(),
+                args.unit.as_deref(),
+                args.no_remote,
+                args.dry_run,
+            )
+        }
         StoreCommand::Overlap(args) => cmd_overlap(&args),
     }
 }
@@ -514,6 +571,22 @@ fn cmd_evict(args: &EvictArgs) -> Result<()> {
         delete: !args.dry_run && args.yes || args.y,
     };
     epicenter_cli::evict::run(&config::cache_root()?, &opts)
+}
+
+fn resolve_remote_key_arg(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let hex = trimmed.strip_prefix("ed25519:").unwrap_or(trimmed);
+    if hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return settings::normalize_remote_publisher_key(trimmed);
+    }
+    let text = util::read_small_text(Path::new(trimmed), 64 * 1024)
+        .with_context(|| format!("reading remote public key {}", trimmed))?;
+    let key = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .context("remote public key file is empty")?;
+    settings::normalize_remote_publisher_key(key)
 }
 
 fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
@@ -601,6 +674,35 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         ),
         None => config::CargoHomeAction::Keep,
     };
+    let remote_url = args
+        .remote_url
+        .as_deref()
+        .map(settings::normalize_remote_url)
+        .transpose()?;
+    let remote_key = args
+        .remote_key
+        .as_deref()
+        .map(resolve_remote_key_arg)
+        .transpose()?;
+    let remote_tier = args.remote_tier.map(Into::into);
+    if !args.remote_off {
+        let existing = settings.global_remote();
+        let effective_url = remote_url
+            .as_deref()
+            .or(existing.and_then(|remote| remote.url.as_deref()));
+        let effective_key = remote_key
+            .as_deref()
+            .or(existing.and_then(|remote| remote.publisher_key.as_deref()));
+        if effective_url.is_some() && effective_key.is_none() {
+            anyhow::bail!(
+                "--remote-url requires --remote-key (or an existing pinned key) — \
+                 obtain it from CI/admin, never from the bucket"
+            );
+        }
+        if effective_key.is_some() && effective_url.is_none() {
+            anyhow::bail!("--remote-key requires --remote-url");
+        }
+    }
     let opts = config::SetupOptions {
         root_arg: args.cache_root.as_deref(),
         use_default: args.use_default,
@@ -611,6 +713,10 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         memory_text: args.memory.as_deref(),
         work_root_arg: args.work_root.as_deref(),
         cargo_home: cargo_home_action,
+        remote_url: remote_url.as_deref(),
+        remote_key: remote_key.as_deref(),
+        remote_tier,
+        remote_off: args.remote_off,
         dry_run: args.dry_run,
     };
     let report = config::setup(&opts, settings)?;
@@ -624,6 +730,23 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         })
     );
     print_policy(&report.policy);
+    if args.remote_off {
+        println!("  {} off (global [remote] removed)", label("remote"));
+    } else if remote_url.is_some() || remote_key.is_some() || remote_tier.is_some() {
+        if let Some(url) = &remote_url {
+            println!("  {} {}", label("remote URL"), url);
+        }
+        if let Some(key) = &remote_key {
+            println!(
+                "  {} {} (pinned; share via CI/admin, never the bucket)",
+                label("remote key"),
+                settings::remote_key_id(key)?
+            );
+        }
+        if let Some(tier) = remote_tier {
+            println!("  {} {}", label("remote tier"), tier.as_str());
+        }
+    }
     println!();
     let cache_note = if report.dry_run { " (not created)" } else { "" };
     println!(
@@ -847,7 +970,7 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
             let status = child.wait().context("running calibration build")?;
             let elapsed = started.elapsed();
             let command = ["cargo".to_string(), "build".to_string()];
-            exec::record_build(&command, elapsed, memory.finish());
+            memory.record_build(&command, elapsed);
             println!(
                 "  {} cargo build · {:.2}s",
                 util::green(util::GLYPH_PASS),
@@ -1299,12 +1422,16 @@ fn cmd_exec(
     cwd: Option<PathBuf>,
     harvest: bool,
     compress: bool,
+    no_remote: bool,
     work_root: Option<&Path>,
     reuse: bool,
     target_dir: Option<&str>,
     rm: bool,
     command: &[String],
 ) -> Result<()> {
+    if !no_remote {
+        let _ = settings.remote()?;
+    }
     let root = config::cache_root()?;
     let cargo_home = match settings.cargo_home()? {
         (path, settings::Source::Global) => Some(path),
@@ -1346,6 +1473,7 @@ fn cmd_exec(
         incremental: exec_incremental(settings),
         link: settings.link()?.0,
         cargo_home: cargo_home.as_deref(),
+        no_remote,
         command,
     };
     let code = exec::run(&vault::store_root(&root), &work_root, &opts)?;
@@ -1433,8 +1561,15 @@ fn cmd_restore(
     link: settings::LinkPolicy,
     into: Option<&std::path::Path>,
     unit: Option<&str>,
+    no_remote: bool,
     dry_run: bool,
 ) -> Result<()> {
+    if no_remote {
+        println!(
+            "  {} disabled by --no-remote",
+            util::dim(&format!("{:<13}", "remote"))
+        );
+    }
     let root = config::cache_root()?;
     let view = into
         .map(std::path::Path::to_path_buf)
@@ -1791,6 +1926,61 @@ mod cli_tests {
                 )
             }
             _ => panic!("expected exec"),
+        }
+    }
+
+    #[test]
+    fn setup_accepts_remote_flags() {
+        let cli = Cli::try_parse_from([
+            "epicenter",
+            "setup",
+            "--remote-url",
+            "https://cache.example/root",
+            "--remote-key",
+            "00",
+            "--remote-tier",
+            "full",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Setup(args) => {
+                assert_eq!(
+                    args.remote_url.as_deref(),
+                    Some("https://cache.example/root")
+                );
+                assert_eq!(args.remote_key.as_deref(), Some("00"));
+                assert!(matches!(args.remote_tier, Some(RemoteTierArg::Full)));
+            }
+            _ => panic!("expected setup"),
+        }
+
+        let cli = Cli::try_parse_from(["epicenter", "setup", "--remote-off"]).unwrap();
+        match cli.command {
+            Command::Setup(args) => assert!(args.remote_off),
+            _ => panic!("expected setup"),
+        }
+    }
+
+    #[test]
+    fn exec_and_restore_accept_no_remote() {
+        let cli = Cli::try_parse_from(["epicenter", "exec", "--no-remote", "--", "true"]).unwrap();
+        match cli.command {
+            Command::Exec { no_remote, .. } => assert!(no_remote),
+            _ => panic!("expected exec"),
+        }
+
+        let cli = Cli::try_parse_from(["epicenter", "restore", "--no-remote"]).unwrap();
+        match cli.command {
+            Command::Restore(args) => assert!(args.no_remote),
+            _ => panic!("expected restore"),
+        }
+
+        let cli = Cli::try_parse_from(["epicenter", "store", "restore", "--no-remote"]).unwrap();
+        match cli.command {
+            Command::Store {
+                command: StoreCommand::Restore(args),
+            } => assert!(args.no_remote),
+            _ => panic!("expected store restore"),
         }
     }
 

@@ -314,6 +314,8 @@ pub struct Options<'a> {
     /// Global `cargo_home` policy; `None` leaves the child's environment
     /// untouched.
     pub cargo_home: Option<&'a Path>,
+    /// Skip remote compatible-unit fetch for this job.
+    pub no_remote: bool,
     /// The command, argv-style.
     pub command: &'a [String],
 }
@@ -602,6 +604,12 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             cargo_home.display()
         );
     }
+    if opts.no_remote {
+        eprintln!(
+            "  {} disabled by --no-remote",
+            util::dim(&format!("{:<11}", "remote"))
+        );
+    }
     if let (Some(layout), Some(version)) = (layout, cargo_version.as_deref()) {
         eprintln!(
             "  {} {} · {}",
@@ -647,7 +655,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         .with_context(|| format!("cannot run `{program}` — is it installed and on PATH?"))?;
     let elapsed = started.elapsed();
     let code = exit_code(&status);
-    record_build(opts.command, elapsed, memory.finish());
+    memory.record_build(opts.command, elapsed);
 
     let harvested = if opts.harvest_back {
         Some(vault::harvest_with(
@@ -752,17 +760,63 @@ impl ChildMemory {
         }
     }
 
-    /// Peak RSS in bytes, or `None` when the tree was too short-lived to
-    /// observe (or the platform has no sampler).
-    pub fn finish(self) -> Option<u64> {
+    /// Stop the sampler and return the peak RSS, if it was observable.
+    pub fn finish(self) -> Result<Option<u64>> {
         #[cfg(windows)]
         {
-            self.sampler?.finish()
+            let rss_bytes: Result<Option<u64>> = match self.sampler {
+                Some(sampler) => sampler.finish(),
+                None => Ok(None),
+            };
+            rss_bytes
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            None
+            Ok(unix_peak_rss())
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(None)
+        }
+    }
+
+    /// Record the last job's wall time and peak child RSS for `doctor`.
+    /// `None` means the state file could not be written; a missing peak is
+    /// stored as JSON `null` rather than a misleading zero.
+    pub fn record_build(
+        self,
+        command: &[String],
+        elapsed: std::time::Duration,
+    ) -> Option<Result<()>> {
+        let peak = match self.finish() {
+            Ok(peak) => peak,
+            Err(err) => {
+                eprintln!(
+                    "could not sample peak resident set size memory of {}: {err:#}",
+                    util::dim(&format!("{:?}", command)),
+                );
+                None
+            }
+        };
+        let state = crate::paths::state_dir().ok()?;
+        if crate::util::create_private_dir_all(&state).is_err() {
+            return None;
+        }
+        let path = state.join("last-build.json");
+        let payload = serde_json::json!({
+            "command": command.join(" "),
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "peak_rss_bytes": peak,
+            "at_unix": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+        });
+        if let Ok(text) = serde_json::to_string(&payload) {
+            let _ = crate::util::write_atomic_private(&path, text.as_bytes());
+        }
+
+        Some(Ok(()))
     }
 }
 
@@ -773,6 +827,7 @@ mod win_rss {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
+    use anyhow::Context;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
@@ -854,7 +909,8 @@ mod win_rss {
 
     pub struct Sampler {
         stop: Option<mpsc::Sender<()>>,
-        worker: Option<JoinHandle<u64>>,
+        /// `None` after `finish`; the inner result preserves a spawn failure.
+        worker: Option<anyhow::Result<JoinHandle<u64>>>,
     }
 
     impl Sampler {
@@ -864,17 +920,23 @@ mod win_rss {
             let worker = thread::Builder::new()
                 .name("epicenter-rss".into())
                 .spawn(move || sample_loop(job, &stopped))
-                .ok()?;
+                .map_err(|e| anyhow::format_err!(e));
             Some(Self {
                 stop: Some(stop),
                 worker: Some(worker),
             })
         }
 
-        pub fn finish(mut self) -> Option<u64> {
+        pub fn finish(mut self) -> anyhow::Result<Option<u64>> {
             self.stop.take();
-            let peak = self.worker.take()?.join().ok()?;
-            (peak > 0).then_some(peak)
+            let worker = self
+                .worker
+                .take()
+                .context("RSS sampler worker was already taken")??;
+            let peak = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("RSS sampler worker panicked"))?;
+            Ok((peak > 0).then_some(peak))
         }
     }
 
@@ -882,7 +944,9 @@ mod win_rss {
         fn drop(&mut self) {
             self.stop.take();
             if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
+                if let Ok(worker) = worker {
+                    let _ = worker.join();
+                }
             }
         }
     }
@@ -964,38 +1028,6 @@ mod win_rss {
             assert!(count >= 2, "job members: {count}");
             Ok(())
         }
-    }
-}
-
-/// Record the last job's wall time and peak child RSS for `doctor`.
-pub fn record_build(command: &[String], elapsed: std::time::Duration, sampled_rss: Option<u64>) {
-    // Windows must sample while the child is alive; Unix keeps its original
-    // post-wait `RUSAGE_CHILDREN` accounting when no sample was supplied.
-    #[cfg(unix)]
-    let rss_bytes = sampled_rss.or_else(unix_peak_rss);
-    #[cfg(not(unix))]
-    let rss_bytes = sampled_rss;
-    let Some(rss_bytes) = rss_bytes else {
-        return;
-    };
-    let Ok(state) = crate::paths::state_dir() else {
-        return;
-    };
-    let path = state.join("last-build.json");
-    if crate::util::create_private_dir_all(&state).is_err() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "command": command.join(" "),
-        "elapsed_secs": elapsed.as_secs_f64(),
-        "peak_rss_bytes": rss_bytes,
-        "at_unix": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0),
-    });
-    if let Ok(text) = serde_json::to_string(&payload) {
-        let _ = crate::util::write_atomic_private(&path, text.as_bytes());
     }
 }
 
@@ -1174,6 +1206,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &command,
         };
         let code = run(store.path(), work.path(), &opts)?;
@@ -1212,6 +1245,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: Some(cargo.path()),
+            no_remote: false,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1242,6 +1276,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1292,6 +1327,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1319,6 +1355,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &bad,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 1);
@@ -1344,6 +1381,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &kept,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1397,6 +1435,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1441,6 +1480,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1480,6 +1520,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &cmd,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1528,6 +1569,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1554,7 +1596,7 @@ mod tests {
             .spawn()?;
         let memory = ChildMemory::start(&child);
         let status = child.wait()?;
-        let peak = memory.finish();
+        let peak = memory.finish()?;
         assert!(status.success());
         assert!(peak.is_some(), "no working set sampled for the child tree");
         Ok(())
@@ -1597,6 +1639,7 @@ mod tests {
             incremental: None,
             link: LinkPolicy::Auto,
             cargo_home: None,
+            no_remote: false,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);

@@ -289,6 +289,8 @@ For every setting, Epicenter resolves values in this exact order:
 
 The old `$CARGO_HOME/epicenter.toml` is no longer read or written. `doctor` reports it as legacy and prints the move command. Make relative `store` and `work` values absolute before moving the file; the new location is their base.
 
+`[remote] tier` follows project > global > `libraries`; all other `[remote]` fields are global-only.
+
 ### The 7 Keys of `epicenter.toml`
 
 All keys are top-level (no `[section]` headers).
@@ -315,6 +317,27 @@ link   = "auto"                  # "auto" | "copy" | "link"
 | `link` | `"auto"`, `"copy"`, `"link"` | `"auto"` | How `restore`/`exec` materialize `.rlib`/`.a` files. `auto` hard-links from a private local store (owner-only ACL on Windows) and copies from network/shared mounts (`9p`, `drvfs`, `NFS`, `SMB`, etc.) or a Windows store with a permissive DACL. `copy` never hard-links. `link` forces hard links on a trusted store but still copies from a mutable store whose Windows DACL is not owner-only (only allowed in global `epicenter.toml`, projects can only tighten to `auto` or `copy`). |
 
 `cargo_home` is opt-in and global-only. `epicenter setup --cargo-home PATH` creates a missing directory with private permissions (or validates an existing real directory), never copies the registry or Cargo credentials, and pins `exec`'s child `CARGO_HOME` to that absolute path. `epicenter setup --cargo-home default` clears it. The same absolute path must be used by the CI publisher and every reader; a different path changes Cargo's source `path` hash and the remote unit is a miss. Raw `cargo` outside `exec` still uses the shell's `CARGO_HOME`; `doctor` warns when the two differ.
+
+### Remote Policy (`[remote]`)
+
+Remote artifact distribution uses a deliberately small table:
+
+```toml
+[remote]
+tier = "libraries"                 # "libraries" | "full"
+url = "https://cache.example/epicenter"
+publisher_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+- `tier` defaults to `libraries`. A project may set only `[remote] tier`; it can tighten `full` to `libraries`, and may select `full` only when the global tier is already `full`.
+- `url` selects the transport: `https://` is anonymous GET, `s3://bucket/prefix` is authenticated S3 (SigV4). TLS is mandatory for both. Credentials, region, proxy and CA come from standard environment variables, never from `epicenter.toml`.
+- `publisher_key` is the pinned Ed25519 public key, 64 hex characters. The short key id is derived from its fingerprint (`ed25519:<16 hex>`). Obtain the key from the CI job summary or an admin-managed channel, **never from the bucket**.
+- The remote import cache defaults to the per-user OS cache (`$XDG_CACHE_HOME/epicenter/remote`, `~/Library/Caches/epicenter/remote`, or `%LOCALAPPDATA%\epicenter\remote`); it is not configurable in the policy file.
+- `epicenter setup --remote-url URL --remote-key HEX|FILE --remote-tier libraries|full` writes the global table and prints the derived key id. `--remote-off` removes it.
+- `epicenter exec --no-remote` and `epicenter store restore --no-remote` force a local-only operation.
+- `doctor` reports the effective tier/source, enabled state, endpoint, key id, transport/region and cache path; `--json` uses the same shape. It also warns when an S3 endpoint has no `AWS_REGION`/`AWS_DEFAULT_REGION`.
+
+**Publisher-key handoff:** CI prints the public key and its key id; a developer copies the exact `setup --remote-key ...` command or file from that trusted output. A key fetched from the bucket is only a TOFU hint, not a trust anchor, and epicenter does not use it automatically.
 
 ### Presets Explained (`auto`, `dev`, `ci`)
 
@@ -460,6 +483,8 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | Configure linker flags in global Cargo config |
 | `epicenter setup --memory <SIZE>` | Set RAM budget (e.g. `16GiB`) for `2 GiB/job` concurrency calculation |
 | `epicenter setup --cargo-home PATH\|default` | Set or clear the global absolute `CARGO_HOME` used by `exec` |
+| `epicenter setup --remote-url URL --remote-key HEX\|FILE [--remote-tier libraries\|full]` | Pin a remote endpoint and publisher key in the global `[remote]` table |
+| `epicenter setup --remote-off` | Remove the global `[remote]` policy table |
 | `epicenter setup --write-profile [--dev-debug full\|line\|none]` | Write recommended profile settings to workspace `Cargo.toml` (with backup) |
 | `epicenter setup --measure` | Run a calibration `cargo build` after setup to record wall time and peak RSS |
 | `epicenter setup --wrapper kache\|sccache\|none` | Configure an external `rustc-wrapper` |
@@ -472,8 +497,10 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter status --unit <NAME>` | Inspect one unit's hashes, deps, files, and freshness (alias: `why`) |
 | `epicenter doctor [--json]` | Audit config, profile, wrapper, filesystem, toolchain, mtimes, and vault |
 | `epicenter exec [FLAGS] -- <CMD>` | Run `<CMD>` in an isolated per-job build dir seeded from the vault |
+| `epicenter exec --no-remote [FLAGS] -- <CMD>` | Force a local-only job; skip remote compatible-unit fetch |
 | `epicenter store harvest [--unit <Q>] [--no-compress] [--dry-run]` | Save compiled units from the shared build dir into the durable vault |
 | `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault |
+| `epicenter store restore --no-remote ...` | Skip remote compatible-unit fetch while restoring |
 | `epicenter store vault` | List vault generations, sizes, and active status |
 | `epicenter store verify` | Verify vault file sizes, timestamps, hashes, and list active `work/` dirs |
 | `epicenter store overlap [--json]` | Report duplicate package/profile variants and repeated bytes in the vault |

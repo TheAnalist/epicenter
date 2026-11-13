@@ -9,9 +9,10 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::paths::{self, DEFAULT_BUILD_DIR};
-use crate::settings::{self, LinkerChoice, Preset, Settings, Source};
+use crate::settings::{self, LinkerChoice, Preset, RemoteTier, Settings, Source};
 use crate::util::metadata_nofollow;
 
 /// The effective shared-cache root: **only** the global
@@ -599,6 +600,11 @@ pub struct SetupOptions<'a> {
     pub memory_text: Option<&'a str>,
     pub work_root_arg: Option<&'a str>,
     pub cargo_home: CargoHomeAction<'a>,
+    /// Resolved, normalized remote values; `None` leaves each field alone.
+    pub remote_url: Option<&'a str>,
+    pub remote_key: Option<&'a str>,
+    pub remote_tier: Option<RemoteTier>,
+    pub remote_off: bool,
     pub dry_run: bool,
 }
 
@@ -862,6 +868,36 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
             settings_changed |= remove_top_key(&mut settings_text, "cargo_home");
         }
     }
+    if opts.remote_off {
+        settings_changed |= remove_remote_table(&mut settings_text)?;
+    } else {
+        if let Some(tier) = opts.remote_tier {
+            settings_changed |= set_remote_key(&mut settings_text, "tier", tier.as_str())?;
+        }
+        if let Some(url) = opts.remote_url {
+            settings_changed |= set_remote_key(&mut settings_text, "url", url)?;
+        }
+        if let Some(key) = opts.remote_key {
+            settings_changed |= set_remote_key(&mut settings_text, "publisher_key", key)?;
+        }
+        if opts.remote_url.is_some() || opts.remote_key.is_some() {
+            let parsed: settings::FileConfig = toml::from_str(&settings_text)
+                .context("parsing the global epicenter.toml after the remote edit")?;
+            let remote = parsed.remote.unwrap_or_default();
+            if let Some(url) = remote.url.as_deref() {
+                settings::normalize_remote_url(url)?;
+            }
+            if let Some(key) = remote.publisher_key.as_deref() {
+                settings::normalize_remote_publisher_key(key)?;
+            }
+            if remote.url.is_some() && remote.publisher_key.is_none() {
+                anyhow::bail!(
+                    "`[remote] url` requires a pinned `publisher_key`; \
+                     pass `--remote-key` for the first setup"
+                );
+            }
+        }
+    }
     let mut settings_backup = None;
     if settings_changed && !opts.dry_run {
         if let Some(parent) = settings_path.parent() {
@@ -1077,6 +1113,34 @@ fn remove_top_key(text: &mut String, key: &str) -> bool {
     lines.remove(index);
     *text = lines.join("\n") + "\n";
     true
+}
+
+/// Set a key inside the `[remote]` table, preserving unrelated tables and
+/// comments. Returns whether the text changed.
+fn set_remote_key(text: &mut String, key: &str, wanted: &str) -> Result<bool> {
+    let before = text.clone();
+    let mut doc: DocumentMut = text.parse().context("parsing the global epicenter.toml")?;
+    let remote = doc
+        .as_table_mut()
+        .entry("remote")
+        .or_insert(Item::Table(Table::new()));
+    let remote = remote
+        .as_table_mut()
+        .context("`[remote]` must be a table, not an inline value")?;
+    remote.insert(key, value(wanted));
+    *text = doc.to_string();
+    Ok(*text != before)
+}
+
+/// Remove the whole `[remote]` table. Returns whether the text changed.
+fn remove_remote_table(text: &mut String) -> Result<bool> {
+    let before = text.clone();
+    let mut doc: DocumentMut = text.parse().context("parsing the global epicenter.toml")?;
+    let removed = doc.as_table_mut().remove("remote").is_some();
+    if removed {
+        *text = doc.to_string();
+    }
+    Ok(*text != before)
 }
 
 /// `<config>.epicenter-bak` (suffix 0).
@@ -1308,6 +1372,27 @@ mod tests {
         let config = dir.path().join("config.toml");
         let err = revert_config_at(&config).unwrap_err();
         assert!(err.to_string().contains("no setup backup"), "{err}");
+    }
+
+    #[test]
+    fn remote_table_edits_preserve_other_tables() -> Result<()> {
+        let mut text =
+            "preset = \"dev\"\n\n[remote]\ntier = \"libraries\"\n\n[net]\noffline = true\n"
+                .to_string();
+        assert!(set_remote_key(
+            &mut text,
+            "url",
+            "https://cache.example/root"
+        )?);
+        assert!(set_remote_key(&mut text, "publisher_key", "ab")?);
+        assert!(text.contains("[net]\noffline = true"), "{text}");
+        assert!(text.contains("tier = \"libraries\""), "{text}");
+
+        assert!(remove_remote_table(&mut text)?);
+        assert!(!text.contains("[remote]"), "{text}");
+        assert!(text.contains("[net]"), "{text}");
+        assert!(text.contains("preset = \"dev\""), "{text}");
+        Ok(())
     }
 
     #[test]

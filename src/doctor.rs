@@ -996,6 +996,14 @@ pub struct ProfileSummary {
     pub global_config: String,
     pub cargo_home: String,
     pub cargo_home_source: String,
+    pub remote_tier: String,
+    pub remote_tier_source: String,
+    pub remote_enabled: bool,
+    pub remote_url: Option<String>,
+    pub remote_key_id: Option<String>,
+    pub remote_transport: String,
+    pub remote_region: Option<String>,
+    pub remote_cache: String,
     pub store: String,
     pub project: Option<String>,
     pub dev: ProfileValues,
@@ -1026,6 +1034,14 @@ impl ProfileSummary {
             "global_config": self.global_config,
             "cargo_home": self.cargo_home,
             "cargo_home_source": self.cargo_home_source,
+            "remote_tier": self.remote_tier,
+            "remote_tier_source": self.remote_tier_source,
+            "remote_enabled": self.remote_enabled,
+            "remote_url": self.remote_url,
+            "remote_key_id": self.remote_key_id,
+            "remote_transport": self.remote_transport,
+            "remote_region": self.remote_region,
+            "remote_cache": self.remote_cache,
             "store": self.store,
             "project": self.project,
             "dev": {
@@ -1061,6 +1077,7 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
     let (jobs, jobs_source) = effective_jobs(cores, job_cap);
     let (link, link_source) = settings.link()?;
     let (cargo_home, cargo_home_source) = settings.cargo_home()?;
+    let remote = settings.remote()?;
     let (active_linker, _) = active_linker();
     let wrapper = crate::config::cargo_configured("rustc-wrapper")?;
     let build_root = crate::config::cache_root().ok();
@@ -1073,6 +1090,7 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
         .as_deref()
         .and_then(profiles)
         .unwrap_or_else(|| (ProfileValues::default(), ProfileValues::default(), false));
+    let remote_url = remote.redacted_url();
 
     Ok(ProfileSummary {
         preset: preset.as_str().to_string(),
@@ -1093,6 +1111,14 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
         global_config: crate::paths::global_config_path()?.display().to_string(),
         cargo_home: cargo_home.display().to_string(),
         cargo_home_source: cargo_home_source.as_str().to_string(),
+        remote_tier: remote.tier.as_str().to_string(),
+        remote_tier_source: remote.tier_source.as_str().to_string(),
+        remote_enabled: remote.enabled,
+        remote_url,
+        remote_key_id: remote.key_id,
+        remote_transport: remote.transport.as_str().to_string(),
+        remote_region: remote.region,
+        remote_cache: remote.cache.display().to_string(),
         store: store.display().to_string(),
         project: project.map(|path| path.display().to_string()),
         dev,
@@ -1274,6 +1300,108 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
             }
         ),
     ));
+    checks.push(check(
+        SEC_CONFIG,
+        if profile.remote_enabled {
+            Level::Pass
+        } else {
+            Level::Info
+        },
+        format!(
+            "remote: {} ({}){}",
+            profile.remote_tier,
+            profile.remote_tier_source,
+            if profile.remote_enabled {
+                " — enabled"
+            } else {
+                " — disabled (no [remote] url)"
+            }
+        ),
+    ));
+    if let Some(url) = &profile.remote_url {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("remote endpoint: {url}"),
+        ));
+    }
+    if let Some(key_id) = &profile.remote_key_id {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Pass,
+            format!(
+                "remote publisher: {key_id} (pinned; obtain it from CI/admin, never the bucket)"
+            ),
+        ));
+    }
+    if profile.remote_enabled {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!(
+                "remote transport: {}{}",
+                profile.remote_transport,
+                profile
+                    .remote_region
+                    .as_deref()
+                    .map(|region| format!(" · region {region}"))
+                    .unwrap_or_default()
+            ),
+        ));
+        if profile.remote_transport == "s3" && profile.remote_region.is_none() {
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                "remote S3 transport has no region in AWS_REGION/AWS_DEFAULT_REGION",
+            ));
+        }
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("remote cache: {}", profile.remote_cache),
+        ));
+        if let Some(ca) = std::env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
+            let ca = PathBuf::from(ca);
+            checks.push(check(
+                SEC_CONFIG,
+                if ca.is_file() {
+                    Level::Pass
+                } else {
+                    Level::Warn
+                },
+                format!(
+                    "remote CA: SSL_CERT_FILE {}{}",
+                    ca.display(),
+                    if ca.is_file() { "" } else { " (missing)" }
+                ),
+            ));
+        } else {
+            checks.push(check(SEC_CONFIG, Level::Info, "remote CA: system roots"));
+        }
+        if std::env::var_os("HTTPS_PROXY")
+            .or_else(|| std::env::var_os("ALL_PROXY"))
+            .is_some_and(|value| !value.is_empty())
+        {
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Info,
+                "remote proxy: environment (redacted)",
+            ));
+        }
+    } else {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("remote cache: {}", profile.remote_cache),
+        ));
+    }
+    if !profile.remote_enabled && profile.remote_key_id.is_some() {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Warn,
+            "remote publisher key is configured but there is no `[remote] url` — remote stays disabled",
+        ));
+    }
     if let Ok(state) = paths::state_dir() {
         checks.push(check(
             SEC_CONFIG,
@@ -1534,11 +1662,14 @@ fn read_last_build() -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let command = value.get("command")?.as_str()?;
     let seconds = value.get("elapsed_secs")?.as_f64()?;
-    let rss = value.get("peak_rss_bytes")?.as_u64()?;
-    Some(format!(
-        "`{command}` — {seconds:.1}s, peak RSS {}",
-        human_bytes(rss)
-    ))
+    let rss = value
+        .get("peak_rss_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|bytes| *bytes > 0);
+    Some(match rss {
+        Some(rss) => format!("`{command}` — {seconds:.1}s, peak RSS {}", human_bytes(rss)),
+        None => format!("`{command}` — {seconds:.1}s, peak RSS unavailable"),
+    })
 }
 
 fn effective_jobs(cores: usize, cap: usize) -> (usize, String) {
