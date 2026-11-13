@@ -40,7 +40,7 @@ Epicenter organizes build state into three simple tiers:
 2. **`store` (The Durable Vault)** — `{cargo-cache-home}/epicenter/store/`
    A read-only, content-addressed snapshot of compiled units keyed by toolchain and compiler flags. It survives `cargo clean`, branch switches, and feeds cold starts.
 3. **`work` (Disposable Per-Job Directories)** — per-user OS cache, e.g. `$XDG_CACHE_HOME/epicenter/work/<id>/` (overridable with `--work-root`)
-   Isolated build directories created by `epicenter exec` and seeded from the `store` vault in milliseconds. Allows 10+ AI agents or CI jobs to compile the same repo in parallel with **zero Cargo lock contention**.
+   Isolated build directories created by `epicenter exec` and seeded from the `store` vault in milliseconds. Allows multiple **git worktrees** of the same project, 10+ AI agents, or CI jobs to compile in parallel with **zero Cargo lock contention**.
 
 ---
 
@@ -116,7 +116,16 @@ Straight-to-the-point commands for humans and AI agents:
   cargo build               # Instant "Fresh" build, zero rustc processes spawned
   ```
 
-### Running AI Agents & Parallel Jobs (Zero Lock Waits)
+### Running AI Agents, Git Worktrees & Parallel Jobs (Zero Lock Waits)
+* **You are working on multiple git worktrees of the same project:**
+  Use an isolated `work` directory per worktree via `epicenter exec` so concurrent builds, test runs, or editor checks across worktrees never block each other on the shared `build/` lock:
+  ```bash
+  # In worktree 1 (e.g. feature-auth):
+  epicenter exec --id wt-auth --reuse --target-dir -- cargo test
+
+  # In worktree 2 (e.g. hotfix-db) at the exact same time:
+  epicenter exec --id wt-hotfix --reuse --target-dir -- cargo build
+  ```
 * **You are running multiple AI coding agents on the same repository simultaneously:**
   ```bash
   # Agent 1 gets its own isolated build dir and target dir, seeded from the vault:
@@ -203,9 +212,9 @@ epicenter store restore
   RUSTUP_TOOLCHAIN=nightly epicenter store harvest
   ```
 
-### Workflow 3: AI Agents & Parallel Local Builds (`exec`)
+### Workflow 3: AI Agents, Git Worktrees & Parallel Local Builds (`exec`)
 
-> **Important rule for agents:** Never point multiple concurrent agents or jobs at the same writable `build/` directory—Cargo's build-dir lock will force them to wait in line. Always use `epicenter exec`.
+> **Important rule for multiple git worktrees & parallel agents:** If you are working on **multiple git worktrees of the same project** (or running concurrent AI agents/jobs), **use Epicenter `work` directories (`epicenter exec`)** instead of pointing concurrent builds at the shared writable `build/` directory. Cargo's build-dir lock serializes concurrent builds on the same `build/` directory—giving each git worktree or agent its own `--id` work directory eliminates lock waits while still sharing 100% of compiled dependencies from the read-only vault.
 
 How `epicenter exec` works:
 1. Reads the project's `Cargo.lock` and selects only the packages needed by this project from the read-only vault.
@@ -434,7 +443,11 @@ epicenter store evict --work-dir agent-1 --yes
 * **WSL Best Practice:** Keep your source code wherever you like (even `/mnt/c/...`), but keep the Epicenter cache and `work/` directories on the native Linux filesystem (`~/.cargo/epicenter/...`). Linux ext4 I/O is 10–30× faster than `/mnt/c`. `epicenter doctor` will warn you if your cache drifts onto a Windows mount.
 * **Never Hardcode Windows Backslash Paths:** Do not manually write `C:\...` into `~/.cargo/config.toml` if WSL shares that file. Always use `epicenter setup --cache-root ...` so paths stay portable.
 * **Cargo Build-Dir Layouts (1.91+ vs 1.100+ / Nightly):**
-  Cargo 1.91–1.99 uses the classic layout (`<profile>/.fingerprint/...`), while Cargo 1.99 nightly and 1.100+ use the new layout (`<profile>/build/<pkg>/<hash>/...`). Epicenter inspects and supports both layouts side-by-side automatically.
+  Cargo 1.91–1.99 uses the classic layout (`<profile>/.fingerprint/...` plus `<profile>/deps/...`), while Cargo 1.99 nightly and 1.100+ use the new per-unit layout (`<profile>/build/<pkg>/<hash>/{fingerprint,out,run}/...`). Epicenter inspects and supports both layouts side-by-side automatically.
+* **Cargo 1.100: nothing new to enable.** The layout change is the default; there is no flag and no separate cache service. The user-facing knob is `build.build-dir` (stable since Cargo 1.91), which `epicenter setup` already writes as `{cargo-cache-home}/epicenter/build`. Intermediates compile there; final binaries still land in each project's `target/`. 1.100 makes that shared directory reliable by consistently putting the build-configuration hash in the unit's parent directory, so different `--features`, profiles, and worktrees no longer collide or miss rebuilds.
+* **What Cargo still does not ship.** A shared build dir is not a complete cache: Cargo has no built-in garbage collection for build artifacts, cross-workspace de-duplication, fine-grained locking, or cross-machine sharing yet. Builds that share a build dir serialize on its per-profile lock, so parallel agents must use `epicenter exec` with one job dir each. Use `epicenter prune` / `store evict` for reclamation; use the vault and remote distribution for cross-machine reuse.
+* **`cargo clean` removes the shared build dir too.** `cargo clean` cleans the effective `build-dir` as well as `target-dir`, so with `epicenter setup` it wipes the shared cache (the durable store survives). To drop final artifacts but keep the cache, remove the project's `target/` directory instead. To clean a disposable job, run `cargo clean` inside `epicenter exec`, where `CARGO_BUILD_BUILD_DIR` points at that job.
+* **Upgrade note.** Cargo 1.100 does not reuse classic-layout units, so expect a one-time recompile after upgrading. Pre-1.100 directories remain on disk until cleaned; `epicenter prune` and `store evict` understand both layouts. Cross-toolchain reuse is still impossible: a different rustc remains a full rebuild.
 
 ---
 

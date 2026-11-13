@@ -101,8 +101,8 @@ Read **[`DOCS.md`](DOCS.md)** for the complete user and agent guide:
 
 1. **[Core Concepts (`build`, `store`, `work`)](DOCS.md#1-core-concepts-three-tiers-one-tool)** — How the three tiers work together.
 2. **[Installation & 30-Second Quickstart](DOCS.md#2-installation--30-second-quickstart)** — Getting started and safe rollback.
-3. **[Practical Recipes ("I want to...")](DOCS.md#3-practical-recipes-i-want-to)** — Copy-paste setups for `lld`/`wild`/`mold`/`gold`, memory limits, profiles, `cargo clean` recovery, and parallel agents.
-4. **[Detailed Workflows](DOCS.md#4-detailed-workflows)** — Daily development, Vault persistence, lock-free AI agents (`exec`), and CI/CD multi-VM fleets.
+3. **[Practical Recipes ("I want to...")](DOCS.md#3-practical-recipes-i-want-to)** — Copy-paste setups for `lld`/`wild`/`mold`/`gold`, memory limits, profiles, `cargo clean` recovery, multiple git worktrees, and parallel agents.
+4. **[Detailed Workflows](DOCS.md#4-detailed-workflows)** — Daily development, Vault persistence, lock-free git worktrees & AI agents (`exec`), and CI/CD multi-VM fleets.
 5. **[Configuration Reference (`epicenter.toml` & Presets)](DOCS.md#5-configuration-reference-epicentertoml--presets)** — Precedence, the 7 policy keys, presets (`auto`, `dev`, `ci`), and linker support.
 6. **[Observability & Diagnostics (`status` & `doctor`)](DOCS.md#6-observability--diagnostics-status--doctor)** — Unit forensics and health checks.
 7. **[Reclaiming Disk Space (`prune` vs `evict`)](DOCS.md#7-reclaiming-disk-space-prune-vs-evict)** — Age-based housekeeping vs deliberate tiered eviction.
