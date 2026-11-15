@@ -756,7 +756,11 @@ fn collect_classic_artifacts(
             if !metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
-            for entry in WalkDir::new(&candidate).min_depth(1) {
+            for entry in WalkDir::new(&candidate)
+                .min_depth(1)
+                .follow_links(false)
+                .follow_root_links(false)
+            {
                 let Ok(entry) = entry else { continue };
                 if !entry.file_type().is_file() {
                     continue;
@@ -779,7 +783,11 @@ fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<Syst
         if !metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
-        for entry in WalkDir::new(&dir).min_depth(1) {
+        for entry in WalkDir::new(&dir)
+            .min_depth(1)
+            .follow_links(false)
+            .follow_root_links(false)
+        {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() {
                 continue;

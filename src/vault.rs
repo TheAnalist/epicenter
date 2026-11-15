@@ -373,7 +373,7 @@ pub fn sweep_store_debris(store_root: &Path) {
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true);
         if still_empty {
-            let _ = crate::util::force_remove_dir(&dir);
+            let _ = util::remove_tree(store_root, &dir);
             drop(_lock);
             remove_generation_lock(store_root, &generation);
         }
@@ -403,7 +403,7 @@ pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
     let Ok(Some(lock)) = FileLock::try_acquire(&lock_path) else {
         return Ok(false);
     };
-    crate::util::force_remove_dir(&dir)?;
+    util::remove_tree(store_root, &dir)?;
     drop(lock);
     remove_generation_lock(store_root, parity);
     Ok(true)
@@ -436,6 +436,13 @@ pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<Stri
     Ok(names)
 }
 
+/// Create or validate the writable store root before a harvest.
+///
+/// A missing root is created with private permissions. An existing root must
+/// be a real directory (never a symlink/reparse point) and is tightened to
+/// 0700; on Windows its DACL must grant write access only to the owner,
+/// SYSTEM or Administrators. The store marker is written last, so a
+/// partially prepared directory is never mistaken for a valid store.
 fn ensure_store_root(store_root: &Path) -> Result<()> {
     util::ensure_windows_user_path(store_root, "store")?;
     match util::metadata_nofollow(store_root) {
@@ -544,6 +551,12 @@ pub struct UnitEntry {
     pub memo: String,
     /// Memo file content — the authoritative 16-hex hash.
     pub hash: String,
+    /// Package version the unit was compiled from, when the build dir records
+    /// it (registry crates via rustc's `.d` source list). Restore only seeds
+    /// it into a lock that resolves the same version; `None` keeps the
+    /// name-only match for git/path crates and older manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Canonical mtime of the whole group (whole seconds).
     pub stamp: u64,
     /// Build-dir layout this group reconstructs. Absent in manifests written
@@ -604,6 +617,16 @@ impl UnitEntry {
         if !self.hash.is_empty() && !fingerprint::looks_like_hash(&self.hash) {
             let shown: String = self.hash.chars().take(32).collect();
             anyhow::bail!("invalid memo hash {shown:?} in unit {}", self.name);
+        }
+        if let Some(version) = &self.version {
+            if version.is_empty()
+                || version.len() > 64
+                || !version
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
+            {
+                anyhow::bail!("invalid package version {version:?} in unit {}", self.name);
+            }
         }
         let mut paths = std::collections::HashSet::with_capacity(self.files.len());
         for file in &self.files {
@@ -1127,7 +1150,7 @@ fn load_manifest_at(store_root: &Path, parity: &str, repair: bool) -> Result<Opt
                 }
                 let dir = units.join(&unit.name);
                 if util::metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
-                    let _ = fs::remove_dir_all(&dir);
+                    let _ = util::remove_tree(store_root, &dir);
                 }
             }
             let _ = save_manifest(store_root, parity, &manifest);
@@ -1207,20 +1230,35 @@ pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
         fs::read_dir(store_root).with_context(|| format!("reading {}", store_root.display()))?
     {
         let entry = entry?;
-        if let Ok(meta) = metadata_nofollow(&entry.path())
-            && meta.is_dir()
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') && names.len() >= MAX_GENERATIONS {
-                names.push(name);
-            } else {
-                anyhow::bail!(
-                    "store {} has more than {} generation directories — refusing an unbounded scan",
-                    store_root.display(),
-                    MAX_GENERATIONS
-                );
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let meta = match metadata_nofollow(&entry.path()) {
+            Ok(meta) => meta,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", entry.path().display()));
             }
         };
+        if !meta.is_dir() {
+            continue;
+        }
+        if names.len() >= MAX_GENERATIONS {
+            anyhow::bail!(
+                "store {} has more than {} generation directories — refusing an unbounded scan",
+                store_root.display(),
+                MAX_GENERATIONS
+            );
+        }
+        names.push(name);
     }
     names.sort();
     Ok(names)
@@ -1241,7 +1279,7 @@ pub struct StoredUnit {
 
 /// Every stored unit across all generations, manifest-driven.
 pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
-    if metadata_nofollow(store_root).is_ok() {
+    if metadata_nofollow(&store_root).is_ok() {
         check_store_trust(store_root)?;
     }
     let mut out = Vec::new();
@@ -1288,6 +1326,25 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
         check_store_trust(store_root)?;
     }
     let lock = FileLock::acquire(&store_lock_path(store_root, generation))?;
+    let generation_dir = store_root.join(generation);
+    match metadata_nofollow(&generation_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            drop(lock);
+            remove_generation_lock(store_root, generation);
+            return Ok(0);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "generation {} is a symlink/reparse point",
+                generation_dir.display()
+            );
+        }
+        Ok(_) => anyhow::bail!("generation {} is not a directory", generation_dir.display()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", generation_dir.display()));
+        }
+    }
     let Some(mut manifest) = load_manifest_at(store_root, generation, true)? else {
         return Ok(0);
     };
@@ -1331,28 +1388,26 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
                 kept.push(entry);
             }
             Ok(meta) if meta.is_dir() => {
-                // Defense in depth even after the component validator: the
-                // target must be a direct child of the units directory.
-                if let Ok(base) = fs::canonicalize(&units) {
-                    match fs::canonicalize(&dir) {
-                        Ok(canon) if canon.parent() == Some(base.as_path()) && canon != base => {}
-                        _ => {
+                // Delete relative to the store root, walking every component
+                // with no-follow. The old canonicalize-then-remove_dir_all
+                // sequence was a check/use race.
+                match util::remove_tree(store_root, &dir) {
+                    Ok(()) => {
+                        // A path swap during deletion is skipped safely. Do
+                        // not prune the manifest entry if the unit is still
+                        // there.
+                        if util::metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
                             eprintln!(
-                                "could not remove {}: escapes {}",
-                                dir.display(),
-                                units.display()
+                                "could not remove {}: path changed or is not a real directory",
+                                dir.display()
                             );
                             kept.push(entry);
-                            continue;
+                        } else {
+                            dropped += 1;
                         }
                     }
-                }
-                match fs::remove_dir_all(&dir) {
-                    Ok(()) => {
-                        dropped += 1;
-                    }
                     Err(err) => {
-                        eprintln!("could not remove {}: {err}", dir.display());
+                        eprintln!("could not remove {}: {err:#}", dir.display());
                         kept.push(entry);
                     }
                 }
@@ -1373,7 +1428,7 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
     manifest.units = kept;
     let empty = manifest.units.is_empty();
     if empty {
-        let _ = crate::util::force_remove_dir(&store_root.join(generation));
+        let _ = util::remove_tree(store_root, &generation_dir);
     } else if dropped > 0 {
         manifest.updated = now_secs();
         save_manifest(store_root, generation, &manifest)?;
@@ -1396,7 +1451,14 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
         .collect();
     let blobs = store_root.join(generation).join("blobs");
     let generation_root = store_root.join(generation);
-    for entry in WalkDir::new(&blobs).min_depth(1).contents_first(true) {
+    let walker = WalkDir::new(&blobs)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .contents_first(true)
+        .into_iter()
+        .filter_entry(|entry| util::walk_entry_is_safe(&blobs, entry));
+    for entry in walker {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -1409,10 +1471,10 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
                 .to_string_lossy()
                 .replace('\\', "/");
             if !referenced.contains(rel.as_str()) {
-                let _ = fs::remove_file(path);
+                let _ = util::remove_file(store_root, path);
             }
         } else if entry.file_type().is_dir() {
-            let _ = fs::remove_dir(path);
+            let _ = util::remove_empty_dir(store_root, path);
         }
     }
 }
@@ -1432,6 +1494,23 @@ pub struct HarvestReport {
     pub files: usize,
     pub bytes: u64,
     pub note: Option<String>,
+    /// Set when the caller bypassed the exec-record gate (`--trusted`).
+    pub trusted: Option<String>,
+}
+
+/// Who vouches for a build root at harvest time.
+///
+/// Harvest is a signing step: the vault manifest is authenticated, so whatever
+/// is signed becomes indistinguishable from a build this host trusts. A build
+/// dir is untrusted input, so the default is [`Recorded`](Self::Recorded).
+#[derive(Debug, Clone, Copy)]
+pub enum HarvestTrust<'a> {
+    /// Sign only a build this host ran: a job dir needs the `exec` record
+    /// written next to it, and a shared build dir must be local and private.
+    Recorded,
+    /// Explicit trusted-builder mode (`--trusted`): the caller asserts that
+    /// every writer of this build root is in the same trust domain.
+    Trusted(&'a str),
 }
 
 /// Store unit groups from a build dir into the vault.
@@ -1446,7 +1525,7 @@ pub fn harvest(
     unit_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<HarvestReport> {
-    harvest_with(
+    harvest_with_trust(
         build_root,
         store_root,
         unit_filter,
@@ -1454,6 +1533,7 @@ pub fn harvest(
         None,
         None,
         true,
+        HarvestTrust::Recorded,
     )
 }
 
@@ -1469,7 +1549,31 @@ pub fn harvest_with(
     layout: Option<fingerprint::UnitLayout>,
     compress: bool,
 ) -> Result<HarvestReport> {
+    harvest_with_trust(
+        build_root,
+        store_root,
+        unit_filter,
+        dry_run,
+        selector,
+        layout,
+        compress,
+        HarvestTrust::Recorded,
+    )
+}
+
+/// [`harvest_with`] with an explicit trust decision.
+pub fn harvest_with_trust(
+    build_root: &Path,
+    store_root: &Path,
+    unit_filter: Option<&str>,
+    dry_run: bool,
+    selector: Option<&str>,
+    layout: Option<fingerprint::UnitLayout>,
+    compress: bool,
+    trust: HarvestTrust<'_>,
+) -> Result<HarvestReport> {
     let build_root = validate_build_root(build_root)?;
+    authorize_harvest(&build_root, trust)?;
     // Fence the writer against a live Cargo build. A lock check that drops the
     // handles races the build that starts one instruction later.
     let _build_locks = match crate::exec::cargo_locks(&build_root)? {
@@ -1484,6 +1588,10 @@ pub fn harvest_with(
     let mut report = HarvestReport {
         parity: parity.clone(),
         toolchain: tc.version_line(),
+        trusted: match trust {
+            HarvestTrust::Trusted(reason) => Some(reason.to_string()),
+            HarvestTrust::Recorded => None,
+        },
         ..Default::default()
     };
 
@@ -1499,11 +1607,28 @@ pub fn harvest_with(
         let lock = FileLock::acquire(&store_lock_path(store_root, &parity))?;
         // Self-heal debris from a crashed or failed store run (dot-dirs whose
         // copies may have inherited read-only sources) before planning.
-        sweep_staging(&units_dir(store_root, &parity));
+        sweep_staging(&units_dir(store_root, &parity))?;
         Some(lock)
     };
-
     let generation_root = store_root.join(&parity);
+    match metadata_nofollow(&generation_root) {
+        Ok(meta) if meta.is_dir() => {}
+        // A dry run does not create the generation directory.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!(
+                "generation {} is a symlink/reparse point",
+                generation_root.display()
+            );
+        }
+        Ok(_) => anyhow::bail!(
+            "generation {} is not a directory",
+            generation_root.display()
+        ),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", generation_root.display()));
+        }
+    }
     let blobs = if compress && !dry_run {
         Some(generation_root.clone())
     } else {
@@ -1583,6 +1708,12 @@ pub fn harvest_with(
         signature: String::new(),
     });
 
+    let mut manifest_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(manifest.units.len());
+    for (index, entry) in manifest.units.iter().enumerate() {
+        manifest_index.entry(entry.name.clone()).or_insert(index);
+    }
+
     let mut plans = Vec::with_capacity(rows.len());
     for (unit, arts) in rows {
         if let Some(query) = unit_filter {
@@ -1595,7 +1726,12 @@ pub fn harvest_with(
             report.skipped_stale += 1;
             continue;
         }
-        match plan_unit(unit, &arts, &build_root)? {
+        // A unit already stored with a version keeps it: no second `.d` read
+        // on a warm harvest.
+        let known = manifest_index
+            .get(&unit.dir_name)
+            .and_then(|&index| manifest.units[index].version.as_deref());
+        match plan_unit(unit, &arts, &build_root, known)? {
             Some(plan) => plans.push(plan),
             None => report.skipped_incomplete += 1,
         }
@@ -1603,15 +1739,10 @@ pub fn harvest_with(
 
     resolve_plan_graph(&mut plans, &manifest);
 
-    let mut manifest_index: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::with_capacity(manifest.units.len());
-    for (index, entry) in manifest.units.iter().enumerate() {
-        manifest_index.entry(entry.name.clone()).or_insert(index);
-    }
-
     // Select work once: compare the planned file set with the manifest, then
     // keep only the plans that need a copy.
     let mut pending: Vec<usize> = Vec::new();
+    let mut version_changed = false;
     for (at, plan) in plans.iter().enumerate() {
         let unit = &plan.unit;
         let group_dir = units_dir(store_root, &parity).join(&unit.dir_name);
@@ -1647,6 +1778,14 @@ pub fn harvest_with(
             })
             .unwrap_or(false);
         if already {
+            // An older manifest has no version. Learn it in place instead of
+            // re-copying unchanged files just to add one field.
+            if let Some(&slot) = manifest_index.get(&unit.dir_name) {
+                if manifest.units[slot].version != plan.version {
+                    manifest.units[slot].version = plan.version.clone();
+                    version_changed = true;
+                }
+            }
             report.unchanged += 1;
             continue;
         }
@@ -1692,6 +1831,7 @@ pub fn harvest_with(
                 profile: plan.unit.profile.clone(),
                 memo: plan.memo.clone(),
                 hash: plan.hash.clone(),
+                version: plan.version.clone(),
                 stamp: plan.stamp,
                 layout: Some(plan.unit.layout),
                 files: entries,
@@ -1712,7 +1852,7 @@ pub fn harvest_with(
         }
     }
 
-    if !dry_run && (changed || !had_manifest || manifest.units.is_empty()) {
+    if !dry_run && (changed || version_changed || !had_manifest || manifest.units.is_empty()) {
         manifest.units.sort_by(|a, b| {
             (a.profile.as_str(), a.name.as_str()).cmp(&(b.profile.as_str(), b.name.as_str()))
         });
@@ -1736,6 +1876,7 @@ struct UnitPlan {
     files: Vec<PlannedFile>,
     memo: String,
     hash: String,
+    version: Option<String>,
     base: u64,
     bytes: u64,
     deps: Vec<usize>,
@@ -1759,9 +1900,56 @@ fn read_rows(
     })
 }
 
+/// Package version from rustc's dep-info side file.
+///
+/// Registry crates live at `…/registry/src/<index>/<name>-<version>/…` and
+/// rustc's `.d` file lists that path. One bounded read per planned unit; a
+/// missing or non-registry source yields `None`, which keeps the name-only
+/// match at restore instead of dropping the unit.
+fn unit_version(arts: &ArtifactInfo, package: &str) -> Option<String> {
+    let dep = arts
+        .paths
+        .iter()
+        .map(|(path, _, _)| path)
+        .find(|path| path.extension().is_some_and(|ext| ext == "d"))?;
+    let text = util::read_text_prefix(dep, 64 * 1024).ok()?;
+    let (_, sources) = text.lines().next()?.split_once(": ")?;
+    for token in sources.split_whitespace() {
+        let normalized = token.replace("\\ ", " ").replace('\\', "/");
+        if !normalized.contains("/registry/src/") && !normalized.contains("/git/checkouts/") {
+            continue;
+        }
+        for component in Path::new(&normalized).components().rev() {
+            let name = component.as_os_str().to_string_lossy();
+            let Some((crate_name, version)) = name.rsplit_once('-') else {
+                continue;
+            };
+            if crate_name == package && looks_like_version(version) {
+                return Some(version.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_version(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 64
+        && text.starts_with(|ch: char| ch.is_ascii_digit())
+        && text.contains('.')
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
+}
+
 /// Turn one discovered unit into a copy plan. File size and mtime are read
 /// once here, so later phases never walk the same files again.
-fn plan_unit(unit: Unit, arts: &ArtifactInfo, build_root: &Path) -> Result<Option<UnitPlan>> {
+fn plan_unit(
+    unit: Unit,
+    arts: &ArtifactInfo,
+    build_root: &Path,
+    known_version: Option<&str>,
+) -> Result<Option<UnitPlan>> {
     let unit_dir = &unit.fingerprint_dir;
     let profile_dir = build_root.join(&unit.profile);
     let memo = unit.memo_file.clone();
@@ -1888,11 +2076,15 @@ fn plan_unit(unit: Unit, arts: &ArtifactInfo, build_root: &Path) -> Result<Optio
 
     let bytes = files.iter().map(|file| file.size).sum();
     let base = group_base(&files);
+    let version = known_version
+        .map(str::to_string)
+        .or_else(|| unit_version(arts, &unit.package));
     Ok(Some(UnitPlan {
         unit,
         files,
         memo,
         hash,
+        version,
         base,
         bytes,
         deps: Vec::new(),
@@ -2048,7 +2240,7 @@ fn store_group(
     if let Err(err) = stage_group(&tmp, files, stamp, blobs, entries) {
         // Never leave a half-written staging dir behind: it would keep a
         // failed unit's bytes on disk and hide the failure from the next run.
-        let _ = crate::util::force_remove_dir(&tmp);
+        let _ = util::remove_tree(&units, &tmp);
         return Err(err);
     }
 
@@ -2056,11 +2248,11 @@ fn store_group(
     match util::metadata_nofollow(&final_dir) {
         Ok(meta) if meta.is_dir() => fs::rename(&final_dir, &old)?,
         Ok(_) => {
-            let _ = crate::util::force_remove_dir(&tmp);
+            let _ = util::remove_tree(&units, &tmp);
             anyhow::bail!("store unit path {} is not a directory", final_dir.display());
         }
         Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            let _ = crate::util::force_remove_dir(&tmp);
+            let _ = util::remove_tree(&units, &tmp);
             anyhow::bail!(
                 "refusing symlinked/reparse store unit {}",
                 final_dir.display()
@@ -2071,7 +2263,7 @@ fn store_group(
     }
     fs::rename(&tmp, &final_dir)?;
     if util::metadata_nofollow(&old).is_ok_and(|meta| meta.is_dir()) {
-        let _ = fs::remove_dir_all(&old);
+        let _ = util::remove_tree(&units, &old);
     }
     Ok(())
 }
@@ -2160,10 +2352,9 @@ fn stage_group(
 /// Remove staging leftovers (`.{unit}.tmp-{pid}`, `.{unit}.old-{pid}`) that a
 /// crashed or failed run left in the units dir. Fresh dirs are left alone: a
 /// concurrent harvest may be filling them right now.
-fn sweep_staging(units: &Path) {
-    let Ok(entries) = fs::read_dir(units) else {
-        return;
-    };
+fn sweep_staging(units: &Path) -> Result<()> {
+    metadata_nofollow(units)?;
+    let entries = fs::read_dir(units)?;
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -2175,7 +2366,7 @@ fn sweep_staging(units: &Path) {
             Ok(meta) => meta,
             // Unlink a planted symlink/reparse name itself; never traverse it.
             Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-                let _ = fs::remove_file(entry.path());
+                let _ = util::remove_file(units, &entry.path());
                 continue;
             }
             Err(_) => continue,
@@ -2189,9 +2380,10 @@ fn sweep_staging(units: &Path) {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > Duration::from_secs(600));
         if stale {
-            let _ = crate::util::force_remove_dir(&entry.path());
+            let _ = util::remove_tree(units, &entry.path());
         }
     }
+    Ok(())
 }
 
 /// Round a timestamp up to whole seconds.
@@ -2779,7 +2971,7 @@ fn store_is_private(store_root: &Path) -> bool {
 /// mount is the multi-VM topology: another machine (or an uncontrolled agent)
 /// can write the inode behind a hard link.
 #[cfg(target_os = "linux")]
-fn store_is_shared_mount(store_root: &Path) -> bool {
+pub(crate) fn store_is_shared_mount(store_root: &Path) -> bool {
     let Ok(target) = fs::canonicalize(store_root) else {
         return true;
     };
@@ -2851,7 +3043,7 @@ fn is_network_fstype(fstype: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn store_is_shared_mount(store_root: &Path) -> bool {
+pub(crate) fn store_is_shared_mount(store_root: &Path) -> bool {
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
     let Ok(path) = CString::new(store_root.as_os_str().as_bytes()) else {
@@ -2871,7 +3063,7 @@ fn store_is_shared_mount(store_root: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn store_is_shared_mount(store_root: &Path) -> bool {
+pub(crate) fn store_is_shared_mount(store_root: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = store_root
         .as_os_str()
@@ -2912,14 +3104,15 @@ fn store_is_shared_mount(_store_root: &Path) -> bool {
 /// partial vault is fine: Cargo recompiles whatever is missing.
 ///
 /// `unit_filter` narrows by substring (`restore --unit`); `packages` narrows
-/// to a package set (`exec` passes the project's `Cargo.lock` packages, so a
-/// job never inherits every other project's units). Unit names that cannot be
-/// split into package + hash are kept rather than dropped (fail-open).
+/// to the project's `Cargo.lock` (`exec` passes the index it already parsed,
+/// so a job never inherits every other project's units and a unit only lands
+/// where the lock resolves its exact package version). Unit names that cannot
+/// be split into package + hash are kept rather than dropped (fail-open).
 pub fn restore(
     view_root: &Path,
     store_root: &Path,
     unit_filter: Option<&str>,
-    packages: Option<&std::collections::HashSet<String>>,
+    packages: Option<&crate::lockfile::LockIndex>,
     dry_run: bool,
 ) -> Result<RestoreReport> {
     restore_with(
@@ -2961,7 +3154,7 @@ pub fn restore_with(
     view_root: &Path,
     store_root: &Path,
     unit_filter: Option<&str>,
-    packages: Option<&std::collections::HashSet<String>>,
+    packages: Option<&crate::lockfile::LockIndex>,
     layout: Option<fingerprint::UnitLayout>,
     selector: Option<&str>,
     dry_run: bool,
@@ -3010,7 +3203,9 @@ pub fn restore_with(
         }
         if let Some(packages) = packages {
             if let Some(package) = unit_package(&entry.name) {
-                if !packages.contains(package) {
+                // The lock must resolve this exact version; a unit without a
+                // recorded version keeps the name-only match.
+                if !packages.matches(package, entry.version.as_deref()) {
                     continue;
                 }
             }
@@ -3339,12 +3534,37 @@ fn restore_unit(
     out
 }
 
-/// The store is a trust boundary: refuse a symlinked, foreign-owned, or
-/// group/world-writable store. A root process must not consume a user-owned
-/// vault (that is the hard-link privesc this fix closes).
 /// Harvest is a signing step: only accept a real, local, non-shared build
 /// root. A group/world-writable build dir is a shared trust domain, and every
 /// unit found there would be signed into the vault.
+/// Refuse to sign a build root this host cannot vouch for.
+///
+/// The ownership/mode check in [`validate_build_root`] is not enough: a job
+/// dir or a shared build dir can still be written by another process between
+/// the check and the copy. The job marker decides which proof applies.
+fn authorize_harvest(build_root: &Path, trust: HarvestTrust<'_>) -> Result<()> {
+    if let HarvestTrust::Trusted(_) = trust {
+        return Ok(());
+    }
+    // A network mount is a second trust domain: the writer may be a different
+    // machine entirely, so nothing inside the dir is a provenance signal.
+    if store_is_shared_mount(build_root) {
+        anyhow::bail!(
+            "build dir {} is a network/shared mount — refusing to sign it; pass --trusted only if every writer is in this trust domain",
+            build_root.display()
+        );
+    }
+    if let Some(token) = crate::exec::job_marker_token(build_root)? {
+        if crate::exec::record_covers(build_root, &token)?.is_none() {
+            anyhow::bail!(
+                "job dir {} has no epicenter exec record on this host — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
+                build_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_build_root(build_root: &Path) -> Result<PathBuf> {
     let build_root = util::validate_state_root(build_root, "build root")?;
     let meta = util::metadata_nofollow(&build_root)
@@ -3371,6 +3591,13 @@ fn validate_build_root(build_root: &Path) -> Result<PathBuf> {
     Ok(build_root)
 }
 
+/// Read-side trust check for an existing store.
+///
+/// A writable store must be a real directory owned by the reader, with a
+/// private DACL on Windows. A foreign, read-only mount is accepted: the OS
+/// denies writes and the manifest signature is verified separately. Read
+/// paths never chmod or repair an operator-selected directory; the writer
+/// marks and tightens it in [`ensure_store_root`].
 pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
     let meta = match util::metadata_nofollow(store_root) {
         Ok(meta) => meta,
@@ -3407,6 +3634,10 @@ pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create or validate a restore target. An existing root must be a real
+/// directory owned by us (and not group/world-writable on Unix); Windows
+/// additionally requires a private DACL. Existing roots are never chmodded,
+/// so `restore --into /` or `--into ~` cannot change system/home modes.
 fn prepare_view_root(view_root: &Path) -> Result<()> {
     match util::metadata_nofollow(view_root) {
         Ok(meta) => {
@@ -3726,7 +3957,10 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                 entry.files.iter().map(|file| file.path.clone()).collect();
             let walk = match WalkDir::new(&unit_dir)
                 .min_depth(1)
+                .follow_links(false)
+                .follow_root_links(false)
                 .into_iter()
+                .filter_entry(|entry| util::walk_entry_is_safe(&unit_dir, entry))
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(walk) => walk,
@@ -3738,8 +3972,10 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                 }
             };
             for file in walk {
-                if !file.file_type().is_file() {
-                    continue;
+                match metadata_nofollow(&file.path()) {
+                    Ok(meta) if !meta.is_file() => continue,
+                    Ok(_) => (),
+                    Err(_) => continue,
                 }
                 let rel = file
                     .path()
@@ -3951,10 +4187,16 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
             info.updated = Some(manifest.updated);
         }
         let units = units_dir(store_root, &parity);
-        if units.is_dir() {
+        if metadata_nofollow(&units).is_ok() && units.is_dir() {
             #[cfg(unix)]
             let mut seen_inodes = std::collections::HashSet::new();
-            for entry in WalkDir::new(&units).min_depth(1) {
+            let walker = WalkDir::new(&units)
+                .min_depth(1)
+                .follow_links(false)
+                .follow_root_links(false)
+                .into_iter()
+                .filter_entry(|entry| util::walk_entry_is_safe(&units, entry));
+            for entry in walker {
                 let entry = entry?;
                 scanned = scanned.saturating_add(1);
                 if scanned > MAX_SCAN_FILES {
@@ -4179,6 +4421,7 @@ mod tests {
             profile: "debug".into(),
             memo: "lib-demo".into(),
             hash: hash.into(),
+            version: None,
             stamp: 1,
             layout: None,
             files: vec![FileEntry {
@@ -4451,6 +4694,24 @@ mod tests {
             &["serde-102a33f055a8d229".into()],
         )?;
         assert!(!store2.path().join(&report2.parity).join(object).exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_units_refuses_a_symlinked_generation() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        fs::create_dir_all(victim.path().join("units/x"))?;
+        fs::write(victim.path().join("units/x/keep"), b"keep")?;
+        std::os::unix::fs::symlink(victim.path(), store.path().join("victim-parity"))?;
+
+        let err = drop_units(store.path(), "victim-parity", &["x".into()]).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink") || format!("{err:#}").contains("reparse"));
+        assert!(
+            victim.path().join("units/x/keep").exists(),
+            "a symlinked generation must not redirect deletion"
+        );
         Ok(())
     }
 
@@ -4771,8 +5032,13 @@ mod tests {
         synthetic_edge_dir(build.path(), now - 3600, now)?;
         harvest(build.path(), store.path(), None, false)?;
 
-        let mut packages = std::collections::HashSet::new();
-        packages.insert("serde_core".to_string());
+        let lock = tempfile::tempdir()?;
+        let lock = lock.path().join("Cargo.lock");
+        fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"serde_core\"\nversion = \"1.0.0\"\n",
+        )?;
+        let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
         let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
         assert_eq!(report.errors, 0);
         assert!(
@@ -5523,6 +5789,7 @@ mod tests {
             profile: profile.into(),
             memo: "lib-x".into(),
             hash: "0123456789abcdef".into(),
+            version: None,
             stamp: 1,
             layout: None,
             files: vec![FileEntry {
@@ -5779,6 +6046,108 @@ mod tests {
         let reports = verify(store.path())?;
         assert!(reports[0].is_clean(), "{:?}", reports[0].problems);
         assert!(reports[0].ordering.is_empty(), "{:?}", reports[0].ordering);
+        Ok(())
+    }
+
+    /// A job-dir shape: a private build root with the exec marker, nested in a
+    /// work root so the record lives beside it.
+    fn job_dir(home: &Path) -> Result<PathBuf> {
+        let build = home.join("job");
+        util::create_private_dir_all(&build)?;
+        fs::write(
+            build.join(crate::exec::JOB_MARKER),
+            "epicenter-job-v1\n0123456789abcdef0123456789abcdef\n",
+        )?;
+        Ok(build)
+    }
+
+    #[test]
+    fn harvest_refuses_a_job_dir_without_an_exec_record() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let build = job_dir(home.path())?;
+        synthetic_build_dir(&build)?;
+        let store = tempfile::tempdir()?;
+
+        let err = harvest(&build, store.path(), None, false).unwrap_err();
+        assert!(err.to_string().contains("exec record"), "{err}");
+        assert!(
+            load_manifest(store.path(), &parity_key()?)?.is_none(),
+            "nothing was signed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn harvest_accepts_a_job_dir_with_an_exec_record() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let build = job_dir(home.path())?;
+        synthetic_build_dir(&build)?;
+        let store = tempfile::tempdir()?;
+        crate::exec::record_for_test(&build)?;
+
+        let report = harvest(&build, store.path(), None, false)?;
+        assert!(report.stored > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn harvest_records_the_registry_version_from_dep_info() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        fs::write(
+            build.path().join("debug/deps/serde-102a33f055a8d229.d"),
+            "/work/deps/libserde-102a33f055a8d229.rlib: \
+             /home/u/.cargo/registry/src/index.crates.io-abc/serde-1.0.219/src/lib.rs\n",
+        )?;
+        harvest(build.path(), store.path(), None, false)?;
+
+        let manifest = load_manifest(store.path(), &parity_key()?)?.expect("manifest");
+        let entry = manifest
+            .units
+            .iter()
+            .find(|entry| entry.name == "serde-102a33f055a8d229")
+            .expect("serde unit stored");
+        assert_eq!(entry.version.as_deref(), Some("1.0.219"));
+        Ok(())
+    }
+
+    #[test]
+    fn restore_binds_a_unit_to_the_lock_version() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        fs::write(
+            build.path().join("debug/deps/serde-102a33f055a8d229.d"),
+            "/work/deps/libserde-102a33f055a8d229.rlib: \
+             /home/u/.cargo/registry/src/index.crates.io-abc/serde-1.0.219/src/lib.rs\n",
+        )?;
+        harvest(build.path(), store.path(), None, false)?;
+
+        let locks = tempfile::tempdir()?;
+        let lock = locks.path().join("Cargo.lock");
+        fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.218\"\n",
+        )?;
+        let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
+        let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
+        assert_eq!(report.units_linked, 0, "a version mismatch is not seeded");
+        assert!(
+            !view
+                .path()
+                .join("debug/.fingerprint/serde-102a33f055a8d229")
+                .exists()
+        );
+
+        fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n",
+        )?;
+        let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
+        let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
+        assert!(report.units_linked > 0, "the matching version is seeded");
         Ok(())
     }
 }

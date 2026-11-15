@@ -8,6 +8,7 @@ pub mod evict;
 pub mod exec;
 pub mod fastlink;
 pub mod fingerprint;
+pub mod lockfile;
 pub mod paths;
 pub mod profile;
 pub mod prune;

@@ -14,7 +14,6 @@
 //! frame lines go to stderr, and the command's exit code becomes epicenter's
 //! exit code.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,37 +62,50 @@ fn job_marker_path(work_dir: &Path) -> PathBuf {
     work_dir.join(JOB_MARKER)
 }
 
-fn write_job_marker(work_dir: &Path) -> Result<()> {
+fn write_job_marker(work_dir: &Path) -> Result<String> {
     let mut token = [0u8; 16];
     getrandom::fill(&mut token).map_err(|err| anyhow::anyhow!("generating job token: {err}"))?;
     let token_hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
     let body = format!("{JOB_MARKER_VERSION}\n{token_hex}\n");
     crate::util::write_atomic_private(&job_marker_path(work_dir), body.as_bytes())
-        .with_context(|| format!("writing job marker in {}", work_dir.display()))
+        .with_context(|| format!("writing job marker in {}", work_dir.display()))?;
+    Ok(token_hex)
 }
 
-fn has_job_marker(work_dir: &Path) -> Result<bool> {
+/// The job token, when `work_dir` carries a well-formed marker.
+pub(crate) fn job_marker_token(work_dir: &Path) -> Result<Option<String>> {
     let text = match crate::util::read_trusted_config(&job_marker_path(work_dir), 1024) {
         Ok(text) => text,
         Err(err)
             if err.kind() == std::io::ErrorKind::NotFound
                 || err.kind() == std::io::ErrorKind::InvalidInput =>
         {
-            return Ok(false);
+            return Ok(None);
         }
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("reading job marker in {}", work_dir.display()));
         }
     };
-    Ok(text.starts_with(JOB_MARKER_VERSION)
-        && text
-            .lines()
-            .nth(1)
-            .is_some_and(|token| token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())))
+    let mut lines = text.lines();
+    if lines.next() != Some(JOB_MARKER_VERSION) {
+        return Ok(None);
+    }
+    let Some(token) = lines.next() else {
+        return Ok(None);
+    };
+    Ok(
+        (token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| token.to_string()),
+    )
 }
 
-fn create_job_dir(work_dir: &Path) -> Result<()> {
+#[cfg(test)]
+fn has_job_marker(work_dir: &Path) -> Result<bool> {
+    Ok(job_marker_token(work_dir)?.is_some())
+}
+
+fn create_job_dir(work_dir: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -108,11 +120,13 @@ fn create_job_dir(work_dir: &Path) -> Result<()> {
             .with_context(|| format!("creating job dir {}", work_dir.display()))?;
         crate::util::ensure_private_dir(work_dir)?;
     }
-    if let Err(err) = write_job_marker(work_dir) {
-        let _ = fs::remove_dir(work_dir);
-        return Err(err);
+    match write_job_marker(work_dir) {
+        Ok(token) => Ok(token),
+        Err(err) => {
+            let _ = fs::remove_dir(work_dir);
+            Err(err)
+        }
     }
-    Ok(())
 }
 
 /// One job dir as the read-only summary sees it.
@@ -162,6 +176,8 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
         };
         for file in WalkDir::new(entry.path())
             .min_depth(1)
+            .follow_links(false)
+            .follow_root_links(false)
             .into_iter()
             .flatten()
         {
@@ -279,11 +295,19 @@ pub(crate) fn sweep_job_locks(work_root: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(job_id) = name.strip_prefix(".lock-") else {
+        if let Some(job_id) = name.strip_prefix(".lock-") {
+            if !job_id.is_empty() {
+                remove_job_lock(work_root, job_id);
+            }
             continue;
-        };
-        if !job_id.is_empty() {
-            remove_job_lock(work_root, job_id);
+        }
+        if let Some(job_id) = name
+            .strip_prefix(".exec-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        {
+            if !job_id.is_empty() && !work_root.join(job_id).exists() {
+                remove_record(work_root, job_id);
+            }
         }
     }
 }
@@ -318,6 +342,122 @@ pub struct Options<'a> {
     pub no_remote: bool,
     /// The command, argv-style.
     pub command: &'a [String],
+}
+
+/// Provenance record for one job dir, written outside the build root.
+///
+/// A build dir is untrusted input: anything that can write it can also write a
+/// complete Cargo fingerprint, and shape checks cannot tell the difference.
+/// This record lives in the private work root instead, next to the job lock, so
+/// `harvest` can tell a build this host ran (`epicenter exec`) from a directory
+/// someone else handed it. It proves *who ran the build*, not that the build is
+/// safe: a build script inside a recorded run can still write files.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExecRecord {
+    pub version: u32,
+    pub run_id: String,
+    /// The `.epicenter-job` token of the job dir this run wrote.
+    pub token: String,
+    /// Canonical job dir.
+    pub build_root: String,
+    /// Canonical directory the command ran in.
+    pub source_root: String,
+    pub toolchain: String,
+    pub command: String,
+    pub started: u64,
+    pub finished: u64,
+    pub exit_code: i32,
+}
+
+const EXEC_RECORD_VERSION: u32 = 1;
+const EXEC_RECORD_MAX_BYTES: u64 = 8 * 1024;
+const EXEC_COMMAND_MAX_CHARS: usize = 1024;
+
+fn record_path(work_root: &Path, job_id: &str) -> PathBuf {
+    work_root.join(format!(".exec-{job_id}.json"))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_record(work_root: &Path, job_id: &str, record: &ExecRecord) -> Result<()> {
+    let body = serde_json::to_vec(record).context("serializing the exec record")?;
+    crate::util::write_atomic_private(&record_path(work_root, job_id), &body)
+        .with_context(|| format!("writing the exec record for job {job_id}"))
+}
+
+fn load_record(work_root: &Path, job_id: &str) -> Result<Option<ExecRecord>> {
+    let path = record_path(work_root, job_id);
+    let text = match crate::util::read_trusted_config(&path, EXEC_RECORD_MAX_BYTES) {
+        Ok(text) => text,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.kind() == std::io::ErrorKind::InvalidInput =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading the exec record {}", path.display()));
+        }
+    };
+    Ok(serde_json::from_str(&text).ok())
+}
+
+/// The record covering `build_root`, if this host wrote it for the job whose
+/// marker token is `token`. A path or token mismatch is a different build.
+pub(crate) fn record_covers(build_root: &Path, token: &str) -> Result<Option<ExecRecord>> {
+    let (Some(work_root), Some(job_id)) = (
+        build_root.parent(),
+        build_root.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Ok(None);
+    };
+    let Some(record) = load_record(work_root, job_id)? else {
+        return Ok(None);
+    };
+    if record.version != EXEC_RECORD_VERSION || record.token != token {
+        return Ok(None);
+    }
+    let canonical = std::fs::canonicalize(build_root).unwrap_or_else(|_| build_root.to_path_buf());
+    if record.build_root != canonical.to_string_lossy() {
+        return Ok(None);
+    }
+    Ok(Some(record))
+}
+
+#[cfg(test)]
+pub(crate) fn record_for_test(build_root: &Path) -> Result<()> {
+    let token = job_marker_token(build_root)?.context("job marker")?;
+    let work_root = build_root.parent().context("work root")?;
+    let job_id = build_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("job id")?;
+    let canonical = std::fs::canonicalize(build_root).unwrap_or_else(|_| build_root.to_path_buf());
+    let record = ExecRecord {
+        version: EXEC_RECORD_VERSION,
+        run_id: "test".into(),
+        token,
+        build_root: canonical.to_string_lossy().into_owned(),
+        source_root: String::new(),
+        toolchain: String::new(),
+        command: "test".into(),
+        started: 0,
+        finished: 0,
+        exit_code: 0,
+    };
+    write_record(work_root, job_id, &record)
+}
+
+fn remove_record(work_root: &Path, job_id: &str) {
+    let path = record_path(work_root, job_id);
+    if crate::util::metadata_nofollow(&path).is_ok_and(|meta| meta.is_file()) {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Resolve `--target-dir`: the bare flag (`"job"`) picks `<work dir>/target`,
@@ -383,59 +523,6 @@ fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
     (selector, version)
 }
 
-/// Packages the project resolves to, from the nearest `Cargo.lock` (the
-/// workspace root). `None` means "cannot tell" — no lock yet, unreadable, or
-/// empty — and the caller keeps the whole-generation seed (fail-open).
-fn project_packages(cwd: &Path, command: &[String]) -> Option<HashSet<String>> {
-    let mut dir = manifest_arg(command)
-        .map(|manifest| {
-            let manifest = if manifest.is_absolute() {
-                manifest
-            } else {
-                cwd.join(manifest)
-            };
-            manifest
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| cwd.to_path_buf())
-        })
-        .unwrap_or_else(|| cwd.to_path_buf());
-    loop {
-        let lock = dir.join("Cargo.lock");
-        if lock.is_file() {
-            return parse_lock(&lock);
-        }
-        dir = dir.parent()?.to_path_buf();
-    }
-}
-
-/// `--manifest-path <p>` or `--manifest-path=<p>` from the child's argv.
-fn manifest_arg(command: &[String]) -> Option<PathBuf> {
-    let mut args = command.iter();
-    while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--manifest-path=") {
-            return Some(PathBuf::from(value));
-        }
-        if arg == "--manifest-path" {
-            return args.next().map(PathBuf::from);
-        }
-    }
-    None
-}
-
-/// Package names from a `Cargo.lock` (all formats: `[[package]] name = …`).
-fn parse_lock(path: &Path) -> Option<HashSet<String>> {
-    let text = crate::util::read_small_text(path, 4 * 1024 * 1024).ok()?;
-    let lock: toml::Value = text.parse().ok()?;
-    let names: HashSet<String> = lock
-        .get("package")?
-        .as_array()?
-        .iter()
-        .filter_map(|package| package.get("name")?.as_str().map(str::to_owned))
-        .collect();
-    (!names.is_empty()).then_some(names)
-}
-
 /// Run the job; returns the command's exit code.
 pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i32> {
     let Some(program) = opts.command.first() else {
@@ -483,6 +570,14 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         }
     }
     let work_root = work_root.as_path();
+    // A job dir must stay on this machine's disk: a network mount is a second
+    // trust domain, and a harvest record written there proves nothing.
+    if crate::vault::store_is_shared_mount(work_root) {
+        bail!(
+            "work root {} is a network/shared mount — job dirs must stay local",
+            work_root.display()
+        );
+    }
     // Acquire the per-job lock BEFORE looking at/creating the dir: the bulk
     // work-dir GC takes the same lock and must never see an unlocked empty dir.
     let job_lock = match crate::util::FileLock::try_acquire(&job_lock_path(work_root, &job_id))? {
@@ -495,7 +590,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let work_dir = work_root.join(&job_id);
     let mut reused = false;
     let mut reuse_locks: Option<Vec<fs::File>> = None;
-    if let Ok(meta) = metadata_nofollow(&work_dir) {
+    let job_token = if let Ok(meta) = metadata_nofollow(&work_dir) {
         if !opts.reuse {
             bail!(
                 "job dir {} already exists — pick another --id, pass --reuse to continue in it, or remove it",
@@ -506,13 +601,13 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             bail!("{} exists and is not a real directory", work_dir.display());
         }
         crate::util::ensure_private_dir(&work_dir)?;
-        if !has_job_marker(&work_dir)? {
+        let Some(token) = job_marker_token(&work_dir)? else {
             bail!(
                 "job dir {} was not created by epicenter (missing {}); refusing --reuse",
                 work_dir.display(),
                 JOB_MARKER
             );
-        }
+        };
         let Some(locks) = cargo_locks(&work_dir)? else {
             bail!(
                 "job dir {} is in use by a live build — wait for it, or use another --id",
@@ -524,9 +619,10 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         // block), so this is a best-effort narrowing, not a full guarantee.
         reuse_locks = Some(locks);
         reused = true;
+        token
     } else {
-        create_job_dir(&work_dir)?;
-    }
+        create_job_dir(&work_dir)?
+    };
     let target_dir = opts
         .target_dir
         .map(|raw| resolve_target_dir(raw, &work_dir, opts.cwd.as_deref()));
@@ -552,7 +648,13 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     // project resolves to: restoring all of it puts every other project's
     // units in the job dir (214 fingerprints for a one-dependency project).
     // A missing or unreadable lock keeps the whole-generation seed.
-    let packages = project_dir(opts).and_then(|cwd| project_packages(&cwd, opts.command));
+    let source_dir = project_dir(opts);
+    let packages = source_dir.as_deref().and_then(|cwd| {
+        crate::lockfile::LockIndex::load(
+            cwd,
+            crate::lockfile::manifest_arg(opts.command).as_deref(),
+        )
+    });
     // The child may select another toolchain (`cargo +nightly`), and Cargo
     // 1.99-nightly+ writes the new build-dir layout. Both decide which vault
     // generation/layout can actually be reused.
@@ -630,6 +732,37 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     eprintln!("{}", util::dim("  ── command ──"));
     let _ = std::io::stderr().flush();
 
+    // Write the provenance record before the child starts, so a harvest that
+    // races the end of the build still sees it. It lives in the private work
+    // root, never in the build dir the child can write.
+    let canonical_build = std::fs::canonicalize(&work_dir).unwrap_or_else(|_| work_dir.clone());
+    let mut record = ExecRecord {
+        version: EXEC_RECORD_VERSION,
+        run_id: format!("{job_id}-{job_token}"),
+        token: job_token.clone(),
+        build_root: canonical_build.to_string_lossy().into_owned(),
+        source_root: source_dir
+            .as_deref()
+            .map(|dir| {
+                std::fs::canonicalize(dir)
+                    .unwrap_or_else(|_| dir.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default(),
+        toolchain: cargo_version.clone().unwrap_or_default(),
+        command: opts
+            .command
+            .join(" ")
+            .chars()
+            .take(EXEC_COMMAND_MAX_CHARS)
+            .collect(),
+        started: unix_now(),
+        finished: 0,
+        exit_code: -1,
+    };
+    write_record(work_root, &job_id, &record)?;
+
     let started = Instant::now();
     let mut child = crate::util::command_for(program)?;
     child.args(&opts.command[1..]);
@@ -656,6 +789,16 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let elapsed = started.elapsed();
     let code = exit_code(&status);
     memory.record_build(opts.command, elapsed);
+    record.finished = unix_now();
+    record.exit_code = code;
+    // The pre-spawn record is already valid; a failed update only loses the
+    // finish time, so it must not fail the job.
+    if let Err(err) = write_record(work_root, &job_id, &record) {
+        eprintln!(
+            "  {} could not update the exec record: {err:#}",
+            util::warn(util::GLYPH_WARN)
+        );
+    }
 
     let harvested = if opts.harvest_back {
         Some(vault::harvest_with(
@@ -673,7 +816,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let mut removed = false;
     let mut remove_error = None;
     if opts.remove_on_success {
-        match util::force_remove_dir(&work_dir) {
+        match util::remove_tree(work_root, &work_dir) {
             Ok(()) => removed = true,
             Err(err) => remove_error = Some(err),
         }
@@ -727,6 +870,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     drop(job_lock);
     if removed {
         remove_job_lock(work_root, &job_id);
+        remove_record(work_root, &job_id);
         sweep_job_locks(work_root);
     }
     Ok(code)

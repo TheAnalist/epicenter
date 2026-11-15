@@ -5,7 +5,7 @@
 //! is a rollback, and two different bodies at the same sequence are
 //! equivocation. Expiry is checked with the pointer signature.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,12 @@ pub struct IndexStatus {
     pub mismatches: Vec<super::Mismatch>,
 }
 
+impl IndexStatus {
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expires < now
+    }
+}
+
 /// `state_dir()/remote/<endpoint+key hash>.json`.
 pub fn state_path(remote: &RemotePolicy) -> Result<PathBuf> {
     state_file(&crate::paths::state_dir()?, remote)
@@ -56,11 +62,7 @@ fn state_file(root: &Path, remote: &RemotePolicy) -> Result<PathBuf> {
         .key_id
         .as_deref()
         .context("remote has no publisher key")?;
-    let mut identity = String::with_capacity(url.len() + key_id.len() + 1);
-    identity.push_str(url);
-    identity.push('\0');
-    identity.push_str(key_id);
-    let name = sha256_hex(identity.as_bytes());
+    let name = sha256_hex(format!("{url}\0{key_id}").as_bytes());
     Ok(root.join(super::STATE_DIR).join(format!("{name}.json")))
 }
 
@@ -91,25 +93,33 @@ pub(crate) fn load_state_at(root: &Path, remote: &RemotePolicy) -> Result<Option
 
 impl RemoteState {
     fn validate(&self, remote: &RemotePolicy) -> Result<()> {
-        if self.schema != SCHEMA_VERSION {
-            bail!("remote state schema {} is not supported", self.schema);
-        }
-        if Some(self.endpoint.as_str()) != remote.url.as_deref() {
-            bail!("remote state belongs to a different endpoint");
-        }
-        if Some(self.key_id.as_str()) != remote.key_id.as_deref() {
-            bail!("remote state belongs to a different publisher key");
-        }
-        if self.sequence == 0 {
-            bail!("remote state has no sequence");
-        }
+        ensure!(
+            self.schema == SCHEMA_VERSION,
+            "remote state schema {} is not supported",
+            self.schema
+        );
+        ensure!(
+            Some(self.endpoint.as_str()) == remote.url.as_deref(),
+            "remote state belongs to a different endpoint"
+        );
+        ensure!(
+            Some(self.key_id.as_str()) == remote.key_id.as_deref(),
+            "remote state belongs to a different publisher key"
+        );
+        ensure!(self.sequence > 0, "remote state has no sequence");
         ensure_sha256(&self.body_sha256, "state body SHA-256")?;
-        if self.fetched_at == 0 || self.expires == 0 {
-            bail!("remote state has no timestamps");
-        }
-        if self.expires <= self.fetched_at {
-            bail!("remote state was recorded after its index expired");
-        }
+        ensure!(
+            self.fetched_at > 0 && self.expires > 0,
+            "remote state has no timestamps"
+        );
+        ensure!(
+            self.expires > self.fetched_at,
+            "remote state was recorded after its index expired"
+        );
+        ensure!(
+            self.publisher.built_at <= self.expires,
+            "publisher timestamp is after the index expiry"
+        );
         self.publisher.validate()?;
         self.compatibility.validate()?;
         Ok(())
@@ -139,17 +149,10 @@ pub(crate) fn record_state_at(
         .as_deref()
         .context("remote has no publisher key")?;
     pointer.verify(pinned, now)?;
-    body.validate_for(remote.tier)?;
     let canonical = body.canonical_bytes()?;
-    super::verify_body(pointer, &canonical, now)?;
-    if body.schema != pointer.schema
-        || body.key_id != pointer.key_id
-        || body.sequence != pointer.sequence
-        || body.created != pointer.created
-        || body.expires != pointer.expires
-    {
-        bail!("remote index body does not match the signed pointer");
-    }
+    let body = super::verify_body(pointer, &canonical, now)?;
+    body.validate_reader(remote.tier)?;
+    ensure_metadata_matches(pointer, &body)?;
     let existing = load_state_at(root, remote)?;
     check_replay(existing.as_ref(), pointer)?;
     if existing.as_ref().is_some_and(|state| {
@@ -175,24 +178,34 @@ pub(crate) fn record_state_at(
     Ok(())
 }
 
+fn ensure_metadata_matches(pointer: &IndexPointer, body: &super::IndexBody) -> Result<()> {
+    ensure!(
+        body.schema == pointer.schema
+            && body.key_id == pointer.key_id
+            && body.sequence == pointer.sequence
+            && body.created == pointer.created
+            && body.expires == pointer.expires,
+        "remote index body does not match the signed pointer"
+    );
+    Ok(())
+}
+
 fn check_replay(existing: Option<&RemoteState>, pointer: &IndexPointer) -> Result<()> {
     let Some(existing) = existing else {
         return Ok(());
     };
-    if pointer.sequence < existing.sequence {
-        bail!(
+    match pointer.sequence.cmp(&existing.sequence) {
+        std::cmp::Ordering::Less => bail!(
             "remote index rolled back from sequence {} to {}; keeping the newer local state",
             existing.sequence,
             pointer.sequence
-        );
-    }
-    if pointer.sequence == existing.sequence && pointer.body_sha256 != existing.body_sha256 {
-        bail!(
+        ),
+        std::cmp::Ordering::Equal if pointer.body_sha256 != existing.body_sha256 => bail!(
             "remote index reuses sequence {} with different bytes; refusing equivocation",
             pointer.sequence
-        );
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Advisory status for `doctor`: last verified sequence plus machine-level

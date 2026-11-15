@@ -8,12 +8,14 @@
 //!
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
-use std::io::ErrorKind;
+use std::fs::Metadata;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::util;
 use anyhow::Result;
 use walkdir::WalkDir;
 
@@ -171,20 +173,29 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
 /// Walk `root` and group every file into units.
 pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-    for entry in WalkDir::new(root).min_depth(1) {
+    let walker = WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| util::walk_entry_is_safe(root, entry));
+    for entry in walker {
         // Unreadable entries are skipped rather than failing the whole scan.
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().is_file() {
+        let meta: Metadata = match util::metadata_nofollow(&entry.path()) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
             continue;
         }
         // `artifact_key` -> None means "never touch" (locks, root files...).
         let Some(key) = artifact_key(root, entry.path()) else {
             continue;
         };
-        let Ok(meta) = entry.metadata() else { continue };
         let incremental = entry.path().components().any(|component| {
             component
                 .as_os_str()
@@ -339,11 +350,9 @@ pub fn prune_with(
     for group in selected {
         match &group.anchor {
             Some(anchor) => {
-                if let Err(e) = fs::remove_dir_all(anchor) {
-                    if e.kind() != ErrorKind::NotFound {
-                        report.errors += 1;
-                        eprintln!("could not remove {}: {e}", anchor.display());
-                    }
+                if let Err(err) = crate::util::remove_tree(root, anchor) {
+                    report.errors += 1;
+                    eprintln!("could not remove {}: {err:#}", anchor.display());
                 }
                 // One unit can span both `.fingerprint/<dir>` and `deps/`: the
                 // anchor covers the first family; files outside it go individually.
@@ -351,21 +360,17 @@ pub fn prune_with(
                     if file.starts_with(anchor) {
                         continue;
                     }
-                    if let Err(e) = fs::remove_file(file) {
-                        if e.kind() != ErrorKind::NotFound {
-                            report.errors += 1;
-                            eprintln!("could not remove {}: {e}", file.display());
-                        }
+                    if let Err(err) = crate::util::remove_file(root, file) {
+                        report.errors += 1;
+                        eprintln!("could not remove {}: {err:#}", file.display());
                     }
                 }
             }
             None => {
                 for file in &group.files {
-                    if let Err(e) = fs::remove_file(file) {
-                        if e.kind() != ErrorKind::NotFound {
-                            report.errors += 1;
-                            eprintln!("could not remove {}: {e}", file.display());
-                        }
+                    if let Err(err) = crate::util::remove_file(root, file) {
+                        report.errors += 1;
+                        eprintln!("could not remove {}: {err:#}", file.display());
                     }
                 }
             }

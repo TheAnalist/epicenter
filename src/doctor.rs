@@ -811,6 +811,8 @@ fn check_incremental_state(root: &Path, rows: &[(Unit, ArtifactInfo)]) -> Vec<Ch
 
 fn directory_bytes(root: &Path) -> u64 {
     WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.metadata().ok())
@@ -1100,7 +1102,12 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
     let (remote_index, remote_index_error) = if remote.enabled {
         match crate::remote::status(&remote) {
             Ok(status) => (status, None),
-            Err(err) => (None, Some(format!("{err:#}"))),
+            Err(err) => (
+                None,
+                Some(crate::util::safe_display(std::ffi::OsStr::new(&format!(
+                    "{err:#}"
+                )))),
+            ),
         }
     } else {
         (None, None)
@@ -1421,20 +1428,19 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
     if profile.remote_enabled {
         match (&profile.remote_index, &profile.remote_index_error) {
             (Some(index), _) => {
-                let published =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(index.publisher.built_at);
+                let published = SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(index.publisher.built_at))
+                    .map(human_age)
+                    .unwrap_or_else(|| "unknown time".to_string());
+                let compatible = index.mismatches.is_empty();
                 checks.push(check(
                     SEC_CONFIG,
-                    if index.mismatches.is_empty() {
-                        Level::Pass
-                    } else {
-                        Level::Warn
-                    },
+                    if compatible { Level::Pass } else { Level::Warn },
                     format!(
                         "remote index: sequence {} · published {} ago · {}",
                         index.sequence,
-                        human_age(published),
-                        if index.mismatches.is_empty() {
+                        published,
+                        if compatible {
                             "compatibility matches"
                         } else {
                             "compatibility mismatch"
@@ -1448,7 +1454,7 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
                         format!("remote compatibility: {mismatch}"),
                     ));
                 }
-                if index.expires < crate::remote::now_secs() {
+                if index.is_expired(crate::remote::now_secs()) {
                     checks.push(check(
                         SEC_CONFIG,
                         Level::Warn,

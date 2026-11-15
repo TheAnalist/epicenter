@@ -312,6 +312,10 @@ struct HarvestArgs {
     /// Show what would be stored, without writing anything.
     #[arg(long)]
     dry_run: bool,
+    /// Sign a build dir this host did not create (a shared/network build dir).
+    /// Only use it when every writer is in this trust domain.
+    #[arg(long)]
+    trusted: bool,
 }
 
 #[derive(clap::Args)]
@@ -486,7 +490,12 @@ fn run() -> Result<()> {
         Command::Who { unit } => epicenter_cli::who::run(&config::cache_root()?, unit.as_deref()),
         Command::Why { unit } => epicenter_cli::who::explain(&config::cache_root()?, &unit),
         Command::Evict(args) => cmd_evict(&args),
-        Command::Harvest(args) => cmd_harvest(args.unit.as_deref(), args.dry_run, args.no_compress),
+        Command::Harvest(args) => cmd_harvest(
+            args.unit.as_deref(),
+            args.dry_run,
+            args.no_compress,
+            args.trusted,
+        ),
         Command::Restore(args) => {
             if !args.no_remote {
                 let _ = settings.remote()?;
@@ -536,9 +545,12 @@ fn cmd_store(command: StoreCommand, settings: &settings::Settings) -> Result<()>
         StoreCommand::Verify => cmd_verify(),
         StoreCommand::Prune(args) => cmd_prune(&args),
         StoreCommand::Evict(args) => cmd_evict(&args),
-        StoreCommand::Harvest(args) => {
-            cmd_harvest(args.unit.as_deref(), args.dry_run, args.no_compress)
-        }
+        StoreCommand::Harvest(args) => cmd_harvest(
+            args.unit.as_deref(),
+            args.dry_run,
+            args.no_compress,
+            args.trusted,
+        ),
         StoreCommand::Restore(args) => {
             if !args.no_remote {
                 let _ = settings.remote()?;
@@ -576,8 +588,7 @@ fn cmd_evict(args: &EvictArgs) -> Result<()> {
 
 fn resolve_remote_key_arg(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
-    let hex = trimmed.strip_prefix("ed25519:").unwrap_or(trimmed);
-    if hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if settings::is_publisher_key_hex(trimmed) {
         return settings::normalize_remote_publisher_key(trimmed);
     }
     let text = util::read_small_text(Path::new(trimmed), 64 * 1024)
@@ -1487,7 +1498,7 @@ fn cmd_exec(
     Ok(())
 }
 
-fn cmd_harvest(unit: Option<&str>, dry_run: bool, no_compress: bool) -> Result<()> {
+fn cmd_harvest(unit: Option<&str>, dry_run: bool, no_compress: bool, trusted: bool) -> Result<()> {
     let root = config::cache_root()?;
     if !root.is_dir() {
         println!(
@@ -1507,7 +1518,12 @@ fn cmd_harvest(unit: Option<&str>, dry_run: bool, no_compress: bool) -> Result<(
             util::heading("epicenter harvest — shared build dir → vault")
         );
     }
-    let report = vault::harvest_with(
+    let trust = if trusted {
+        vault::HarvestTrust::Trusted("--trusted")
+    } else {
+        vault::HarvestTrust::Recorded
+    };
+    let report = vault::harvest_with_trust(
         &root,
         &vault::store_root(&root),
         unit,
@@ -1515,8 +1531,15 @@ fn cmd_harvest(unit: Option<&str>, dry_run: bool, no_compress: bool) -> Result<(
         None,
         None,
         !no_compress,
+        trust,
     )?;
     println!("  {} {}", label("parity"), report.parity);
+    if let Some(reason) = &report.trusted {
+        println!(
+            "  {} signed in trusted-builder mode ({reason})",
+            util::warn(util::GLYPH_WARN)
+        );
+    }
     if let Some(note) = &report.note {
         println!("  {} {note}", util::warn(util::GLYPH_WARN));
         return Ok(());

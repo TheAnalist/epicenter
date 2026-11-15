@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -10,6 +11,7 @@ use anyhow::Result;
 use walkdir::WalkDir;
 
 use crate::prune;
+use crate::util;
 
 /// Size/count of one top-level bucket (usually a profile dir: `debug`, `release`).
 pub struct DirStat {
@@ -55,15 +57,24 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
     let mut buckets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     #[cfg(unix)]
     let mut seen_inodes = std::collections::HashSet::new();
-    for entry in WalkDir::new(root).min_depth(1) {
+    let walker = WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| util::walk_entry_is_safe(root, entry));
+    for entry in walker {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue, // locked/unreadable: skip, never crash status
         };
-        if !entry.file_type().is_file() {
+        let meta: Metadata = match util::metadata_nofollow(&entry.path()) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
 
         #[cfg(unix)]
         let unique = {

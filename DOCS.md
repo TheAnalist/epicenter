@@ -232,6 +232,40 @@ Common `exec` flags:
 * `--rm`: Delete the job directory as soon as the command finishes.
 * `--cwd <DIR>`: Run the command in `<DIR>` and resolve `epicenter.toml` / `Cargo.lock` from there.
 
+#### Why `exec` records builds (the harvest trust boundary)
+
+A build directory is **untrusted input**. Cargo's fingerprint is just a set of
+files, so anything that can write the build dir — a foreign VM on a shared
+mount, a co-tenant, or a repository build script — can write a complete unit
+shape that looks exactly like a real one. No amount of shape validation can
+tell the two apart, because the attacker writes the same shape Cargo writes.
+
+`epicenter exec` therefore writes a small `ExecRecord` **next to the job dir**
+(`work/.exec-<id>.json`, in the private work root, never inside the build dir)
+before it starts the command. It records the job token, the canonical build
+root, the source directory, toolchain, command and timing. `harvest` checks
+that record before it signs anything:
+
+* A job dir (marked `.epicenter-job`) must have a matching record from this
+  host. A foreign VM cannot write the private work root, so it cannot mint one
+  and cannot make this host sign its bytes.
+* The shared build dir is signed only when it is a local, private directory. A
+  network/shared mount is refused unless you pass `--trusted`, which is an
+  explicit statement that every writer is in the same trust domain.
+* `exec` itself refuses a work root that is a network/shared mount, so a job
+  dir always lives on the machine that recorded it.
+
+This is a **provenance boundary, not a safety check**. It proves that this host
+ran the build; it does not prove the build is safe. A build script inside a
+recorded run can still write files, so treat untrusted source as code
+execution: build it in a sandbox (separate user/VM) or do not harvest it.
+
+Restore is bound the other way. A stored unit records the package version it
+was compiled from (read from rustc's `.d` source list at harvest), and `exec`
+seeds it only into a job whose `Cargo.lock` resolves the same
+`(package, version)`. The lock is parsed once per job and each check is a
+hash-map lookup, so the binding costs one small file read, not a per-unit scan.
+
 ### Workflow 4: CI/CD & Multi-VM Fleets
 
 In CI or multi-VM agent fleets, share the **read-only vault** (`store/`) across VMs, and give each VM its own fast local writable `work/` directory.
@@ -354,6 +388,8 @@ blobs/<sha256>             immutable stored file (gzip or raw)
 - `indexes/<sha256>.json` is the canonical body: tier, publisher metadata, compatibility tuple and unit/file refs. It is immutable and addressed by the hash the signed pointer commits to.
 - `blobs/<sha256>` stores one file per object. The index records the stored hash/size and the decoded hash/size, so a reader verifies the object before decompressing it and verifies the decoded bytes again.
 - `publisher.json` mirrors the signed metadata for humans and CI logs; it is not a trust anchor.
+
+Remote parsing is strict: fields and paths are bounded, control/bidi formatting characters are rejected, registry/git URLs must not embed credentials, and an S3 prefix cannot contain empty, `.`, or `..` components. Blob imports stream against the signed decoded size; only small blobs are buffered in memory.
 
 Readers verify the pointer signature, key id, sequence/expiry, body hash/size/canonical form and then each blob. They keep the highest accepted sequence per endpoint/key under the OS state directory and reject rollback, same-sequence equivocation and expired indexes. Rotation/revocation is a trusted-channel operation: re-pin the new key with `setup`; an old-key index fails both the key-id and signature checks. A deliberate sequence reset under the same key requires clearing the local state.
 
@@ -518,7 +554,7 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter doctor [--json]` | Audit config, profile, wrapper, filesystem, toolchain, mtimes, and vault |
 | `epicenter exec [FLAGS] -- <CMD>` | Run `<CMD>` in an isolated per-job build dir seeded from the vault |
 | `epicenter exec --no-remote [FLAGS] -- <CMD>` | Force a local-only job; skip remote compatible-unit fetch |
-| `epicenter store harvest [--unit <Q>] [--no-compress] [--dry-run]` | Save compiled units from the shared build dir into the durable vault |
+| `epicenter store harvest [--unit <Q>] [--no-compress] [--dry-run] [--trusted]` | Save compiled units from the shared build dir into the durable vault (`--trusted` accepts a shared/network build dir) |
 | `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault |
 | `epicenter store restore --no-remote ...` | Skip remote compatible-unit fetch while restoring |
 | `epicenter store vault` | List vault generations, sizes, and active status |

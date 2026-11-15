@@ -20,19 +20,21 @@ mod cas;
 mod compat;
 mod index;
 mod state;
+pub(crate) mod validate;
 
 #[cfg(test)]
 mod tests;
 
 pub use cas::{
-    BlobRef, Compression, Upload, UploadMode, read_blob, upload_plan, verify_blob, write_blob,
+    BlobRef, Compression, MAX_IN_MEMORY_BLOB_BYTES, Upload, UploadMode, decode_blob, read_blob,
+    upload_plan, verify_blob, write_blob,
 };
 pub use compat::{
     Compatibility, LocalEnvironment, Mismatch, RegistryIdentity, RustcIdentity, UnitCompatibility,
     compare_compatibility, source_path_hash,
 };
 pub use index::{
-    IndexBody, IndexPointer, PublisherMetadata, PublisherReport, RemoteFile, RemoteUnit,
+    FileRole, IndexBody, IndexPointer, PublisherMetadata, PublisherReport, RemoteFile, RemoteUnit,
     RemoteUnitKind, SourceKind, UnitSource, VerifiedIndex, make_index, publisher_report,
     read_index_tree, verify_body, verify_index, write_index_tree,
 };

@@ -265,7 +265,10 @@ pub fn force_remove_dir(path: &Path) -> std::io::Result<()> {
         Ok(()) => return Ok(()),
         Err(err) => err,
     };
-    for entry in WalkDir::new(path) {
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .follow_root_links(false)
+    {
         let Ok(entry) = entry else { continue };
         // Never follow a symlink here: `set_permissions` on a symlink path
         // changes the *target* (possibly outside this tree).
@@ -1220,6 +1223,13 @@ pub(crate) struct AtDir {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum EntryKind {
+    Directory,
+    Other,
+}
+
+#[cfg(unix)]
 impl AtDir {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         use std::ffi::CString;
@@ -1305,6 +1315,144 @@ impl AtDir {
         Ok(true)
     }
 
+    /// Open an existing child directory without creating it or following a
+    /// symlink/reparse point.
+    pub(crate) fn open_child(&self, name: &std::ffi::OsStr) -> Result<Self> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        let cname = CString::new(name.as_bytes())
+            .with_context(|| format!("path component contains NUL: {:?}", name))?;
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening child {:?}", name));
+        }
+        Ok(Self {
+            file: unsafe { File::from_raw_fd(fd) },
+        })
+    }
+
+    fn entry_kind(&self, name: &std::ffi::OsStr) -> Result<Option<EntryKind>> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let cname = CString::new(name.as_bytes())
+            .with_context(|| format!("path component contains NUL: {:?}", name))?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                cname.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(err).with_context(|| format!("inspecting child {:?}", name));
+        }
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            Ok(Some(EntryKind::Directory))
+        } else {
+            Ok(Some(EntryKind::Other))
+        }
+    }
+
+    fn read_names(&self) -> Result<Vec<std::ffi::OsString>> {
+        use std::ffi::{CStr, OsString};
+        use std::os::unix::ffi::OsStringExt;
+        let dup = unsafe { libc::dup(self.file.as_raw_fd()) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error()).context("duplicating directory fd");
+        }
+        let dir = unsafe { libc::fdopendir(dup) };
+        if dir.is_null() {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(dup) };
+            return Err(err).context("opening directory stream");
+        }
+        let mut names = Vec::new();
+        loop {
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+        unsafe { libc::closedir(dir) };
+        Ok(names)
+    }
+
+    fn remove_entry(&self, name: &std::ffi::OsStr) -> Result<()> {
+        match self.unlink(name) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("removing child {:?}", name)),
+        }
+    }
+
+    fn remove_dir_entry(&self, name: &std::ffi::OsStr) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let cname = CString::new(name.as_bytes())
+            .with_context(|| format!("path component contains NUL: {:?}", name))?;
+        let rc =
+            unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        Err(err).with_context(|| format!("removing directory {:?}", name))
+    }
+
+    /// Remove one entry relative to this directory. A directory is opened with
+    /// O_NOFOLLOW and enumerated through its fd; a symlink/reparse entry is
+    /// unlinked itself, never followed.
+    fn remove_tree_entry(&self, name: &std::ffi::OsStr) -> Result<()> {
+        match self.entry_kind(name)? {
+            None => Ok(()),
+            Some(EntryKind::Other) => self.remove_entry(name),
+            Some(EntryKind::Directory) => {
+                let child = match self.open_child(name) {
+                    Ok(child) => child,
+                    Err(err) if is_nofollow_open_error(&err) => {
+                        // The name changed to a symlink/non-directory after the
+                        // lookup. Remove the entry itself; never follow it.
+                        return self.remove_entry(name);
+                    }
+                    Err(err) => return Err(err),
+                };
+                for child_name in child.read_names()? {
+                    child.remove_tree_entry(&child_name)?;
+                }
+                match self.remove_dir_entry(name) {
+                    Ok(()) => Ok(()),
+                    // The directory was replaced by a non-directory. Remove the
+                    // replacement entry itself, but never recurse into it.
+                    Err(err) if is_not_dir_error(&err) => self.remove_entry(name),
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
     /// Link the exact inode behind an already-open, hashed source descriptor.
     /// Linux exposes the held fd through /proc/self/fd, so a concurrent path
     /// swap in the store cannot substitute another inode between the hash
@@ -1375,6 +1523,284 @@ impl AtDir {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn is_nofollow_open_error(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| code == libc::ELOOP || code == libc::ENOTDIR)
+}
+
+#[cfg(unix)]
+fn is_not_dir_error(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| code == libc::ENOTDIR)
+}
+
+/// Relative components of `target` under `root`, rejecting `..`, absolute
+/// targets, and the root itself. Both paths must name the same tree.
+fn relative_under(root: &Path, target: &Path) -> Result<PathBuf> {
+    let rel = target
+        .strip_prefix(root)
+        .with_context(|| format!("{} is outside {}", target.display(), root.display()))?;
+    let mut out = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => out.push(name),
+            Component::CurDir => {}
+            _ => anyhow::bail!("refusing non-normal component in {}", target.display()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        anyhow::bail!("refusing to remove the root {}", root.display());
+    }
+    Ok(out)
+}
+
+/// Open a directory by absolute path, walking every component with
+/// `O_NOFOLLOW`. The returned handle pins the directory object; a later rename
+/// or symlink swap of the path cannot redirect operations on the handle.
+#[cfg(unix)]
+fn open_dir_path(path: &Path) -> Result<AtDir> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving the current directory")?
+            .join(path)
+    };
+    let mut dir = AtDir::open(Path::new("/"))?;
+    for component in absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => dir = dir.open_child(name)?,
+            _ => anyhow::bail!("refusing non-normal component in {}", absolute.display()),
+        }
+    }
+    Ok(dir)
+}
+
+/// Walk from a pinned root to the parent of `target`.
+#[cfg(unix)]
+fn open_parent_at(root: &Path, target: &Path) -> Result<Option<(AtDir, std::ffi::OsString)>> {
+    let rel = relative_under(root, target)?;
+    let mut dir = open_dir_path(root)?;
+    let mut components = rel.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("refusing non-normal component in {}", target.display());
+        };
+        if components.peek().is_none() {
+            return Ok(Some((dir, name.to_os_string())));
+        }
+        match dir.open_child(name) {
+            Ok(child) => dir = child,
+            Err(err)
+                if err
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    || is_nofollow_open_error(&err) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("opening parent of {}", target.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Remove a file or directory tree under `root` without following a symlink or
+/// reparse point at any component. On Unix every lookup is `openat`-relative to
+/// a held directory fd; on Windows the root and parent components are pinned
+/// with no-delete-share handles, checked with `metadata_nofollow`, and reparse
+/// entries are removed as links, never traversed.
+///
+/// A missing target, or a parent that is no longer a real directory, is a
+/// successful no-op: the path cannot be safely resolved.
+pub(crate) fn remove_tree(root: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let rel = relative_under(root, target)?;
+        let mut dir = open_dir_path(root)?;
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                anyhow::bail!("refusing non-normal component in {}", target.display());
+            };
+            if components.peek().is_none() {
+                return dir
+                    .remove_tree_entry(name)
+                    .with_context(|| format!("removing {}", target.display()));
+            }
+            match dir.open_child(name) {
+                Ok(child) => dir = child,
+                Err(err)
+                    if err
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                        || is_nofollow_open_error(&err) =>
+                {
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("opening parent of {}", target.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let rel = relative_under(root, target)?;
+        #[cfg(windows)]
+        let _pins = pin_parent_handles(root, &rel)?;
+        check_parent_components(root, &rel)?;
+        remove_tree_path(target)
+    }
+}
+
+/// Remove one file (or a symlink/reparse entry) under `root`.
+pub(crate) fn remove_file(root: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        match open_parent_at(root, target)? {
+            Some((dir, name)) => dir.remove_entry(&name),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let rel = relative_under(root, target)?;
+        #[cfg(windows)]
+        let _pins = pin_parent_handles(root, &rel)?;
+        check_parent_components(root, &rel)?;
+        match std::fs::symlink_metadata(target) {
+            Ok(meta) if meta.is_dir() => {
+                anyhow::bail!("{} is a directory", target.display());
+            }
+            Ok(_) => std::fs::remove_file(target)
+                .with_context(|| format!("removing {}", target.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("inspecting {}", target.display())),
+        }
+    }
+}
+
+/// Remove one empty directory under `root`; a non-empty directory is an error.
+pub(crate) fn remove_empty_dir(root: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        match open_parent_at(root, target)? {
+            Some((dir, name)) => dir.remove_dir_entry(&name),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let rel = relative_under(root, target)?;
+        #[cfg(windows)]
+        let _pins = pin_parent_handles(root, &rel)?;
+        check_parent_components(root, &rel)?;
+        match std::fs::symlink_metadata(target) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir(target)
+                .with_context(|| format!("removing {}", target.display())),
+            Ok(_) => anyhow::bail!("{} is not a directory", target.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("inspecting {}", target.display())),
+        }
+    }
+}
+
+/// Hold Windows directory handles for the root and every parent component.
+/// The handles use `FILE_SHARE_READ_WRITE` (no delete share), so another
+/// process cannot rename or delete those directories while the deletion runs.
+#[cfg(windows)]
+fn pin_parent_handles(root: &Path, rel: &Path) -> Result<Vec<File>> {
+    let mut handles = Vec::new();
+    let mut current = root.to_path_buf();
+    handles.push(open_dir_handle(&current)?);
+    let count = rel.components().count();
+    for (index, component) in rel.components().enumerate() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("refusing non-normal component in {}", rel.display());
+        };
+        if index + 1 == count {
+            break;
+        }
+        current.push(name);
+        handles.push(open_dir_handle(&current)?);
+    }
+    Ok(handles)
+}
+
+#[cfg(not(unix))]
+fn check_parent_components(root: &Path, rel: &Path) -> Result<()> {
+    match metadata_nofollow(root) {
+        Ok(meta) if meta.is_dir() => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("{} is a symlink/reparse point", root.display());
+        }
+        Ok(_) => anyhow::bail!("{} is not a directory", root.display()),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", root.display())),
+    }
+    let count = rel.components().count();
+    let mut current = root.to_path_buf();
+    for (index, component) in rel.components().enumerate() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("refusing non-normal component in {}", rel.display());
+        };
+        if index + 1 == count {
+            break;
+        }
+        current.push(name);
+        match metadata_nofollow(&current) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => anyhow::bail!("{} is not a directory", current.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                anyhow::bail!("{} is a symlink/reparse point", current.display());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_tree_path(target: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", target.display())),
+    };
+    if meta.is_dir() && !meta.file_type().is_symlink() && !is_reparse_point(&meta) {
+        for entry in
+            std::fs::read_dir(target).with_context(|| format!("reading {}", target.display()))?
+        {
+            let entry = entry?;
+            remove_tree_path(&entry.path())?;
+        }
+        std::fs::remove_dir(target).with_context(|| format!("removing {}", target.display()))?;
+    } else if meta.is_dir() {
+        // A junction/reparse directory: remove the entry itself, never its
+        // target.
+        std::fs::remove_dir(target).with_context(|| format!("removing {}", target.display()))?;
+    } else {
+        std::fs::remove_file(target).with_context(|| format!("removing {}", target.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1573,6 +1999,34 @@ pub fn read_small_text_follow(path: &Path, max_bytes: u64) -> std::io::Result<St
     }
     let mut text = String::new();
     file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Read at most `max_bytes` from the start of a regular file, without
+/// following a symlink/reparse point and without blocking on FIFOs/devices.
+/// Use this for a bounded prefix of a file that may legitimately be large.
+pub fn read_text_prefix(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    windows_no_reparse(&mut options);
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || is_reparse_point(&meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.take(max_bytes).read_to_string(&mut text)?;
     Ok(text)
 }
 
@@ -2575,6 +3029,47 @@ pub fn metadata_nofollow(path: &Path) -> std::io::Result<Metadata> {
     Ok(meta)
 }
 
+/// Does any component from `base` to `target` resolve through a symlink or
+/// reparse point? The check includes `base` and the final component. A target
+/// outside `base` also returns `true`, so callers can use this as a
+/// `WalkDir::filter_entry` predicate and skip an entire junction subtree.
+pub(crate) fn has_reparse_component(base: &Path, target: &Path) -> bool {
+    if metadata_nofollow(base).is_err() {
+        return true;
+    }
+    let Ok(rel) = target.strip_prefix(base) else {
+        return true;
+    };
+    let mut current = base.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => current.push(name),
+            Component::CurDir => continue,
+            _ => return true,
+        }
+        if metadata_nofollow(&current).is_err() {
+            return true;
+        }
+    }
+    false
+}
+
+/// `WalkDir::filter_entry` predicate: regular files pass; a directory or link
+/// is checked for a reparse component so a junction subtree is skipped before
+/// it is traversed.
+///
+/// The walker must also use `follow_links(false)` and
+/// `follow_root_links(false)`: WalkDir follows a symlinked **root** by default
+/// even when `follow_links(false)` is set, and the root entry is not yielded
+/// when `min_depth(1)` is used, so this predicate never sees it.
+pub(crate) fn walk_entry_is_safe(base: &Path, entry: &walkdir::DirEntry) -> bool {
+    let kind = entry.file_type();
+    if !(kind.is_dir() || kind.is_symlink()) {
+        return true;
+    }
+    !has_reparse_component(base, entry.path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2655,6 +3150,118 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let err = open_file_nofollow(&path).unwrap_err();
         assert!(format!("{err:#}").contains("regular file"), "{err:#}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_tree_unlinks_a_symlink_entry_without_following_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        let unit = root.path().join("unit");
+        fs::create_dir_all(&unit)?;
+        fs::write(unit.join("file"), b"x")?;
+        fs::write(victim.path().join("keep"), b"keep")?;
+        std::os::unix::fs::symlink(victim.path(), unit.join("link"))?;
+
+        remove_tree(root.path(), &unit)?;
+        assert!(!unit.exists(), "the unit tree is gone");
+        assert!(
+            victim.path().join("keep").exists(),
+            "the symlink target must survive"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_filter_skips_a_symlinked_subtree() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        fs::write(victim.path().join("keep"), b"keep")?;
+        fs::create_dir(root.path().join("real"))?;
+        fs::write(root.path().join("real/file"), b"x")?;
+        std::os::unix::fs::symlink(victim.path(), root.path().join("link"))?;
+
+        for follow in [false, true] {
+            let visited: Vec<PathBuf> = walkdir::WalkDir::new(root.path())
+                .min_depth(1)
+                .follow_links(follow)
+                .into_iter()
+                .filter_entry(|entry| walk_entry_is_safe(root.path(), entry))
+                .filter_map(Result::ok)
+                .map(|entry| entry.into_path())
+                .collect();
+            assert!(
+                visited
+                    .iter()
+                    .any(|path| path == &root.path().join("real/file")),
+                "regular files must still be visited"
+            );
+            assert!(
+                !visited
+                    .iter()
+                    .any(|path| path.starts_with(root.path().join("link"))
+                        || path.starts_with(victim.path())),
+                "a symlink subtree must be skipped (follow={follow})"
+            );
+        }
+
+        // WalkDir follows a symlinked root by default even with
+        // follow_links(false); follow_root_links(false) must stop it.
+        let linked_root = root.path().join("linked-root");
+        std::os::unix::fs::symlink(victim.path(), &linked_root)?;
+        let visited: Vec<PathBuf> = walkdir::WalkDir::new(&linked_root)
+            .min_depth(1)
+            .follow_links(false)
+            .follow_root_links(false)
+            .into_iter()
+            .filter_entry(|entry| walk_entry_is_safe(&linked_root, entry))
+            .filter_map(Result::ok)
+            .map(|entry| entry.into_path())
+            .collect();
+        assert!(
+            visited.is_empty(),
+            "a symlinked root must not be traversed: {visited:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_tree_skips_a_symlinked_parent() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        fs::create_dir_all(victim.path().join("child"))?;
+        fs::write(victim.path().join("child/keep"), b"keep")?;
+        std::os::unix::fs::symlink(victim.path(), root.path().join("link"))?;
+
+        remove_tree(root.path(), &root.path().join("link/child"))?;
+        assert!(
+            victim.path().join("child/keep").exists(),
+            "a symlinked parent must never redirect deletion"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_and_empty_dir_stay_under_the_root() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let file = root.path().join("file");
+        let empty = root.path().join("empty");
+        let full = root.path().join("full");
+        fs::write(&file, b"x")?;
+        fs::create_dir(&empty)?;
+        fs::create_dir(&full)?;
+        fs::write(full.join("keep"), b"x")?;
+
+        remove_file(root.path(), &file)?;
+        assert!(!file.exists());
+        remove_empty_dir(root.path(), &empty)?;
+        assert!(!empty.exists());
+        assert!(remove_empty_dir(root.path(), &full).is_err());
+        assert!(full.join("keep").exists());
         Ok(())
     }
 

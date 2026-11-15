@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -230,6 +229,13 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
     }
 
     let store_root = crate::vault::store_root(build_root);
+    match metadata_nofollow(&store_root) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", store_root.display()));
+        }
+    }
     let active = crate::vault::parity_key().ok();
     let age_limit = opts
         .older_than
@@ -496,14 +502,12 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                     eprintln!("view {label} is in use by a live build — skipped");
                     continue;
                 };
-                remove_dir(unit_dir, &mut errors);
+                remove_dir(root, unit_dir, &mut errors);
                 for anchor in anchors {
-                    if anchor.is_dir() {
-                        remove_dir(anchor, &mut errors);
-                    }
+                    remove_dir(root, anchor, &mut errors);
                 }
                 for artifact in artifacts {
-                    remove_file(artifact, &mut errors);
+                    remove_file(root, artifact, &mut errors);
                 }
                 *view_counts.entry(label.clone()).or_default() += 1;
             }
@@ -664,7 +668,7 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     let tombstone = work_root.join(format!(".{name}.deleting-{}", std::process::id()));
     match metadata_nofollow(&tombstone) {
         Ok(_) => {
-            crate::util::force_remove_dir(&tombstone)
+            crate::util::remove_tree(&work_root, &tombstone)
                 .with_context(|| format!("clearing stale tombstone {}", tombstone.display()))?;
         }
         // No stale tombstone to clear.
@@ -691,7 +695,7 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
             path.display()
         )
     })?;
-    if let Err(err) = crate::util::force_remove_dir(&tombstone) {
+    if let Err(err) = crate::util::remove_tree(&work_root, &tombstone) {
         let _ = fs::rename(&tombstone, &path);
         drop(job_lock);
         return Err(err).with_context(|| format!("removing {}", path.display()));
@@ -986,7 +990,7 @@ fn evict_work_dirs(
         drop(cargo_locks);
         #[cfg(not(windows))]
         let _cargo_locks = cargo_locks;
-        match crate::util::force_remove_dir(&row.path) {
+        match crate::util::remove_tree(&work_root, &row.path) {
             Ok(()) => {
                 report.removed += 1;
                 freed_unique += row.unique;
@@ -1027,7 +1031,13 @@ fn evict_work_dirs(
 /// (directory mtimes only move when entries are added or removed).
 fn dir_newest(dir: &Path) -> Option<SystemTime> {
     let mut newest = None;
-    for entry in WalkDir::new(dir).min_depth(1).into_iter().flatten() {
+    for entry in WalkDir::new(dir)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .flatten()
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1046,7 +1056,13 @@ fn dir_accounting(dir: &Path) -> (u64, u64, u64, u64) {
     let mut unique = 0u64;
     let mut shared = 0u64;
     let mut files = 0u64;
-    for entry in WalkDir::new(dir).min_depth(1).into_iter().flatten() {
+    for entry in WalkDir::new(dir)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .flatten()
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1145,7 +1161,13 @@ fn view_unit_files(unit: &Unit, arts: &ArtifactInfo) -> Vec<PathBuf> {
 }
 
 fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in WalkDir::new(dir).min_depth(1).into_iter().flatten() {
+    for entry in WalkDir::new(dir)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .flatten()
+    {
         if entry.file_type().is_file() {
             out.push(entry.path().to_path_buf());
         }
@@ -1154,14 +1176,12 @@ fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Remove one unit from one view: fingerprint dir, build anchors, artifacts.
 fn remove_view_unit(root: &Path, unit: &Unit, arts: &ArtifactInfo, errors: &mut u64) {
-    remove_dir(&unit.fingerprint_dir, errors);
+    remove_dir(root, &unit.fingerprint_dir, errors);
     for anchor in fingerprint::build_anchor_dirs(root, unit) {
-        if anchor.is_dir() {
-            remove_dir(&anchor, errors);
-        }
+        remove_dir(root, &anchor, errors);
     }
     for (path, _, _) in &arts.paths {
-        remove_file(path, errors);
+        remove_file(root, path, errors);
     }
 }
 
@@ -1670,21 +1690,17 @@ fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<
     Ok(())
 }
 
-fn remove_dir(path: &Path, errors: &mut u64) {
-    if let Err(e) = fs::remove_dir_all(path) {
-        if e.kind() != ErrorKind::NotFound {
-            *errors += 1;
-            eprintln!("could not remove {}: {e}", path.display());
-        }
+fn remove_dir(root: &Path, path: &Path, errors: &mut u64) {
+    if let Err(err) = crate::util::remove_tree(root, path) {
+        *errors += 1;
+        eprintln!("could not remove {}: {err:#}", path.display());
     }
 }
 
-fn remove_file(path: &Path, errors: &mut u64) {
-    if let Err(e) = fs::remove_file(path) {
-        if e.kind() != ErrorKind::NotFound {
-            *errors += 1;
-            eprintln!("could not remove {}: {e}", path.display());
-        }
+fn remove_file(root: &Path, path: &Path, errors: &mut u64) {
+    if let Err(err) = crate::util::remove_file(root, path) {
+        *errors += 1;
+        eprintln!("could not remove {}: {err:#}", path.display());
     }
 }
 
@@ -2493,6 +2509,7 @@ mod tests {
                 profile: "debug".into(),
                 memo: "lib-old".into(),
                 hash: "aaaaaaaabbbbbbbb".into(),
+                version: None,
                 stamp: 1,
                 layout: None,
                 files: vec![crate::vault::FileEntry {

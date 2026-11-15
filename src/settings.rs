@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -631,11 +631,13 @@ impl Settings {
 /// Nearest `epicenter.toml`, but never above the workspace root. A shared
 /// parent directory can be written by a co-tenant; an ancestor policy file
 /// must not be able to redirect the store or the profile.
+/// Nearest real project policy. A symlink/reparse candidate is skipped so a
+/// repository cannot shadow an ancestor policy with a link.
 fn find_project(cwd: &Path) -> Option<PathBuf> {
     let stop = workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     for dir in cwd.ancestors() {
         let candidate = dir.join(FILE_NAME);
-        if candidate.is_file() {
+        if metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_file()) {
             return Some(candidate);
         }
         if dir == stop {
@@ -645,10 +647,15 @@ fn find_project(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The nearest directory that marks a workspace (`.git` or `Cargo.toml`).
+/// The nearest directory with a real `.git` or `Cargo.toml` marker. A
+/// symlinked marker is ignored: it must not shorten the ancestor search and
+/// hide a real policy above it.
 fn workspace_root(cwd: &Path) -> Option<PathBuf> {
     for dir in cwd.ancestors() {
-        if dir.join(".git").exists() || dir.join("Cargo.toml").is_file() {
+        let git =
+            metadata_nofollow(&dir.join(".git")).is_ok_and(|meta| meta.is_file() || meta.is_dir());
+        let cargo = metadata_nofollow(&dir.join("Cargo.toml")).is_ok_and(|meta| meta.is_file());
+        if git || cargo {
             return Some(dir.to_path_buf());
         }
     }
@@ -832,54 +839,40 @@ pub fn resolve_cargo_home(raw: &str) -> Result<PathBuf> {
     Ok(normalize(path))
 }
 
-fn validate_remote_text(raw: &str, what: &str) -> Result<String> {
+const MAX_REMOTE_URL_BYTES: usize = 4096;
+const MAX_REMOTE_KEY_BYTES: usize = 80;
+const MAX_AWS_REGION_BYTES: usize = 64;
+
+fn validate_remote_text(raw: &str, what: &str, max_bytes: usize) -> Result<String> {
     let raw = raw.trim();
-    if raw.is_empty() {
-        bail!("`[remote] {what}` must not be empty");
-    }
-    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
-        bail!("`[remote] {what}` must not contain whitespace or control characters");
-    }
+    ensure!(!raw.is_empty(), "`[remote] {what}` must not be empty");
+    ensure!(
+        !raw.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || crate::remote::validate::is_unsafe_format(ch)
+        }),
+        "`[remote] {what}` must not contain whitespace, control or formatting characters"
+    );
+    ensure!(
+        raw.len() <= max_bytes,
+        "`[remote] {what}` exceeds {max_bytes} bytes"
+    );
     Ok(raw.to_string())
 }
 
+fn strip_scheme<'a>(raw: &'a str, scheme: &str) -> Option<&'a str> {
+    raw.get(..scheme.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        .map(|_| &raw[scheme.len()..])
+}
+
 fn validate_remote_url(raw: &str) -> Result<(String, RemoteTransport)> {
-    let raw = validate_remote_text(raw, "url")?;
-    if raw
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-    {
-        let rest = &raw[8..];
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        if authority.is_empty() {
-            bail!("`[remote] url` is missing a host");
-        }
-        if authority.contains('@') {
-            bail!("`[remote] url` must not embed credentials; use the environment path");
-        }
-        if rest.contains(['?', '#']) {
-            bail!(
-                "`[remote] url` must not contain a query or fragment; \
-                 do not put signed tokens or credentials in the config"
-            );
-        }
+    let raw = validate_remote_text(raw, "url", MAX_REMOTE_URL_BYTES)?;
+    if let Some(rest) = strip_scheme(&raw, "https://") {
+        validate_https_url(rest)?;
         return Ok((raw, RemoteTransport::AnonymousHttps));
     }
-    if raw
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3://"))
-    {
-        let rest = &raw[5..];
-        let bucket = rest.split('/').next().unwrap_or_default();
-        if bucket.is_empty() {
-            bail!("`[remote] url` s3:// URL is missing a bucket");
-        }
-        if bucket.contains('@') || rest.contains(['?', '#']) {
-            bail!(
-                "`[remote] url` must not embed credentials, a query or a fragment; \
-                 use AWS environment credentials"
-            );
-        }
+    if let Some(rest) = strip_scheme(&raw, "s3://") {
+        validate_s3_url(rest)?;
         return Ok((raw, RemoteTransport::S3));
     }
     bail!(
@@ -888,48 +881,100 @@ fn validate_remote_url(raw: &str) -> Result<(String, RemoteTransport)> {
     )
 }
 
+fn validate_https_url(rest: &str) -> Result<()> {
+    ensure!(!rest.contains('\\'), "`[remote] url` must not contain `\\`");
+    ensure!(
+        !rest.contains(['?', '#']),
+        "`[remote] url` must not contain a query or fragment; do not put signed tokens \
+         or credentials in the config"
+    );
+    let authority = rest.split('/').next().unwrap_or_default();
+    ensure!(!authority.is_empty(), "`[remote] url` is missing a host");
+    ensure!(
+        !authority.contains('@'),
+        "`[remote] url` must not embed credentials; use the environment path"
+    );
+    Ok(())
+}
+
+fn validate_s3_url(rest: &str) -> Result<()> {
+    ensure!(
+        !rest.contains(['?', '#', '@', '\\']),
+        "`[remote] url` must not embed credentials, a query, a fragment or `\\`; \
+         use AWS environment credentials"
+    );
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    ensure!(
+        !bucket.is_empty() && bucket != "." && bucket != "..",
+        "`[remote] url` s3:// URL is missing a valid bucket"
+    );
+    ensure!(
+        bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+        "`[remote] url` s3:// bucket {bucket:?} contains unsupported characters"
+    );
+
+    ensure!(
+        !prefix.starts_with('/'),
+        "`[remote] url` s3:// prefix must not begin with an empty component"
+    );
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    if !prefix.is_empty() {
+        for component in prefix.split('/') {
+            ensure!(
+                !component.is_empty() && component != "." && component != "..",
+                "`[remote] url` s3:// prefix must not contain empty, `.` or `..` components"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Normalize and validate an `https://` or `s3://` remote endpoint.
 pub fn normalize_remote_url(raw: &str) -> Result<String> {
     Ok(validate_remote_url(raw)?.0)
 }
 
-/// Normalize and validate the pinned Ed25519 publisher public key.
-pub fn normalize_remote_publisher_key(raw: &str) -> Result<String> {
-    let raw = validate_remote_text(raw, "publisher_key")?;
-    let raw = raw.strip_prefix("ed25519:").unwrap_or(&raw);
-    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!(
-            "`[remote] publisher_key` must be 64 hex characters \
-             (an Ed25519 public key)"
-        );
-    }
+fn decode_key_hex(raw: &str, what: &str) -> Result<[u8; 32]> {
+    ensure!(
+        raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "`[remote] {what}` must be 64 hex characters (an Ed25519 public key)"
+    );
     let mut bytes = [0u8; 32];
     for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(pair).expect("validated hex is ASCII");
         bytes[index] = u8::from_str_radix(text, 16).expect("validated hex pair");
     }
+    Ok(bytes)
+}
+
+/// Whether a setup argument is a hex key rather than a file path.
+pub fn is_publisher_key_hex(raw: &str) -> bool {
+    let raw = raw.trim();
+    let hex = raw.strip_prefix("ed25519:").unwrap_or(raw);
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Normalize and validate the pinned Ed25519 publisher public key.
+pub fn normalize_remote_publisher_key(raw: &str) -> Result<String> {
+    let raw = validate_remote_text(raw, "publisher_key", MAX_REMOTE_KEY_BYTES)?;
+    let hex = raw.strip_prefix("ed25519:").unwrap_or(&raw);
+    let bytes = decode_key_hex(hex, "publisher_key")?;
     VerifyingKey::from_bytes(&bytes).map_err(|err| {
         anyhow::anyhow!("`[remote] publisher_key` is not a valid Ed25519 key: {err}")
     })?;
-    Ok(raw.to_ascii_lowercase())
+    Ok(hex.to_ascii_lowercase())
 }
 
 /// Stable short id derived from the public-key fingerprint.
 pub fn remote_key_id(public_key: &str) -> Result<String> {
-    if public_key.len() != 64 || !public_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("remote public key must be 64 hex characters");
-    }
-    let mut bytes = [0u8; 32];
-    for (index, pair) in public_key.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(pair).expect("validated hex is ASCII");
-        bytes[index] = u8::from_str_radix(text, 16).expect("validated hex pair");
-    }
+    let bytes = decode_key_hex(public_key, "public key")?;
     let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(16);
-    for byte in &digest[..8] {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    Ok(format!("ed25519:{hex}"))
+    Ok(format!(
+        "ed25519:{}",
+        crate::vault::hex_encode(&digest[..8])
+    ))
 }
 
 fn aws_region() -> Option<String> {
@@ -939,7 +984,13 @@ fn aws_region() -> Option<String> {
             std::env::var(name)
                 .ok()
                 .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= MAX_AWS_REGION_BYTES
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
         })
 }
 
@@ -1318,6 +1369,34 @@ mod tests {
         );
         let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
         assert!(settings.remote().is_err(), "publisher keys are validated");
+
+        let publisher_key = test_public_key();
+        for bad in [
+            "https://cache.example/root\\evil",
+            "https://cache.example/root#fragment",
+            "s3://bucket/../prefix",
+            "s3://bucket//prefix",
+        ] {
+            write(
+                &global,
+                &format!("[remote]\nurl = '{bad}'\npublisher_key = \"{publisher_key}\"\n"),
+            );
+            let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+            assert!(settings.remote().is_err(), "{bad} must be refused");
+        }
+
+        write(
+            &global,
+            &format!(
+                "[remote]\nurl = \"s3://bucket/prefix/\"\npublisher_key = \"{publisher_key}\"\n"
+            ),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(
+            settings.remote().unwrap().transport,
+            RemoteTransport::S3,
+            "one trailing slash is harmless"
+        );
     }
 
     #[test]
@@ -1357,6 +1436,40 @@ mod tests {
         symlink(&real, &global_link).unwrap();
         let err = Settings::load_at(dir.path(), Some(&global_link)).unwrap_err();
         assert!(format!("{err:#}").contains("symlink/reparse"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_file_does_not_shadow_ancestor_policy() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        write(&root.path().join(FILE_NAME), "link = \"copy\"\n");
+
+        // A symlinked project file in the subdirectory must be skipped, not
+        // selected and then rejected: the real root policy still applies.
+        let target = sub.join("real.toml");
+        write(&target, "link = \"link\"\n");
+        symlink(&target, sub.join(FILE_NAME)).unwrap();
+        let settings = Settings::load_at(&sub, None).unwrap();
+        assert_eq!(
+            settings.project_path(),
+            Some(root.path().join(FILE_NAME).as_path())
+        );
+        assert_eq!(settings.link().unwrap().0, LinkPolicy::Copy);
+
+        // A symlinked workspace marker must not stop the search early either.
+        std::fs::remove_file(sub.join(FILE_NAME)).unwrap();
+        symlink(root.path().join(".git"), sub.join(".git")).unwrap();
+        let settings = Settings::load_at(&sub, None).unwrap();
+        assert_eq!(
+            settings.project_path(),
+            Some(root.path().join(FILE_NAME).as_path())
+        );
+        assert_eq!(settings.link().unwrap().0, LinkPolicy::Copy);
     }
 
     #[test]

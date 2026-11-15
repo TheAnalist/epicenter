@@ -71,7 +71,7 @@ fn test_unit(
     package: &str,
     kind: RemoteUnitKind,
     path: &str,
-    role: &str,
+    role: FileRole,
     content: &[u8],
 ) -> RemoteUnit {
     let source = root.join(format!(".source-{package}"));
@@ -112,7 +112,7 @@ fn test_unit(
             dest: path.to_string(),
             size: content.len() as u64,
             sha256: sha256_hex(content),
-            role: role.to_string(),
+            role,
             blob: blob.blob,
             blob_size: blob.blob_size,
             compression: blob.compression,
@@ -145,7 +145,7 @@ fn index_round_trip_is_canonical_and_verified() -> Result<()> {
     write_index_tree(dir.path(), &pointer, &bytes)?;
     assert!(dir.path().join(PUBLISHER_FILE).is_file());
 
-    let verified = read_index_tree(dir.path(), &public_key(&key), now)?;
+    let verified = read_index_tree(dir.path(), &public_key(&key), RemoteTier::Libraries, now)?;
     assert_eq!(verified.pointer.sequence, 3);
     assert_eq!(verified.body.tier, RemoteTier::Libraries);
     assert_eq!(verified.body_bytes, bytes);
@@ -194,7 +194,16 @@ fn body_hash_size_and_canonical_form_are_enforced() -> Result<()> {
     let pretty = serde_json::to_vec_pretty(&body)?;
     assert!(verify_body(&pointer, &pretty, now).is_err());
 
-    assert!(verify_index(&bytes, &bytes, &public_key(&key), now).is_err());
+    assert!(
+        verify_index(
+            &bytes,
+            &bytes,
+            &public_key(&key),
+            RemoteTier::Libraries,
+            now
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -206,6 +215,7 @@ fn expiry_future_clock_and_validity_cap_are_enforced() -> Result<()> {
     let mut stale = body_for(&key, now, 4, RemoteTier::Libraries, Vec::new());
     stale.created = now.saturating_sub(1_000);
     stale.expires = now.saturating_sub(1);
+    stale.publisher.built_at = now.saturating_sub(500);
     let (pointer, _) = make_index(&stale, &key, now.saturating_sub(500))?;
     assert!(pointer.verify(&public_key(&key), now).is_err());
 
@@ -213,6 +223,10 @@ fn expiry_future_clock_and_validity_cap_are_enforced() -> Result<()> {
     let body = body_for(&key, future, 5, RemoteTier::Libraries, Vec::new());
     let (pointer, _) = make_index(&body, &key, future)?;
     assert!(pointer.verify(&public_key(&key), now).is_err());
+
+    let mut future_publisher = body_for(&key, now, 5, RemoteTier::Libraries, Vec::new());
+    future_publisher.publisher.built_at = now + MAX_CLOCK_SKEW_SECS + 1;
+    assert!(make_index(&future_publisher, &key, now).is_err());
 
     let mut too_long = body_for(&key, now, 6, RemoteTier::Libraries, Vec::new());
     too_long.expires = too_long.created + MAX_INDEX_VALIDITY_SECS + 1;
@@ -308,7 +322,7 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
         "buildy",
         RemoteUnitKind::BuildScript,
         "build/buildy/out/build-script-build",
-        "build-tree",
+        FileRole::BuildTree,
         b"executable",
     );
     let body = body_for(&key, now, 9, RemoteTier::Full, vec![build_script.clone()]);
@@ -321,6 +335,29 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
     );
     assert!(body.validate_for(RemoteTier::Libraries).is_err());
 
+    let (pointer, bytes) = make_index(&body, &key, now)?;
+    let pointer_bytes = serde_json::to_vec(&pointer)?;
+    assert!(
+        verify_index(
+            &pointer_bytes,
+            &bytes,
+            &public_key(&key),
+            RemoteTier::Libraries,
+            now
+        )
+        .is_err()
+    );
+    assert!(
+        verify_index(
+            &pointer_bytes,
+            &bytes,
+            &public_key(&key),
+            RemoteTier::Full,
+            now
+        )
+        .is_ok()
+    );
+
     let mut mislabeled = body;
     mislabeled.tier = RemoteTier::Libraries;
     assert!(mislabeled.validate_for(RemoteTier::Libraries).is_err());
@@ -330,7 +367,7 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
         "macros",
         RemoteUnitKind::Lib,
         "deps/libmacros.so",
-        "artifact",
+        FileRole::Artifact,
         b"shared object",
     );
     let body = body_for(&key, now, 10, RemoteTier::Libraries, vec![proc_macro]);
@@ -341,7 +378,7 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
         "probe",
         RemoteUnitKind::Other,
         "deps/probe",
-        "artifact",
+        FileRole::Artifact,
         b"extensionless binary",
     );
     let body = body_for(&key, now, 18, RemoteTier::Libraries, vec![binary]);
@@ -360,7 +397,7 @@ fn path_workspace_and_path_traversal_are_rejected() -> Result<()> {
         "local",
         RemoteUnitKind::Lib,
         "deps/liblocal.rlib",
-        "artifact",
+        FileRole::Artifact,
         b"rlib",
     );
     local.source.kind = SourceKind::Path;
@@ -369,12 +406,24 @@ fn path_workspace_and_path_traversal_are_rejected() -> Result<()> {
     let body = body_for(&key, now, 11, RemoteTier::Libraries, vec![local]);
     assert!(body.validate_shape().is_err());
 
+    let mut credential = test_unit(
+        dir.path(),
+        "credential",
+        RemoteUnitKind::Lib,
+        "deps/libcredential.rlib",
+        FileRole::Artifact,
+        b"rlib",
+    );
+    credential.source.id = "registry+https://user:pass@cache.example/index".to_string();
+    let body = body_for(&key, now, 11, RemoteTier::Libraries, vec![credential]);
+    assert!(body.validate_shape().is_err());
+
     let mut escape = test_unit(
         dir.path(),
         "escape",
         RemoteUnitKind::Lib,
         "deps/libescape.rlib",
-        "artifact",
+        FileRole::Artifact,
         b"rlib",
     );
     escape.files[0].path = "../escape".to_string();
@@ -386,7 +435,7 @@ fn path_workspace_and_path_traversal_are_rejected() -> Result<()> {
         "oversized",
         RemoteUnitKind::Lib,
         "deps/liboversized.rlib",
-        "artifact",
+        FileRole::Artifact,
         b"rlib",
     );
     oversized.files[0].size = MAX_BLOB_BYTES + 1;
@@ -394,7 +443,16 @@ fn path_workspace_and_path_traversal_are_rejected() -> Result<()> {
     assert!(body.validate_shape().is_err());
 
     let huge_pointer = vec![b' '; MAX_INDEX_POINTER_BYTES as usize + 1];
-    assert!(verify_index(&huge_pointer, b"{}", &public_key(&key), now).is_err());
+    assert!(
+        verify_index(
+            &huge_pointer,
+            b"{}",
+            &public_key(&key),
+            RemoteTier::Libraries,
+            now
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -408,7 +466,7 @@ fn duplicate_destinations_and_bad_names_are_rejected() -> Result<()> {
         "one",
         RemoteUnitKind::Lib,
         "deps/libsame.rlib",
-        "artifact",
+        FileRole::Artifact,
         b"one",
     );
     let mut second = test_unit(
@@ -416,7 +474,7 @@ fn duplicate_destinations_and_bad_names_are_rejected() -> Result<()> {
         "two",
         RemoteUnitKind::Lib,
         "deps/libsame.rlib",
-        "artifact",
+        FileRole::Artifact,
         b"two",
     );
     second.files[0].dest = first.files[0].dest.clone();
@@ -448,6 +506,16 @@ fn blob_round_trip_is_put_if_absent() -> Result<()> {
     assert!(blob.blob_size < blob.size);
     verify_blob(dir.path(), &blob)?;
     assert_eq!(read_blob(dir.path(), &blob)?, payload);
+    let mut streamed = Vec::new();
+    decode_blob(dir.path(), &blob, &mut streamed)?;
+    assert_eq!(streamed, payload);
+
+    let mut too_big = blob.clone();
+    too_big.size = MAX_IN_MEMORY_BLOB_BYTES + 1;
+    assert!(read_blob(dir.path(), &too_big).is_err());
+    let mut short = blob.clone();
+    short.size -= 1;
+    assert!(decode_blob(dir.path(), &short, &mut Vec::new()).is_err());
 
     let again = write_blob(&source, dir.path())?;
     assert_eq!(blob, again, "an identical blob must reuse the CAS object");
@@ -477,7 +545,7 @@ fn upload_plan_replaces_the_pointer_last() -> Result<()> {
         "upload",
         RemoteUnitKind::Lib,
         "deps/libupload.rlib",
-        "artifact",
+        FileRole::Artifact,
         b"payload",
     );
     let body = body_for(&key, now, 16, RemoteTier::Libraries, vec![unit]);
@@ -534,9 +602,17 @@ fn compatibility_mismatches_name_the_field() -> Result<()> {
     assert!(fields.contains(&"cargo home"));
     assert!(fields.contains(&"target"));
 
-    let mut unsorted = compatibility;
+    let mut unsorted = compatibility.clone();
     unsorted.profiles = vec!["release".to_string(), "debug".to_string()];
     assert!(unsorted.validate().is_err());
+
+    let mut credential = compatibility.clone();
+    credential.registry.index = "https://token@cache.example/index".to_string();
+    assert!(credential.validate().is_err());
+
+    let mut oversize = compatibility;
+    oversize.features = vec!["x".repeat(super::compat::MAX_FEATURE_BYTES + 1)];
+    assert!(oversize.validate().is_err());
     Ok(())
 }
 
@@ -559,6 +635,36 @@ fn local_compatibility_gate_checks_the_machine_tuple() -> Result<()> {
         body.validate_for_local(RemoteTier::Libraries, &other)
             .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn publisher_metadata_rejects_control_characters_and_oversize_text() -> Result<()> {
+    let now = now_secs();
+    let key = signing_key(7);
+    let mut body = body_for(&key, now, 21, RemoteTier::Libraries, Vec::new());
+    body.publisher.notes = "\u{1b}[31mred".to_string();
+    assert!(body.validate_shape().is_err());
+
+    body.publisher.notes = "\u{202e}evil".to_string();
+    assert!(body.validate_shape().is_err());
+
+    body.publisher.notes.clear();
+    body.publisher.ci_job = "https://token@ci.example/job".to_string();
+    assert!(body.validate_shape().is_err());
+
+    body.publisher.ci_job.clear();
+    body.publisher.tool = "x".repeat(super::index::MAX_TOOL_BYTES + 1);
+    assert!(body.validate_shape().is_err());
+    Ok(())
+}
+
+#[test]
+fn file_roles_are_typed_and_round_trip() -> Result<()> {
+    let role: FileRole = serde_json::from_str("\"build-tree\"")?;
+    assert_eq!(role, FileRole::BuildTree);
+    assert_eq!(role.as_str(), "build-tree");
+    assert!(serde_json::from_str::<FileRole>("\"executable\"").is_err());
     Ok(())
 }
 

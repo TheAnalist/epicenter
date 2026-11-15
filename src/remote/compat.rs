@@ -5,12 +5,26 @@
 //! cargo-home, registry source path, flags) so `doctor`/`exec` can explain a
 //! likely miss before Cargo recompiles.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::Path;
 
 use super::{RemoteUnit, sha256_hex};
 use crate::fingerprint::FingerprintJson;
+
+const MAX_RUSTC_TEXT: usize = 256;
+const MAX_REGISTRY_NAME: usize = 256;
+const MAX_REGISTRY_INDEX: usize = 4096;
+const MAX_CARGO: usize = 256;
+const MAX_TARGET: usize = 256;
+pub(crate) const MAX_PROFILES: usize = 64;
+pub(crate) const MAX_PROFILE_BYTES: usize = 128;
+pub(crate) const MAX_FEATURES: usize = 4096;
+pub(crate) const MAX_FEATURE_BYTES: usize = 256;
+pub(crate) const MAX_FLAGS: usize = 4096;
+pub(crate) const MAX_FLAG_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_CARGO_HOME: usize = 4096;
 
 /// `rustc -vV` facts that name a compiler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,10 +39,12 @@ pub struct RustcIdentity {
 
 impl RustcIdentity {
     fn validate(&self) -> Result<()> {
-        validate_text(&self.release, "rustc release")?;
-        validate_text(&self.commit, "rustc commit")?;
-        validate_text(&self.host, "rustc host")?;
-        validate_optional_text(&self.llvm, "rustc LLVM version")?;
+        super::validate::text(&self.release, "rustc release", MAX_RUSTC_TEXT)?;
+        super::validate::text(&self.commit, "rustc commit", MAX_RUSTC_TEXT)?;
+        super::validate::text(&self.host, "rustc host", MAX_RUSTC_TEXT)?;
+        if !self.llvm.is_empty() {
+            super::validate::text(&self.llvm, "rustc LLVM version", MAX_RUSTC_TEXT)?;
+        }
         Ok(())
     }
 }
@@ -48,9 +64,10 @@ pub struct RegistryIdentity {
 
 impl RegistryIdentity {
     fn validate(&self) -> Result<()> {
-        validate_text(&self.name, "registry name")?;
-        validate_text(&self.index, "registry index")?;
-        super::ensure_sha256(&self.source_path_hash, "registry source path hash")?;
+        super::validate::text(&self.name, "registry name", MAX_REGISTRY_NAME)?;
+        super::validate::text(&self.index, "registry index", MAX_REGISTRY_INDEX)?;
+        super::validate::no_url_credentials(&self.index, "registry index")?;
+        super::validate::lower_hex(&self.source_path_hash, 64, "registry source path hash")?;
         Ok(())
     }
 }
@@ -137,37 +154,27 @@ impl Compatibility {
 
     pub fn validate(&self) -> Result<()> {
         self.rustc.validate()?;
-        validate_text(&self.cargo, "cargo version")?;
-        validate_text(&self.target, "target")?;
-        if self.profiles.len() > 64 {
-            bail!("too many profiles in the compatibility tuple");
-        }
-        if self.profiles.iter().any(|profile| profile.is_empty()) {
-            bail!("compatibility profiles must not be empty");
-        }
-        if !is_sorted_unique(&self.profiles) {
-            bail!("compatibility profiles must be sorted and unique");
-        }
-        if self.features.iter().any(|feature| feature.is_empty()) {
-            bail!("compatibility features must not be empty");
-        }
-        if !is_sorted_unique(&self.features) {
-            bail!("compatibility features must be sorted and unique");
-        }
-        if self.rustflags_digest.len() != 8
-            || !self.rustflags_digest.bytes().all(super::is_lower_hex)
-        {
-            bail!("rustflags digest must be 8 hex characters");
-        }
-        super::ensure_sha256(&self.config_digest, "config digest")?;
-        validate_text(&self.cargo_home, "cargo home")?;
-        if !Path::new(&self.cargo_home).is_absolute() {
-            bail!("cargo home in the compatibility tuple must be absolute");
-        }
-        match self.layout.as_str() {
-            "classic" | "new" | "mixed" => {}
-            other => bail!("unknown Cargo layout {other:?}"),
-        }
+        super::validate::text(&self.cargo, "cargo version", MAX_CARGO)?;
+        super::validate::text(&self.target, "target", MAX_TARGET)?;
+        super::validate::sorted_unique(
+            &self.profiles,
+            "compatibility profiles",
+            MAX_PROFILES,
+            MAX_PROFILE_BYTES,
+        )?;
+        super::validate::sorted_unique(
+            &self.features,
+            "compatibility features",
+            MAX_FEATURES,
+            MAX_FEATURE_BYTES,
+        )?;
+        super::validate::lower_hex(&self.rustflags_digest, 8, "rustflags digest")?;
+        super::validate::lower_hex(&self.config_digest, 64, "config digest")?;
+        super::validate::absolute_path(&self.cargo_home, "cargo home", MAX_CARGO_HOME)?;
+        ensure!(
+            matches!(self.layout.as_str(), "classic" | "new" | "mixed"),
+            "unknown Cargo layout; expected classic, new or mixed"
+        );
         self.registry.validate()?;
         Ok(())
     }
@@ -262,20 +269,19 @@ impl UnitCompatibility {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_opaque(&self.rustc, "unit rustc hash")?;
-        validate_opaque(&self.target, "unit target hash")?;
-        validate_opaque(&self.profile, "unit profile hash")?;
-        validate_opaque(&self.config, "unit config hash")?;
-        validate_opaque(&self.path, "unit source path hash")?;
-        validate_opaque(&self.compile_kind, "unit compile kind")?;
-        for feature in &self.features {
-            validate_feature(feature, "unit feature")?;
-        }
-        for flag in &self.rustflags {
-            if flag.contains('\0') {
-                bail!("unit rustflags must not contain NUL");
-            }
-        }
+        super::validate::decimal(&self.rustc, "unit rustc hash")?;
+        super::validate::decimal(&self.target, "unit target hash")?;
+        super::validate::decimal(&self.profile, "unit profile hash")?;
+        super::validate::decimal(&self.config, "unit config hash")?;
+        super::validate::decimal(&self.path, "unit source path hash")?;
+        super::validate::decimal(&self.compile_kind, "unit compile kind")?;
+        super::validate::strings(
+            &self.features,
+            "unit features",
+            MAX_FEATURES,
+            MAX_FEATURE_BYTES,
+        )?;
+        super::validate::strings(&self.rustflags, "unit rustflags", MAX_FLAGS, MAX_FLAG_BYTES)?;
         Ok(())
     }
 }
@@ -293,8 +299,19 @@ impl std::fmt::Display for Mismatch {
         write!(
             formatter,
             "{}: publisher {}, local {}",
-            self.field, self.expected, self.actual
+            sanitize(&self.field),
+            sanitize(&self.expected),
+            sanitize(&self.actual)
         )
+    }
+}
+
+/// Keep control bytes out of terminal output; the JSON form stays raw.
+fn sanitize(value: &str) -> Cow<'_, str> {
+    if value.chars().any(char::is_control) {
+        Cow::Owned(crate::util::safe_display(std::ffi::OsStr::new(value)))
+    } else {
+        Cow::Borrowed(value)
     }
 }
 
@@ -335,7 +352,7 @@ impl LocalEnvironment {
         }
         .to_string();
         let registry = local_registry(&cargo_home);
-        Ok(Self {
+        let environment = Self {
             rustc: rustc.clone(),
             cargo,
             target,
@@ -343,7 +360,22 @@ impl LocalEnvironment {
             rustflags_digest: crate::vault::flags_digest_of(&rustc.host, selector),
             layout,
             registry,
-        })
+        };
+        environment.validate()?;
+        Ok(environment)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.rustc.validate()?;
+        super::validate::text(&self.cargo, "cargo version", MAX_CARGO)?;
+        super::validate::text(&self.target, "target", MAX_TARGET)?;
+        super::validate::absolute_path(&self.cargo_home, "cargo home", MAX_CARGO_HOME)?;
+        super::validate::lower_hex(&self.rustflags_digest, 8, "rustflags digest")?;
+        ensure!(
+            matches!(self.layout.as_str(), "classic" | "new" | "mixed"),
+            "unknown Cargo layout; expected classic, new or mixed"
+        );
+        self.registry.validate()
     }
 }
 
@@ -487,42 +519,4 @@ fn path_key(value: &str) -> String {
         text.make_ascii_lowercase();
     }
     text
-}
-
-fn validate_text(value: &str, what: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        bail!("{what} must not be empty");
-    }
-    if value.chars().any(char::is_control) {
-        bail!("{what} must not contain control characters");
-    }
-    Ok(())
-}
-
-fn validate_optional_text(value: &str, what: &str) -> Result<()> {
-    if value
-        .chars()
-        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
-    {
-        bail!("{what} must not contain control characters");
-    }
-    Ok(())
-}
-
-fn validate_opaque(value: &str, what: &str) -> Result<()> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("{what} must be a non-empty decimal hash");
-    }
-    Ok(())
-}
-
-fn validate_feature(value: &str, what: &str) -> Result<()> {
-    if value.is_empty() || value.contains('\0') {
-        bail!("{what} must be non-empty and contain no NUL");
-    }
-    Ok(())
-}
-
-fn is_sorted_unique(values: &[String]) -> bool {
-    values.windows(2).all(|pair| pair[0] < pair[1])
 }

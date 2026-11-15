@@ -8,7 +8,7 @@
 //! indexes/<sha256>.json  <- canonical IndexBody, addressed by its hash
 //! ```
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -20,11 +20,15 @@ use super::{
     now_secs, read_capped, sha256_hex,
 };
 use crate::settings::{self, RemoteTier};
-use crate::util::validate_rel;
 
 const SIGNING_DOMAIN: &[u8] = b"epicenter.remote.index.v1\0";
 const EXECUTABLE_EXTENSIONS: [&str; 6] = ["exe", "dll", "dylib", "so", "dSYM", "efi"];
 const MAX_REMOTE_PATH_BYTES: usize = 4096;
+const MAX_SOURCE_ID_BYTES: usize = 4096;
+pub(crate) const MAX_TOOL_BYTES: usize = 256;
+pub(crate) const MAX_COMMIT_BYTES: usize = 256;
+pub(crate) const MAX_CI_JOB_BYTES: usize = 4096;
+pub(crate) const MAX_NOTES_BYTES: usize = 16 * 1024;
 
 /// The signed pointer stored at `index.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,14 +68,13 @@ impl IndexPointer {
         self.validate_time(now)?;
         let pinned = settings::normalize_remote_publisher_key(pinned_public_key)?;
         let expected = settings::remote_key_id(&pinned)?;
-        if self.key_id != expected {
-            bail!(
-                "remote index is signed by {} but the pinned publisher is {}; \
-                 rotate the pin only through the trusted CI/admin channel",
-                self.key_id,
-                expected
-            );
-        }
+        ensure!(
+            self.key_id == expected,
+            "remote index is signed by {} but the pinned publisher is {}; rotate the pin \
+             only through the trusted CI/admin channel",
+            self.key_id,
+            expected
+        );
         let signature = crate::vault::hex_decode(&self.signature, "index signature")?;
         let signature: [u8; 64] = signature
             .try_into()
@@ -83,49 +86,41 @@ impl IndexPointer {
     }
 
     pub fn validate_shape(&self) -> Result<()> {
-        if self.schema != SCHEMA_VERSION {
-            bail!(
-                "remote index schema {} is not supported (expected {SCHEMA_VERSION})",
-                self.schema
-            );
-        }
+        ensure!(
+            self.schema == SCHEMA_VERSION,
+            "remote index schema {} is not supported (expected {SCHEMA_VERSION})",
+            self.schema
+        );
         validate_key_id(&self.key_id)?;
-        if self.sequence == 0 {
-            bail!("remote index sequence must start at 1");
-        }
+        ensure!(self.sequence > 0, "remote index sequence must start at 1");
         validate_window(self.created, self.expires)?;
-        super::ensure_sha256(&self.body_sha256, "index body SHA-256")?;
-        if self.body_size == 0 || self.body_size > MAX_INDEX_BODY_BYTES {
-            bail!(
-                "remote index body size {} is outside 1..={MAX_INDEX_BODY_BYTES}",
-                self.body_size
-            );
-        }
+        super::validate::lower_hex(&self.body_sha256, 64, "index body SHA-256")?;
+        ensure!(
+            (1..=MAX_INDEX_BODY_BYTES).contains(&self.body_size),
+            "remote index body size {} is outside 1..={MAX_INDEX_BODY_BYTES}",
+            self.body_size
+        );
         if !self.signature.is_empty() {
-            let signature = crate::vault::hex_decode(&self.signature, "index signature")?;
-            if signature.len() != 64 {
-                bail!("remote index signature must be 128 hex characters");
-            }
+            super::validate::lower_hex(&self.signature, 128, "index signature")?;
         }
         Ok(())
     }
 
     fn validate_time(&self, now: u64) -> Result<()> {
-        if self.signature.is_empty() {
-            bail!("remote index pointer is not signed");
-        }
-        if self.created > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
-            bail!(
-                "remote index was created {} seconds in the future; check the clock",
-                self.created.saturating_sub(now)
-            );
-        }
-        if self.expires < now {
-            bail!(
-                "remote index expired {} seconds ago; ask CI to publish a fresh index",
-                now.saturating_sub(self.expires)
-            );
-        }
+        ensure!(
+            !self.signature.is_empty(),
+            "remote index pointer is not signed"
+        );
+        ensure!(
+            self.created <= now.saturating_add(MAX_CLOCK_SKEW_SECS),
+            "remote index was created {} seconds in the future; check the clock",
+            self.created.saturating_sub(now)
+        );
+        ensure!(
+            self.expires >= now,
+            "remote index expired {} seconds ago; ask CI to publish a fresh index",
+            now.saturating_sub(self.expires)
+        );
         Ok(())
     }
 }
@@ -145,46 +140,70 @@ pub struct IndexBody {
     pub units: Vec<RemoteUnit>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlobIdentity<'a> {
+    sha256: &'a str,
+    size: u64,
+    blob_size: u64,
+    compression: super::Compression,
+}
+
+impl<'a> From<&'a RemoteFile> for BlobIdentity<'a> {
+    fn from(file: &'a RemoteFile) -> Self {
+        Self {
+            sha256: &file.sha256,
+            size: file.size,
+            blob_size: file.blob_size,
+            compression: file.compression,
+        }
+    }
+}
+
 impl IndexBody {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(self)?)
     }
 
     pub fn validate_shape(&self) -> Result<()> {
-        if self.schema != SCHEMA_VERSION {
-            bail!(
-                "remote index body schema {} is not supported (expected {SCHEMA_VERSION})",
-                self.schema
-            );
-        }
+        ensure!(
+            self.schema == SCHEMA_VERSION,
+            "remote index body schema {} is not supported (expected {SCHEMA_VERSION})",
+            self.schema
+        );
         validate_key_id(&self.key_id)?;
-        if self.sequence == 0 {
-            bail!("remote index body sequence must start at 1");
-        }
+        ensure!(
+            self.sequence > 0,
+            "remote index body sequence must start at 1"
+        );
         validate_window(self.created, self.expires)?;
         self.publisher.validate()?;
         self.compatibility.validate()?;
-        if self.units.len() > MAX_INDEX_UNITS {
-            bail!(
-                "remote index has {} units (cap {MAX_INDEX_UNITS})",
-                self.units.len()
-            );
-        }
+        self.validate_units()
+    }
 
+    fn validate_units(&self) -> Result<()> {
+        super::validate::count(self.units.len(), MAX_INDEX_UNITS, "remote index units")?;
         let mut names = HashSet::with_capacity(self.units.len());
-        let mut files = 0usize;
         let mut destinations: HashMap<String, &str> = HashMap::new();
-        let mut blobs: HashMap<&str, (&str, u64, u64, super::Compression)> = HashMap::new();
+        let mut blobs: HashMap<&str, BlobIdentity<'_>> = HashMap::new();
         let mut contents: HashMap<&str, u64> = HashMap::new();
+        let mut files = 0usize;
+
         for unit in &self.units {
             unit.validate()?;
-            if !names.insert(unit.name.to_ascii_lowercase()) {
-                bail!("duplicate unit {:?} in remote index", unit.name);
-            }
-            files = files.saturating_add(unit.files.len());
-            if files > MAX_INDEX_FILES {
-                bail!("remote index has more than {MAX_INDEX_FILES} files");
-            }
+            ensure!(
+                names.insert(unit.name.to_ascii_lowercase()),
+                "duplicate unit {:?} in remote index",
+                unit.name
+            );
+            files = files
+                .checked_add(unit.files.len())
+                .context("remote index file count overflow")?;
+            ensure!(
+                files <= MAX_INDEX_FILES,
+                "remote index has more than {MAX_INDEX_FILES} files"
+            );
+
             for file in &unit.files {
                 let destination = file.dest.to_ascii_lowercase();
                 if let Some(owner) = destinations.insert(destination, unit.name.as_str()) {
@@ -195,40 +214,30 @@ impl IndexBody {
                         unit.name
                     );
                 }
-                match blobs.get(file.blob.as_str()) {
-                    Some((sha256, size, blob_size, compression))
-                        if *sha256 != file.sha256
-                            || *size != file.size
-                            || *blob_size != file.blob_size
-                            || *compression != file.compression =>
-                    {
-                        bail!(
+                let identity = BlobIdentity::from(file);
+                match blobs.entry(file.blob.as_str()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        ensure!(
+                            entry.get() == &identity,
                             "blob {} is referenced with conflicting content/size/compression",
                             file.blob
                         );
                     }
-                    Some(_) => {}
-                    None => {
-                        blobs.insert(
-                            file.blob.as_str(),
-                            (
-                                file.sha256.as_str(),
-                                file.size,
-                                file.blob_size,
-                                file.compression,
-                            ),
-                        );
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(identity);
                     }
                 }
-                if let Some(size) = contents.get(file.sha256.as_str()) {
-                    if *size != file.size {
-                        bail!(
+                match contents.entry(file.sha256.as_str()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        ensure!(
+                            *entry.get() == file.size,
                             "content {} is referenced with conflicting sizes",
                             file.sha256
                         );
                     }
-                } else {
-                    contents.insert(file.sha256.as_str(), file.size);
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(file.size);
+                    }
                 }
             }
         }
@@ -242,28 +251,29 @@ impl IndexBody {
     /// subset. `libraries` content can never contain executable units.
     pub fn validate_for(&self, reader: RemoteTier) -> Result<()> {
         self.validate_shape()?;
-        if reader == RemoteTier::Libraries && self.tier == RemoteTier::Full {
+        self.validate_reader(reader)
+    }
+
+    pub(crate) fn validate_reader(&self, reader: RemoteTier) -> Result<()> {
+        ensure!(
+            reader == RemoteTier::Full || self.tier != RemoteTier::Full,
+            "remote index is published for the `full` tier but this machine allows only \
+             `libraries`; refusing executable units"
+        );
+        if self.tier == RemoteTier::Libraries
+            && let Some(unit) = self.units.iter().find(|unit| unit.is_executable())
+        {
+            let detail = unit
+                .executable_file()
+                .map(|file| file.path.as_str())
+                .unwrap_or(unit.memo.as_str());
             bail!(
-                "remote index is published for the `full` tier but this machine allows \
-                 only `libraries`; refusing executable units"
+                "`libraries` remote index contains executable unit {:?} \
+                 (kind {:?}, file {:?}); re-publish with tier = \"full\" or exclude it",
+                unit.name,
+                unit.kind,
+                detail
             );
-        }
-        if self.tier == RemoteTier::Libraries {
-            for unit in &self.units {
-                if unit.is_executable() {
-                    let detail = unit
-                        .executable_file()
-                        .map(|file| file.path.as_str())
-                        .unwrap_or(unit.memo.as_str());
-                    bail!(
-                        "`libraries` remote index contains executable unit {:?} \
-                         (kind {:?}, file {:?}); re-publish with tier = \"full\" or exclude it",
-                        unit.name,
-                        unit.kind,
-                        detail
-                    );
-                }
-            }
         }
         Ok(())
     }
@@ -278,31 +288,39 @@ impl IndexBody {
     ) -> Result<()> {
         self.validate_for(reader)?;
         let mismatches = self.compatibility.compare_local(local);
-        if !mismatches.is_empty() {
-            let details = mismatches
+        ensure!(
+            mismatches.is_empty(),
+            "remote index compatibility mismatch: {}",
+            mismatches
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
-                .join("; ");
-            bail!("remote index compatibility mismatch: {details}");
-        }
+                .join("; ")
+        );
         Ok(())
     }
 
     fn validate_time(&self, now: u64) -> Result<()> {
         validate_window(self.created, self.expires)?;
-        if self.created > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
-            bail!(
-                "remote index was created {} seconds in the future; check the clock",
-                self.created.saturating_sub(now)
-            );
-        }
-        if self.expires < now {
-            bail!(
-                "remote index expired {} seconds ago; ask CI to publish a fresh index",
-                now.saturating_sub(self.expires)
-            );
-        }
+        ensure!(
+            self.created <= now.saturating_add(MAX_CLOCK_SKEW_SECS),
+            "remote index was created {} seconds in the future; check the clock",
+            self.created.saturating_sub(now)
+        );
+        ensure!(
+            self.publisher.built_at <= self.expires,
+            "publisher timestamp is after the index expiry"
+        );
+        ensure!(
+            self.publisher.built_at <= now.saturating_add(MAX_CLOCK_SKEW_SECS),
+            "publisher timestamp is {} seconds in the future; check the clock",
+            self.publisher.built_at.saturating_sub(now)
+        );
+        ensure!(
+            self.expires >= now,
+            "remote index expired {} seconds ago; ask CI to publish a fresh index",
+            now.saturating_sub(self.expires)
+        );
         Ok(())
     }
 }
@@ -324,15 +342,22 @@ pub struct PublisherMetadata {
 
 impl PublisherMetadata {
     pub(crate) fn validate(&self) -> Result<()> {
-        validate_text(&self.tool, "publisher tool")?;
-        validate_text(&self.source_commit, "publisher source commit")?;
-        if self.built_at == 0 {
-            bail!("publisher built_at must be a Unix timestamp");
+        super::validate::text(&self.tool, "publisher tool", MAX_TOOL_BYTES)?;
+        super::validate::text(
+            &self.source_commit,
+            "publisher source commit",
+            MAX_COMMIT_BYTES,
+        )?;
+        ensure!(
+            self.built_at > 0,
+            "publisher built_at must be a Unix timestamp"
+        );
+        if !self.ci_job.is_empty() {
+            super::validate::text(&self.ci_job, "publisher CI job", MAX_CI_JOB_BYTES)?;
+            super::validate::no_url_credentials(&self.ci_job, "publisher CI job")?;
         }
-        validate_optional_text(&self.ci_job, "publisher CI job")?;
-        if self.notes.contains('\0') {
-            bail!("publisher notes must not contain NUL");
-        }
+        super::validate::multiline(&self.notes, "publisher notes", MAX_NOTES_BYTES)?;
+        super::validate::no_url_credentials(&self.notes, "publisher notes")?;
         Ok(())
     }
 }
@@ -366,55 +391,61 @@ impl RemoteUnit {
     pub fn executable_file(&self) -> Option<&RemoteFile> {
         self.files
             .iter()
-            .find(|file| file.role == "build-tree" || file.is_executable())
+            .find(|file| file.role == FileRole::BuildTree || file.is_executable())
     }
 
     fn validate(&self) -> Result<()> {
-        crate::util::validate_component(&self.name, "remote unit name")?;
-        let Some((package, suffix)) = self.name.rsplit_once('-') else {
-            bail!("remote unit name {:?} must be <package>-<16hex>", self.name);
-        };
-        if package != self.package || !crate::fingerprint::looks_like_hash(suffix) {
-            bail!(
-                "remote unit name {:?} does not match package {:?} and a 16-hex suffix",
-                self.name,
-                self.package
-            );
-        }
-        crate::util::validate_component(&self.package, "remote package")?;
-        crate::util::validate_component(&self.profile, "remote profile")?;
-        crate::util::validate_component(&self.memo, "remote memo file")?;
-        if !crate::fingerprint::looks_like_hash(&self.hash) {
-            bail!("remote unit {:?} has an invalid memo hash", self.name);
-        }
-        if self.stamp == 0 {
-            bail!("remote unit {:?} has no stamp", self.name);
-        }
+        super::validate::component(&self.name, "remote unit name")?;
+        super::validate::component(&self.package, "remote package")?;
+        super::validate::component(&self.profile, "remote profile")?;
+        super::validate::component(&self.memo, "remote memo file")?;
+        let (package, suffix) = self
+            .name
+            .rsplit_once('-')
+            .context("remote unit name must be <package>-<16hex>")?;
+        ensure!(
+            package == self.package,
+            "remote unit name {:?} does not match package {:?}",
+            self.name,
+            self.package
+        );
+        ensure!(
+            crate::fingerprint::looks_like_hash(suffix),
+            "remote unit name {:?} needs a 16-hex suffix",
+            self.name
+        );
+        ensure!(
+            crate::fingerprint::looks_like_hash(&self.hash),
+            "remote unit {:?} has an invalid memo hash",
+            self.name
+        );
+        ensure!(self.stamp > 0, "remote unit {:?} has no stamp", self.name);
         let expected_kind = RemoteUnitKind::from(crate::fingerprint::classify_kind(&self.memo));
-        if self.kind != expected_kind {
-            bail!(
-                "remote unit {:?} says {:?} but memo {:?} implies {:?}",
-                self.name,
-                self.kind,
-                self.memo,
-                expected_kind
-            );
-        }
+        ensure!(
+            self.kind == expected_kind,
+            "remote unit {:?} says {:?} but memo {:?} implies {:?}",
+            self.name,
+            self.kind,
+            self.memo,
+            expected_kind
+        );
         self.source.validate()?;
         self.compat.validate()?;
-        if self.files.is_empty() {
-            bail!("remote unit {:?} has no files", self.name);
-        }
+        ensure!(
+            !self.files.is_empty(),
+            "remote unit {:?} has no files",
+            self.name
+        );
+
         let mut paths = HashSet::with_capacity(self.files.len());
         for file in &self.files {
             file.validate()?;
-            if !paths.insert(file.path.to_ascii_lowercase()) {
-                bail!(
-                    "duplicate case-insensitive file path {:?} in unit {:?}",
-                    file.path,
-                    self.name
-                );
-            }
+            ensure!(
+                paths.insert(file.path.to_ascii_lowercase()),
+                "duplicate case-insensitive file path {:?} in unit {:?}",
+                file.path,
+                self.name
+            );
         }
         Ok(())
     }
@@ -463,35 +494,31 @@ pub struct UnitSource {
 
 impl UnitSource {
     fn validate(&self) -> Result<()> {
-        match self.kind {
-            SourceKind::Path | SourceKind::Workspace => {
-                bail!(
-                    "remote index contains a {:?} unit source; path/workspace units must \
-                     never be published",
-                    self.kind
-                );
+        ensure!(
+            !matches!(self.kind, SourceKind::Path | SourceKind::Workspace),
+            "remote index contains a {:?} unit source; path/workspace units must never be published",
+            self.kind
+        );
+        let what = match self.kind {
+            SourceKind::Registry => "registry source",
+            SourceKind::Git => "git source",
+            SourceKind::Path | SourceKind::Workspace => unreachable!(),
+        };
+        super::validate::text(&self.id, what, MAX_SOURCE_ID_BYTES)?;
+        super::validate::no_url_credentials(&self.id, what)?;
+
+        match (self.kind, self.checksum.as_deref()) {
+            (SourceKind::Registry, Some(checksum)) => {
+                super::validate::lower_hex(checksum, 64, "registry checksum")?
             }
-            SourceKind::Registry => {
-                validate_text(&self.id, "registry source")?;
-                let checksum = self
-                    .checksum
-                    .as_deref()
-                    .context("registry unit source needs a checksum")?;
-                super::ensure_sha256(checksum, "registry checksum")?;
+            (SourceKind::Registry, None) => {
+                bail!("registry unit source needs a checksum")
             }
-            SourceKind::Git => {
-                validate_text(&self.id, "git source")?;
-                if self
-                    .checksum
-                    .as_deref()
-                    .is_some_and(|text| !text.is_empty())
-                {
-                    super::ensure_sha256(
-                        self.checksum.as_deref().unwrap_or_default(),
-                        "git checksum",
-                    )?;
-                }
+            (SourceKind::Git, Some(checksum)) => {
+                super::validate::lower_hex(checksum, 64, "git checksum")?
             }
+            (SourceKind::Git, None) => {}
+            (SourceKind::Path | SourceKind::Workspace, _) => unreachable!(),
         }
         Ok(())
     }
@@ -506,6 +533,47 @@ pub enum SourceKind {
     Workspace,
 }
 
+/// What a stored file represents inside a unit group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileRole {
+    Memo,
+    Fingerprint,
+    DepInfo,
+    Artifact,
+    BuildTree,
+    Extra,
+}
+
+impl FileRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileRole::Memo => "memo",
+            FileRole::Fingerprint => "fingerprint",
+            FileRole::DepInfo => "dep-info",
+            FileRole::Artifact => "artifact",
+            FileRole::BuildTree => "build-tree",
+            FileRole::Extra => "extra",
+        }
+    }
+}
+
+impl TryFrom<&str> for FileRole {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "memo" => Ok(FileRole::Memo),
+            "fingerprint" => Ok(FileRole::Fingerprint),
+            "dep-info" => Ok(FileRole::DepInfo),
+            "artifact" => Ok(FileRole::Artifact),
+            "build-tree" => Ok(FileRole::BuildTree),
+            "extra" => Ok(FileRole::Extra),
+            other => bail!("unknown remote file role {other:?}"),
+        }
+    }
+}
+
 /// One content-addressed file in a unit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -518,8 +586,7 @@ pub struct RemoteFile {
     pub size: u64,
     /// SHA-256 of the decoded bytes.
     pub sha256: String,
-    /// `memo` | `fingerprint` | `dep-info` | `artifact` | `build-tree` | `extra`.
-    pub role: String,
+    pub role: FileRole,
     /// SHA-256 of the stored bytes; the CAS object key is `blobs/<blob>`.
     pub blob: String,
     /// Stored (possibly compressed) size in bytes.
@@ -537,7 +604,7 @@ impl RemoteFile {
         let Some((_, extension)) = name.rsplit_once('.') else {
             // Rustc library artifacts always have an extension; an
             // extensionless artifact in `deps/` is a binary.
-            return self.role == "artifact";
+            return self.role == FileRole::Artifact;
         };
         EXECUTABLE_EXTENSIONS
             .iter()
@@ -545,52 +612,42 @@ impl RemoteFile {
     }
 
     fn validate(&self) -> Result<()> {
-        validate_rel(&self.path, "remote file path")?;
-        validate_rel(&self.dest, "remote destination path")?;
-        if self.path.len() > MAX_REMOTE_PATH_BYTES || self.dest.len() > MAX_REMOTE_PATH_BYTES {
-            bail!(
-                "remote file path {:?} exceeds {MAX_REMOTE_PATH_BYTES} bytes",
-                self.path
-            );
-        }
-        if self.size > MAX_BLOB_BYTES {
-            bail!(
-                "remote file {:?} is {} bytes (cap {MAX_BLOB_BYTES})",
-                self.path,
-                self.size
-            );
-        }
-        if self.blob_size > MAX_BLOB_BYTES {
-            bail!(
-                "remote blob {:?} is {} bytes (cap {MAX_BLOB_BYTES})",
-                self.path,
-                self.blob_size
-            );
-        }
-        super::ensure_sha256(&self.sha256, "remote file SHA-256")?;
-        super::ensure_sha256(&self.blob, "remote blob SHA-256")?;
-        match self.role.as_str() {
-            "memo" | "fingerprint" | "dep-info" | "artifact" | "build-tree" | "extra" => {}
-            other => bail!("remote file {:?} has unknown role {other:?}", self.path),
-        }
+        super::validate::relative_path(&self.path, "remote file path", MAX_REMOTE_PATH_BYTES)?;
+        super::validate::relative_path(
+            &self.dest,
+            "remote destination path",
+            MAX_REMOTE_PATH_BYTES,
+        )?;
+        ensure!(
+            self.size <= MAX_BLOB_BYTES,
+            "remote file {:?} is {} bytes (cap {MAX_BLOB_BYTES})",
+            self.path,
+            self.size
+        );
+        ensure!(
+            self.blob_size <= MAX_BLOB_BYTES,
+            "remote blob {:?} is {} bytes (cap {MAX_BLOB_BYTES})",
+            self.path,
+            self.blob_size
+        );
+        super::validate::lower_hex(&self.sha256, 64, "remote file SHA-256")?;
+        super::validate::lower_hex(&self.blob, 64, "remote blob SHA-256")?;
+        self.validate_blob()
+    }
+
+    fn validate_blob(&self) -> Result<()> {
         match self.compression {
-            super::Compression::Raw => {
-                if self.blob != self.sha256 || self.blob_size != self.size {
-                    bail!(
-                        "uncompressed remote file {:?} must have blob == sha256 and \
-                         blob_size == size",
-                        self.path
-                    );
-                }
-            }
-            super::Compression::Gzip => {
-                if self.blob_size >= self.size {
-                    bail!(
-                        "gzip remote file {:?} must be smaller than its decoded size",
-                        self.path
-                    );
-                }
-            }
+            super::Compression::Raw => ensure!(
+                self.blob == self.sha256 && self.blob_size == self.size,
+                "uncompressed remote file {:?} must have blob == sha256 and \
+                 blob_size == size",
+                self.path
+            ),
+            super::Compression::Gzip => ensure!(
+                self.blob_size > 0 && self.blob_size < self.size,
+                "gzip remote file {:?} must be smaller than its decoded size",
+                self.path
+            ),
         }
         Ok(())
     }
@@ -639,20 +696,18 @@ pub fn make_index(body: &IndexBody, key: &SigningKey, now: u64) -> Result<(Index
     body.validate_time(now)?;
     let expected =
         settings::remote_key_id(&crate::vault::hex_encode(&key.verifying_key().to_bytes()))?;
-    if body.key_id != expected {
-        bail!(
-            "remote index body is pinned to {} but the signing key is {}",
-            body.key_id,
-            expected
-        );
-    }
+    ensure!(
+        body.key_id == expected,
+        "remote index body is pinned to {} but the signing key is {}",
+        body.key_id,
+        expected
+    );
     let bytes = body.canonical_bytes()?;
-    if bytes.len() as u64 > MAX_INDEX_BODY_BYTES {
-        bail!(
-            "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
-            bytes.len()
-        );
-    }
+    ensure!(
+        bytes.len() as u64 <= MAX_INDEX_BODY_BYTES,
+        "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
+        bytes.len()
+    );
     let mut pointer = IndexPointer {
         schema: body.schema,
         key_id: body.key_id.clone(),
@@ -670,37 +725,42 @@ pub fn make_index(body: &IndexBody, key: &SigningKey, now: u64) -> Result<(Index
 /// Verify the pointer signature and the body hash/size. The body is checked
 /// for canonical encoding before it is returned.
 pub fn verify_body(pointer: &IndexPointer, bytes: &[u8], now: u64) -> Result<IndexBody> {
-    if bytes.len() as u64 != pointer.body_size {
-        bail!(
-            "remote index body is {} bytes but the pointer commits to {}",
-            bytes.len(),
-            pointer.body_size
-        );
-    }
-    if bytes.len() as u64 > MAX_INDEX_BODY_BYTES {
-        bail!(
-            "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
-            bytes.len()
-        );
-    }
-    if sha256_hex(bytes) != pointer.body_sha256 {
-        bail!("remote index body does not match the SHA-256 in the signed pointer");
-    }
+    ensure!(
+        bytes.len() as u64 == pointer.body_size,
+        "remote index body is {} bytes but the pointer commits to {}",
+        bytes.len(),
+        pointer.body_size
+    );
+    ensure!(
+        bytes.len() as u64 <= MAX_INDEX_BODY_BYTES,
+        "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
+        bytes.len()
+    );
+    ensure!(
+        sha256_hex(bytes) == pointer.body_sha256,
+        "remote index body does not match the SHA-256 in the signed pointer"
+    );
     let body: IndexBody = serde_json::from_slice(bytes).context("parsing the remote index body")?;
-    if body.canonical_bytes()? != bytes {
-        bail!("remote index body is not in canonical form");
-    }
-    body.validate_shape()?;
+    ensure!(
+        body.canonical_bytes()? == bytes,
+        "remote index body is not in canonical form"
+    );
+    body.validate_for(body.tier)?;
     body.validate_time(now)?;
-    if body.schema != pointer.schema
-        || body.key_id != pointer.key_id
-        || body.sequence != pointer.sequence
-        || body.created != pointer.created
-        || body.expires != pointer.expires
-    {
-        bail!("remote index body metadata does not match the signed pointer");
-    }
+    ensure_metadata_matches(pointer, &body)?;
     Ok(body)
+}
+
+fn ensure_metadata_matches(pointer: &IndexPointer, body: &IndexBody) -> Result<()> {
+    ensure!(
+        body.schema == pointer.schema
+            && body.key_id == pointer.key_id
+            && body.sequence == pointer.sequence
+            && body.created == pointer.created
+            && body.expires == pointer.expires,
+        "remote index body metadata does not match the signed pointer"
+    );
+    Ok(())
 }
 
 /// Parse and fully verify `index.json` + `indexes/<sha256>.json`.
@@ -708,15 +768,18 @@ pub fn verify_index(
     pointer_bytes: &[u8],
     body_bytes: &[u8],
     pinned_public_key: &str,
+    reader: RemoteTier,
     now: u64,
 ) -> Result<VerifiedIndex> {
-    if pointer_bytes.len() as u64 > MAX_INDEX_POINTER_BYTES {
-        bail!("remote index pointer is too large");
-    }
+    ensure!(
+        pointer_bytes.len() as u64 <= MAX_INDEX_POINTER_BYTES,
+        "remote index pointer is too large"
+    );
     let pointer: IndexPointer =
         serde_json::from_slice(pointer_bytes).context("parsing the remote index pointer")?;
     pointer.verify(pinned_public_key, now)?;
     let body = verify_body(&pointer, body_bytes, now)?;
+    body.validate_reader(reader)?;
     Ok(VerifiedIndex {
         pointer,
         body,
@@ -734,12 +797,11 @@ pub fn write_index_tree(root: &Path, pointer: &IndexPointer, body_bytes: &[u8]) 
     match crate::util::metadata_nofollow(&body_file) {
         Ok(meta) if meta.is_file() => {
             let existing = read_capped(&body_file, MAX_INDEX_BODY_BYTES, "index body")?;
-            if existing != body_bytes {
-                bail!(
-                    "index body {} already exists with different bytes",
-                    body_file.display()
-                );
-            }
+            ensure!(
+                existing == body_bytes,
+                "index body {} already exists with different bytes",
+                body_file.display()
+            );
         }
         Ok(_) => bail!("index body {} is not a regular file", body_file.display()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -766,7 +828,12 @@ pub fn write_index_tree(root: &Path, pointer: &IndexPointer, body_bytes: &[u8]) 
 
 /// Read and verify a local staging tree (used by tests and the publisher's
 /// post-upload check).
-pub fn read_index_tree(root: &Path, pinned_public_key: &str, now: u64) -> Result<VerifiedIndex> {
+pub fn read_index_tree(
+    root: &Path,
+    pinned_public_key: &str,
+    reader: RemoteTier,
+    now: u64,
+) -> Result<VerifiedIndex> {
     let pointer_bytes = read_capped(
         &root.join(super::INDEX_FILE),
         MAX_INDEX_POINTER_BYTES,
@@ -781,7 +848,7 @@ pub fn read_index_tree(root: &Path, pinned_public_key: &str, now: u64) -> Result
         MAX_INDEX_BODY_BYTES,
         "index body",
     )?;
-    verify_index(&pointer_bytes, &body_bytes, pinned_public_key, now)
+    verify_index(&pointer_bytes, &body_bytes, pinned_public_key, reader, now)
 }
 
 fn signing_message(unsigned: &[u8]) -> Vec<u8> {
@@ -801,47 +868,25 @@ fn verifying_key(public_key: &str) -> Result<VerifyingKey> {
 }
 
 fn validate_key_id(text: &str) -> Result<()> {
-    let Some(hex) = text.strip_prefix("ed25519:") else {
-        bail!("remote key id {text:?} must start with `ed25519:`");
-    };
-    if hex.len() != 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("remote key id {text:?} must be `ed25519:` plus 16 hex characters");
-    }
-    Ok(())
+    let hex = text
+        .strip_prefix("ed25519:")
+        .context("remote key id must start with `ed25519:`")?;
+    super::validate::lower_hex(hex, 16, "remote key id suffix")
 }
 
 fn validate_window(created: u64, expires: u64) -> Result<()> {
-    if created == 0 {
-        bail!("remote index created time must be a Unix timestamp");
-    }
-    if expires <= created {
-        bail!("remote index expiry must be after its creation");
-    }
-    if expires - created > MAX_INDEX_VALIDITY_SECS {
-        bail!(
-            "remote index validity is {} seconds (cap {MAX_INDEX_VALIDITY_SECS})",
-            expires - created
-        );
-    }
-    Ok(())
-}
-
-fn validate_text(value: &str, what: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        bail!("{what} must not be empty");
-    }
-    if value.chars().any(|ch| ch.is_control()) {
-        bail!("{what} must not contain control characters");
-    }
-    Ok(())
-}
-
-fn validate_optional_text(value: &str, what: &str) -> Result<()> {
-    if value
-        .chars()
-        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
-    {
-        bail!("{what} must not contain control characters");
-    }
+    ensure!(
+        created > 0,
+        "remote index created time must be a Unix timestamp"
+    );
+    ensure!(
+        expires > created,
+        "remote index expiry must be after its creation"
+    );
+    ensure!(
+        expires - created <= MAX_INDEX_VALIDITY_SECS,
+        "remote index validity is {} seconds (cap {MAX_INDEX_VALIDITY_SECS})",
+        expires - created
+    );
     Ok(())
 }

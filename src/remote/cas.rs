@@ -6,17 +6,18 @@
 //! is still rejected. Uploads are put-if-absent: a published blob is never
 //! replaced.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    MAX_BLOB_BYTES, MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES, blob_path, body_path,
-    ensure_sha256, publisher_report, sha256_hex, verify_body,
+    MAX_BLOB_BYTES, blob_path, body_path, ensure_sha256, publisher_report, sha256_hex, verify_body,
 };
 use crate::util::{COMPRESS_MIN_BYTES, metadata_nofollow, temp_nonce};
+
+const MAX_OBJECT_KEY_BYTES: usize = 4096;
 
 /// How a blob's stored bytes relate to the decoded file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,22 +62,18 @@ pub fn write_blob(src: &Path, root: &Path) -> Result<BlobRef> {
         }
         Err(err) => return Err(err).with_context(|| format!("inspecting {}", src.display())),
     };
-    if !meta.is_file() {
-        bail!("{} is not a regular file", src.display());
-    }
-    if !crate::util::owned_by_us(src, &meta) {
-        bail!(
-            "{} is owned by another user — refusing to publish it",
-            src.display()
-        );
-    }
-    if meta.len() > MAX_BLOB_BYTES {
-        bail!(
-            "{} is {} bytes (cap {MAX_BLOB_BYTES})",
-            src.display(),
-            meta.len()
-        );
-    }
+    ensure!(meta.is_file(), "{} is not a regular file", src.display());
+    ensure!(
+        crate::util::owned_by_us(src, &meta),
+        "{} is owned by another user — refusing to publish it",
+        src.display()
+    );
+    ensure!(
+        meta.len() <= MAX_BLOB_BYTES,
+        "{} is {} bytes (cap {MAX_BLOB_BYTES})",
+        src.display(),
+        meta.len()
+    );
 
     let blobs = root.join(super::BLOBS_DIR);
     crate::util::create_private_dir_all(&blobs)?;
@@ -130,9 +127,10 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
                 break;
             }
             decoded.update(&buf[..n]);
-            if decoded.size > MAX_BLOB_BYTES {
-                bail!("compressed source exceeds the maximum artifact size");
-            }
+            ensure!(
+                decoded.size <= MAX_BLOB_BYTES,
+                "compressed source exceeds the maximum artifact size"
+            );
             encoder.write_all(&buf[..n])?;
         }
         encoder.finish()?.sync_all()?;
@@ -162,9 +160,14 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
 fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
     let tmp = blobs.join(format!(".tmp-{}-{}", std::process::id(), temp_nonce()));
     let mut input = open_nofollow(src)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
         .open(&tmp)
         .with_context(|| format!("creating {}", tmp.display()))?;
     let mut hasher = Sha256Writer::new();
@@ -176,9 +179,10 @@ fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
                 break;
             }
             hasher.update(&buf[..n]);
-            if hasher.size > MAX_BLOB_BYTES {
-                bail!("source exceeds the maximum artifact size");
-            }
+            ensure!(
+                hasher.size <= MAX_BLOB_BYTES,
+                "source exceeds the maximum artifact size"
+            );
             output.write_all(&buf[..n])?;
         }
         output.sync_all()?;
@@ -251,12 +255,16 @@ fn install_put_if_absent(
 
 fn verify_blob_file(path: &Path, expected_blob: &str, expected_size: u64) -> Result<()> {
     let meta = metadata_nofollow(path)?;
-    if !meta.is_file() || meta.len() != expected_size {
-        bail!("CAS object {} has the wrong size", path.display());
-    }
-    if crate::util::sha256_file(path)? != expected_blob {
-        bail!("CAS object {} failed its SHA-256 check", path.display());
-    }
+    ensure!(
+        meta.is_file() && meta.len() == expected_size,
+        "CAS object {} has the wrong size",
+        path.display()
+    );
+    ensure!(
+        crate::util::sha256_file(path)? == expected_blob,
+        "CAS object {} failed its SHA-256 check",
+        path.display()
+    );
     Ok(())
 }
 
@@ -264,45 +272,80 @@ fn verify_blob_file(path: &Path, expected_blob: &str, expected_size: u64) -> Res
 pub fn verify_blob(root: &Path, blob: &BlobRef) -> Result<()> {
     ensure_sha256(&blob.blob, "blob SHA-256")?;
     ensure_sha256(&blob.sha256, "decoded SHA-256")?;
-    if blob.blob_size > MAX_BLOB_BYTES || blob.size > MAX_BLOB_BYTES {
-        bail!("blob exceeds the maximum artifact size");
-    }
+    ensure!(
+        blob.blob_size <= MAX_BLOB_BYTES && blob.size <= MAX_BLOB_BYTES,
+        "blob exceeds the maximum artifact size"
+    );
     verify_blob_file(&blob_path(root, &blob.blob)?, &blob.blob, blob.blob_size)
 }
 
-/// Verify and decode one blob. This buffers the decoded bytes; the reader's
-/// streaming import path is added with the exec integration.
-pub fn read_blob(root: &Path, blob: &BlobRef) -> Result<Vec<u8>> {
+/// Large blobs must be streamed; this is the in-memory convenience cap.
+pub const MAX_IN_MEMORY_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Verify and stream one blob into a writer. The decoded size is capped by the
+/// signed `blob.size`, so a gzip bomb cannot expand past the expected artifact
+/// size, and both the stored and decoded SHA-256 are checked.
+pub fn decode_blob<W: Write>(root: &Path, blob: &BlobRef, writer: &mut W) -> Result<()> {
+    use sha2::Digest;
+
     verify_blob(root, blob)?;
     let path = blob_path(root, &blob.blob)?;
     let input = open_nofollow(&path)?;
-    let mut bytes = Vec::with_capacity(blob.size.min(8 * 1024 * 1024) as usize);
-    match blob.compression {
-        Compression::Raw => {
-            input
-                .take(MAX_BLOB_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("reading {}", path.display()))?;
+    let mut reader: Box<dyn Read> = match blob.compression {
+        Compression::Raw => Box::new(input),
+        Compression::Gzip => Box::new(flate2::read::GzDecoder::new(input)),
+    };
+
+    let mut hasher = sha2::Sha256::new();
+    let mut written = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            break;
         }
-        Compression::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(input);
-            let mut limited = std::io::Read::take(&mut decoder, MAX_BLOB_BYTES + 1);
-            limited
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("decompressing {}", path.display()))?;
-        }
-    }
-    if bytes.len() as u64 != blob.size {
-        bail!(
-            "decoded blob {} is {} bytes, expected {}",
+        written = written
+            .checked_add(n as u64)
+            .context("decoded blob size overflow")?;
+        ensure!(
+            written <= blob.size,
+            "decoded blob {} exceeds the expected {} bytes",
             path.display(),
-            bytes.len(),
             blob.size
         );
+        hasher.update(&buf[..n]);
+        writer
+            .write_all(&buf[..n])
+            .with_context(|| format!("writing verified blob {}", path.display()))?;
     }
-    if sha256_hex(&bytes) != blob.sha256 {
-        bail!("decoded blob {} failed its SHA-256 check", path.display());
-    }
+    ensure!(
+        written == blob.size,
+        "decoded blob {} is {written} bytes, expected {}",
+        path.display(),
+        blob.size
+    );
+    let digest = crate::vault::hex_encode(&hasher.finalize());
+    ensure!(
+        digest == blob.sha256,
+        "decoded blob {} failed its SHA-256 check",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Buffer a small blob. Artifacts above [`MAX_IN_MEMORY_BLOB_BYTES`] must use
+/// [`decode_blob`] so a large import cannot exhaust memory.
+pub fn read_blob(root: &Path, blob: &BlobRef) -> Result<Vec<u8>> {
+    ensure!(
+        blob.size <= MAX_IN_MEMORY_BLOB_BYTES,
+        "blob {} is {} bytes; use decode_blob() to stream it",
+        blob.blob,
+        blob.size
+    );
+    let mut bytes = Vec::with_capacity(blob.size as usize);
+    decode_blob(root, blob, &mut bytes)?;
     Ok(bytes)
 }
 
@@ -324,9 +367,7 @@ fn open_nofollow(path: &Path) -> Result<File> {
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
     let meta = file.metadata()?;
-    if !meta.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
+    ensure!(meta.is_file(), "{} is not a regular file", path.display());
     Ok(file)
 }
 
@@ -357,83 +398,77 @@ pub fn upload_plan(
     body_bytes: &[u8],
 ) -> Result<Vec<Upload>> {
     let body = verify_body(pointer, body_bytes, super::now_secs())?;
-    if body_bytes.len() as u64 > MAX_INDEX_BODY_BYTES {
-        bail!("index body exceeds the upload cap");
-    }
     let mut uploads = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for unit in &body.units {
-        for file in &unit.files {
-            if !seen.insert(file.blob.clone()) {
-                continue;
-            }
-            let path = blob_path(root, &file.blob)?;
-            verify_blob_file(&path, &file.blob, file.blob_size)?;
-            uploads.push(Upload {
-                key: super::blob_key(&file.blob)?,
-                source: path,
-                sha256: file.blob.clone(),
-                size: file.blob_size,
-                mode: UploadMode::PutIfAbsent,
-            });
+    for file in body.units.iter().flat_map(|unit| &unit.files) {
+        if !seen.insert(file.blob.as_str()) {
+            continue;
         }
+        uploads.push(upload_source(
+            super::blob_key(&file.blob)?,
+            blob_path(root, &file.blob)?,
+            &file.blob,
+            file.blob_size,
+            UploadMode::PutIfAbsent,
+        )?);
     }
     uploads.sort_by(|left, right| left.key.cmp(&right.key));
 
-    let body_path = body_path(root, &pointer.body_sha256)?;
-    let body_meta = metadata_nofollow(&body_path)
-        .with_context(|| format!("inspecting {}", body_path.display()))?;
-    if body_meta.len() != pointer.body_size || body_meta.len() != body_bytes.len() as u64 {
-        bail!("index body file no longer matches the signed pointer");
-    }
-    if crate::util::sha256_file(&body_path)? != pointer.body_sha256 {
-        bail!("index body file no longer matches the signed hash");
-    }
-    uploads.push(Upload {
-        key: super::body_key(&pointer.body_sha256)?,
-        source: body_path,
-        sha256: pointer.body_sha256.clone(),
-        size: body_meta.len(),
-        mode: UploadMode::PutIfAbsent,
-    });
+    uploads.push(upload_source(
+        super::body_key(&pointer.body_sha256)?,
+        body_path(root, &pointer.body_sha256)?,
+        &pointer.body_sha256,
+        pointer.body_size,
+        UploadMode::PutIfAbsent,
+    )?);
 
     let report = publisher_report(pointer, &body)?;
-    let report_path = root.join(super::PUBLISHER_FILE);
-    let report_meta = metadata_nofollow(&report_path)
-        .with_context(|| format!("inspecting {}", report_path.display()))?;
-    if report_meta.len() != report.len() as u64
-        || crate::util::sha256_file(&report_path)? != sha256_hex(&report)
-    {
-        bail!("publisher report file no longer matches its bytes");
-    }
-    uploads.push(Upload {
-        key: super::PUBLISHER_FILE.to_string(),
-        source: report_path,
-        sha256: sha256_hex(&report),
-        size: report_meta.len(),
-        mode: UploadMode::Replace,
-    });
+    uploads.push(upload_source(
+        super::PUBLISHER_FILE.to_string(),
+        root.join(super::PUBLISHER_FILE),
+        &sha256_hex(&report),
+        report.len() as u64,
+        UploadMode::Replace,
+    )?);
 
     let pointer_bytes = serde_json::to_vec(pointer)?;
-    if pointer_bytes.len() as u64 > MAX_INDEX_POINTER_BYTES {
-        bail!("index pointer exceeds the upload cap");
-    }
-    let pointer_path = root.join(super::INDEX_FILE);
-    let pointer_meta = metadata_nofollow(&pointer_path)
-        .with_context(|| format!("inspecting {}", pointer_path.display()))?;
-    if pointer_meta.len() != pointer_bytes.len() as u64
-        || crate::util::sha256_file(&pointer_path)? != sha256_hex(&pointer_bytes)
-    {
-        bail!("index pointer file no longer matches its bytes");
-    }
-    uploads.push(Upload {
-        key: super::INDEX_FILE.to_string(),
-        source: pointer_path,
-        sha256: sha256_hex(&pointer_bytes),
-        size: pointer_meta.len(),
-        mode: UploadMode::Replace,
-    });
+    uploads.push(upload_source(
+        super::INDEX_FILE.to_string(),
+        root.join(super::INDEX_FILE),
+        &sha256_hex(&pointer_bytes),
+        pointer_bytes.len() as u64,
+        UploadMode::Replace,
+    )?);
     Ok(uploads)
+}
+
+fn upload_source(
+    key: String,
+    source: PathBuf,
+    expected_sha256: &str,
+    expected_size: u64,
+    mode: UploadMode,
+) -> Result<Upload> {
+    super::validate::relative_path(&key, "upload object key", MAX_OBJECT_KEY_BYTES)?;
+    let meta =
+        metadata_nofollow(&source).with_context(|| format!("inspecting {}", source.display()))?;
+    ensure!(
+        meta.is_file() && meta.len() == expected_size,
+        "upload source {} changed size or is not a regular file",
+        source.display()
+    );
+    ensure!(
+        crate::util::sha256_file(&source)? == expected_sha256,
+        "upload source {} no longer matches its SHA-256",
+        source.display()
+    );
+    Ok(Upload {
+        key,
+        source,
+        sha256: expected_sha256.to_string(),
+        size: expected_size,
+        mode,
+    })
 }
 
 struct Sha256Writer {
