@@ -1,0 +1,847 @@
+//! Canonical signed index: pointer, body, schema and validation.
+//!
+//! Only the small pointer is signed. It commits to the canonical body bytes,
+//! so the body is immutable and can be cached independently:
+//!
+//! ```text
+//! index.json             <- Ed25519 signature over canonical pointer bytes
+//! indexes/<sha256>.json  <- canonical IndexBody, addressed by its hash
+//! ```
+
+use anyhow::{Context, Result, bail};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use super::{
+    MAX_BLOB_BYTES, MAX_CLOCK_SKEW_SECS, MAX_INDEX_BODY_BYTES, MAX_INDEX_FILES,
+    MAX_INDEX_POINTER_BYTES, MAX_INDEX_UNITS, MAX_INDEX_VALIDITY_SECS, SCHEMA_VERSION, body_path,
+    now_secs, read_capped, sha256_hex,
+};
+use crate::settings::{self, RemoteTier};
+use crate::util::validate_rel;
+
+const SIGNING_DOMAIN: &[u8] = b"epicenter.remote.index.v1\0";
+const EXECUTABLE_EXTENSIONS: [&str; 6] = ["exe", "dll", "dylib", "so", "dSYM", "efi"];
+const MAX_REMOTE_PATH_BYTES: usize = 4096;
+
+/// The signed pointer stored at `index.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IndexPointer {
+    pub schema: u32,
+    pub key_id: String,
+    pub sequence: u64,
+    pub created: u64,
+    pub expires: u64,
+    pub body_sha256: String,
+    pub body_size: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+}
+
+impl IndexPointer {
+    /// Canonical bytes covered by the signature (signature field cleared).
+    pub fn unsigned_bytes(&self) -> Result<Vec<u8>> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        Ok(serde_json::to_vec(&unsigned)?)
+    }
+
+    pub fn sign(&mut self, key: &SigningKey) -> Result<()> {
+        let body = self.unsigned_bytes()?;
+        self.signature = crate::vault::hex_encode(&key.sign(&signing_message(&body)).to_bytes());
+        Ok(())
+    }
+
+    /// Verify the signature against the pinned public key and check the
+    /// sequence/expiry window. Also rejects a pointer whose key id does not
+    /// match the pinned key: rotation happens only through the trusted
+    /// CI/admin channel.
+    pub fn verify(&self, pinned_public_key: &str, now: u64) -> Result<()> {
+        self.validate_shape()?;
+        self.validate_time(now)?;
+        let pinned = settings::normalize_remote_publisher_key(pinned_public_key)?;
+        let expected = settings::remote_key_id(&pinned)?;
+        if self.key_id != expected {
+            bail!(
+                "remote index is signed by {} but the pinned publisher is {}; \
+                 rotate the pin only through the trusted CI/admin channel",
+                self.key_id,
+                expected
+            );
+        }
+        let signature = crate::vault::hex_decode(&self.signature, "index signature")?;
+        let signature: [u8; 64] = signature
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("index signature must be 64 bytes"))?;
+        let signature = Signature::from_bytes(&signature);
+        let key = verifying_key(&pinned)?;
+        key.verify_strict(&signing_message(&self.unsigned_bytes()?), &signature)
+            .map_err(|_| anyhow::anyhow!("remote index failed its Ed25519 signature check"))
+    }
+
+    pub fn validate_shape(&self) -> Result<()> {
+        if self.schema != SCHEMA_VERSION {
+            bail!(
+                "remote index schema {} is not supported (expected {SCHEMA_VERSION})",
+                self.schema
+            );
+        }
+        validate_key_id(&self.key_id)?;
+        if self.sequence == 0 {
+            bail!("remote index sequence must start at 1");
+        }
+        validate_window(self.created, self.expires)?;
+        super::ensure_sha256(&self.body_sha256, "index body SHA-256")?;
+        if self.body_size == 0 || self.body_size > MAX_INDEX_BODY_BYTES {
+            bail!(
+                "remote index body size {} is outside 1..={MAX_INDEX_BODY_BYTES}",
+                self.body_size
+            );
+        }
+        if !self.signature.is_empty() {
+            let signature = crate::vault::hex_decode(&self.signature, "index signature")?;
+            if signature.len() != 64 {
+                bail!("remote index signature must be 128 hex characters");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_time(&self, now: u64) -> Result<()> {
+        if self.signature.is_empty() {
+            bail!("remote index pointer is not signed");
+        }
+        if self.created > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            bail!(
+                "remote index was created {} seconds in the future; check the clock",
+                self.created.saturating_sub(now)
+            );
+        }
+        if self.expires < now {
+            bail!(
+                "remote index expired {} seconds ago; ask CI to publish a fresh index",
+                now.saturating_sub(self.expires)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The canonical, hash-addressed index document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IndexBody {
+    pub schema: u32,
+    pub key_id: String,
+    pub sequence: u64,
+    pub created: u64,
+    pub expires: u64,
+    pub tier: RemoteTier,
+    pub publisher: PublisherMetadata,
+    pub compatibility: super::Compatibility,
+    pub units: Vec<RemoteUnit>,
+}
+
+impl IndexBody {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn validate_shape(&self) -> Result<()> {
+        if self.schema != SCHEMA_VERSION {
+            bail!(
+                "remote index body schema {} is not supported (expected {SCHEMA_VERSION})",
+                self.schema
+            );
+        }
+        validate_key_id(&self.key_id)?;
+        if self.sequence == 0 {
+            bail!("remote index body sequence must start at 1");
+        }
+        validate_window(self.created, self.expires)?;
+        self.publisher.validate()?;
+        self.compatibility.validate()?;
+        if self.units.len() > MAX_INDEX_UNITS {
+            bail!(
+                "remote index has {} units (cap {MAX_INDEX_UNITS})",
+                self.units.len()
+            );
+        }
+
+        let mut names = HashSet::with_capacity(self.units.len());
+        let mut files = 0usize;
+        let mut destinations: HashMap<String, &str> = HashMap::new();
+        let mut blobs: HashMap<&str, (&str, u64, u64, super::Compression)> = HashMap::new();
+        let mut contents: HashMap<&str, u64> = HashMap::new();
+        for unit in &self.units {
+            unit.validate()?;
+            if !names.insert(unit.name.to_ascii_lowercase()) {
+                bail!("duplicate unit {:?} in remote index", unit.name);
+            }
+            files = files.saturating_add(unit.files.len());
+            if files > MAX_INDEX_FILES {
+                bail!("remote index has more than {MAX_INDEX_FILES} files");
+            }
+            for file in &unit.files {
+                let destination = file.dest.to_ascii_lowercase();
+                if let Some(owner) = destinations.insert(destination, unit.name.as_str()) {
+                    bail!(
+                        "duplicate destination {:?} in remote index (units {:?} and {:?})",
+                        file.dest,
+                        owner,
+                        unit.name
+                    );
+                }
+                match blobs.get(file.blob.as_str()) {
+                    Some((sha256, size, blob_size, compression))
+                        if *sha256 != file.sha256
+                            || *size != file.size
+                            || *blob_size != file.blob_size
+                            || *compression != file.compression =>
+                    {
+                        bail!(
+                            "blob {} is referenced with conflicting content/size/compression",
+                            file.blob
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        blobs.insert(
+                            file.blob.as_str(),
+                            (
+                                file.sha256.as_str(),
+                                file.size,
+                                file.blob_size,
+                                file.compression,
+                            ),
+                        );
+                    }
+                }
+                if let Some(size) = contents.get(file.sha256.as_str()) {
+                    if *size != file.size {
+                        bail!(
+                            "content {} is referenced with conflicting sizes",
+                            file.sha256
+                        );
+                    }
+                } else {
+                    contents.insert(file.sha256.as_str(), file.size);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the content against the tier it claims and the reader tier.
+    ///
+    /// A `libraries` reader may consume only a `libraries` index. A `full`
+    /// reader may consume either, because a libraries index is a strict
+    /// subset. `libraries` content can never contain executable units.
+    pub fn validate_for(&self, reader: RemoteTier) -> Result<()> {
+        self.validate_shape()?;
+        if reader == RemoteTier::Libraries && self.tier == RemoteTier::Full {
+            bail!(
+                "remote index is published for the `full` tier but this machine allows \
+                 only `libraries`; refusing executable units"
+            );
+        }
+        if self.tier == RemoteTier::Libraries {
+            for unit in &self.units {
+                if unit.is_executable() {
+                    let detail = unit
+                        .executable_file()
+                        .map(|file| file.path.as_str())
+                        .unwrap_or(unit.memo.as_str());
+                    bail!(
+                        "`libraries` remote index contains executable unit {:?} \
+                         (kind {:?}, file {:?}); re-publish with tier = \"full\" or exclude it",
+                        unit.name,
+                        unit.kind,
+                        detail
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Full reader gate: tier rules plus the machine-level compatibility tuple.
+    /// `full` executable units are accepted only when the rustc/Cargo/target/
+    /// cargo-home/flags/layout/registry tuple matches this machine.
+    pub fn validate_for_local(
+        &self,
+        reader: RemoteTier,
+        local: &super::LocalEnvironment,
+    ) -> Result<()> {
+        self.validate_for(reader)?;
+        let mismatches = self.compatibility.compare_local(local);
+        if !mismatches.is_empty() {
+            let details = mismatches
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("remote index compatibility mismatch: {details}");
+        }
+        Ok(())
+    }
+
+    fn validate_time(&self, now: u64) -> Result<()> {
+        validate_window(self.created, self.expires)?;
+        if self.created > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            bail!(
+                "remote index was created {} seconds in the future; check the clock",
+                self.created.saturating_sub(now)
+            );
+        }
+        if self.expires < now {
+            bail!(
+                "remote index expired {} seconds ago; ask CI to publish a fresh index",
+                now.saturating_sub(self.expires)
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublisherMetadata {
+    /// Tool and version that produced the index, e.g. `epicenter-cli 0.1.0`.
+    pub tool: String,
+    /// Source commit of the workspace/CI job.
+    pub source_commit: String,
+    /// Unix seconds of the publish.
+    pub built_at: u64,
+    /// CI job identifier or URL; empty when unavailable.
+    pub ci_job: String,
+    /// Human-readable note; empty when unavailable.
+    pub notes: String,
+}
+
+impl PublisherMetadata {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_text(&self.tool, "publisher tool")?;
+        validate_text(&self.source_commit, "publisher source commit")?;
+        if self.built_at == 0 {
+            bail!("publisher built_at must be a Unix timestamp");
+        }
+        validate_optional_text(&self.ci_job, "publisher CI job")?;
+        if self.notes.contains('\0') {
+            bail!("publisher notes must not contain NUL");
+        }
+        Ok(())
+    }
+}
+
+/// One unit group in the remote index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteUnit {
+    /// `<package>-<16hex>`, exactly the Cargo fingerprint dir name.
+    pub name: String,
+    pub package: String,
+    pub profile: String,
+    /// Memo file name, e.g. `lib-serde`.
+    pub memo: String,
+    /// Memo hash — the authoritative 16-hex value Cargo compares.
+    pub hash: String,
+    /// Canonical mtime of the group (whole seconds).
+    pub stamp: u64,
+    pub layout: crate::fingerprint::UnitLayout,
+    pub kind: RemoteUnitKind,
+    pub source: UnitSource,
+    pub compat: super::UnitCompatibility,
+    pub files: Vec<RemoteFile>,
+}
+
+impl RemoteUnit {
+    pub fn is_executable(&self) -> bool {
+        self.kind.is_executable() || self.executable_file().is_some()
+    }
+
+    pub fn executable_file(&self) -> Option<&RemoteFile> {
+        self.files
+            .iter()
+            .find(|file| file.role == "build-tree" || file.is_executable())
+    }
+
+    fn validate(&self) -> Result<()> {
+        crate::util::validate_component(&self.name, "remote unit name")?;
+        let Some((package, suffix)) = self.name.rsplit_once('-') else {
+            bail!("remote unit name {:?} must be <package>-<16hex>", self.name);
+        };
+        if package != self.package || !crate::fingerprint::looks_like_hash(suffix) {
+            bail!(
+                "remote unit name {:?} does not match package {:?} and a 16-hex suffix",
+                self.name,
+                self.package
+            );
+        }
+        crate::util::validate_component(&self.package, "remote package")?;
+        crate::util::validate_component(&self.profile, "remote profile")?;
+        crate::util::validate_component(&self.memo, "remote memo file")?;
+        if !crate::fingerprint::looks_like_hash(&self.hash) {
+            bail!("remote unit {:?} has an invalid memo hash", self.name);
+        }
+        if self.stamp == 0 {
+            bail!("remote unit {:?} has no stamp", self.name);
+        }
+        let expected_kind = RemoteUnitKind::from(crate::fingerprint::classify_kind(&self.memo));
+        if self.kind != expected_kind {
+            bail!(
+                "remote unit {:?} says {:?} but memo {:?} implies {:?}",
+                self.name,
+                self.kind,
+                self.memo,
+                expected_kind
+            );
+        }
+        self.source.validate()?;
+        self.compat.validate()?;
+        if self.files.is_empty() {
+            bail!("remote unit {:?} has no files", self.name);
+        }
+        let mut paths = HashSet::with_capacity(self.files.len());
+        for file in &self.files {
+            file.validate()?;
+            if !paths.insert(file.path.to_ascii_lowercase()) {
+                bail!(
+                    "duplicate case-insensitive file path {:?} in unit {:?}",
+                    file.path,
+                    self.name
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteUnitKind {
+    Lib,
+    BuildScript,
+    BuildRun,
+    Other,
+}
+
+impl RemoteUnitKind {
+    /// Everything that is not a library unit can carry executable content
+    /// (build scripts, run-build-script state, bins, tests). Proc-macro libs
+    /// are caught by their shared-object file extension.
+    pub fn is_executable(self) -> bool {
+        !matches!(self, RemoteUnitKind::Lib)
+    }
+}
+
+impl From<crate::fingerprint::UnitKind> for RemoteUnitKind {
+    fn from(value: crate::fingerprint::UnitKind) -> Self {
+        match value {
+            crate::fingerprint::UnitKind::Lib => RemoteUnitKind::Lib,
+            crate::fingerprint::UnitKind::BuildScriptCompile => RemoteUnitKind::BuildScript,
+            crate::fingerprint::UnitKind::BuildScriptRun => RemoteUnitKind::BuildRun,
+            crate::fingerprint::UnitKind::Other => RemoteUnitKind::Other,
+        }
+    }
+}
+
+/// Where a unit's source came from. Path/workspace units are always excluded
+/// from a remote index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnitSource {
+    pub kind: SourceKind,
+    /// Registry index URL, git URL+rev, or the rejected local path.
+    pub id: String,
+    /// Registry checksum; `None` for git.
+    pub checksum: Option<String>,
+}
+
+impl UnitSource {
+    fn validate(&self) -> Result<()> {
+        match self.kind {
+            SourceKind::Path | SourceKind::Workspace => {
+                bail!(
+                    "remote index contains a {:?} unit source; path/workspace units must \
+                     never be published",
+                    self.kind
+                );
+            }
+            SourceKind::Registry => {
+                validate_text(&self.id, "registry source")?;
+                let checksum = self
+                    .checksum
+                    .as_deref()
+                    .context("registry unit source needs a checksum")?;
+                super::ensure_sha256(checksum, "registry checksum")?;
+            }
+            SourceKind::Git => {
+                validate_text(&self.id, "git source")?;
+                if self
+                    .checksum
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    super::ensure_sha256(
+                        self.checksum.as_deref().unwrap_or_default(),
+                        "git checksum",
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Registry,
+    Git,
+    Path,
+    Workspace,
+}
+
+/// One content-addressed file in a unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFile {
+    /// Path inside the unit group.
+    pub path: String,
+    /// Path relative to the profile dir in a build dir.
+    pub dest: String,
+    /// Decoded size in bytes.
+    pub size: u64,
+    /// SHA-256 of the decoded bytes.
+    pub sha256: String,
+    /// `memo` | `fingerprint` | `dep-info` | `artifact` | `build-tree` | `extra`.
+    pub role: String,
+    /// SHA-256 of the stored bytes; the CAS object key is `blobs/<blob>`.
+    pub blob: String,
+    /// Stored (possibly compressed) size in bytes.
+    pub blob_size: u64,
+    pub compression: super::Compression,
+}
+
+impl RemoteFile {
+    pub fn blob_key(&self) -> Result<String> {
+        super::blob_key(&self.blob)
+    }
+
+    pub fn is_executable(&self) -> bool {
+        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let Some((_, extension)) = name.rsplit_once('.') else {
+            // Rustc library artifacts always have an extension; an
+            // extensionless artifact in `deps/` is a binary.
+            return self.role == "artifact";
+        };
+        EXECUTABLE_EXTENSIONS
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_rel(&self.path, "remote file path")?;
+        validate_rel(&self.dest, "remote destination path")?;
+        if self.path.len() > MAX_REMOTE_PATH_BYTES || self.dest.len() > MAX_REMOTE_PATH_BYTES {
+            bail!(
+                "remote file path {:?} exceeds {MAX_REMOTE_PATH_BYTES} bytes",
+                self.path
+            );
+        }
+        if self.size > MAX_BLOB_BYTES {
+            bail!(
+                "remote file {:?} is {} bytes (cap {MAX_BLOB_BYTES})",
+                self.path,
+                self.size
+            );
+        }
+        if self.blob_size > MAX_BLOB_BYTES {
+            bail!(
+                "remote blob {:?} is {} bytes (cap {MAX_BLOB_BYTES})",
+                self.path,
+                self.blob_size
+            );
+        }
+        super::ensure_sha256(&self.sha256, "remote file SHA-256")?;
+        super::ensure_sha256(&self.blob, "remote blob SHA-256")?;
+        match self.role.as_str() {
+            "memo" | "fingerprint" | "dep-info" | "artifact" | "build-tree" | "extra" => {}
+            other => bail!("remote file {:?} has unknown role {other:?}", self.path),
+        }
+        match self.compression {
+            super::Compression::Raw => {
+                if self.blob != self.sha256 || self.blob_size != self.size {
+                    bail!(
+                        "uncompressed remote file {:?} must have blob == sha256 and \
+                         blob_size == size",
+                        self.path
+                    );
+                }
+            }
+            super::Compression::Gzip => {
+                if self.blob_size >= self.size {
+                    bail!(
+                        "gzip remote file {:?} must be smaller than its decoded size",
+                        self.path
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Human-readable copy of the signed metadata, stored at `publisher.json`.
+/// It is not a trust anchor; readers verify `index.json` and the body hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublisherReport {
+    pub schema: u32,
+    pub key_id: String,
+    pub sequence: u64,
+    pub body_sha256: String,
+    pub tier: RemoteTier,
+    pub publisher: PublisherMetadata,
+    pub compatibility: super::Compatibility,
+}
+
+pub fn publisher_report(pointer: &IndexPointer, body: &IndexBody) -> Result<Vec<u8>> {
+    let report = PublisherReport {
+        schema: pointer.schema,
+        key_id: pointer.key_id.clone(),
+        sequence: pointer.sequence,
+        body_sha256: pointer.body_sha256.clone(),
+        tier: body.tier,
+        publisher: body.publisher.clone(),
+        compatibility: body.compatibility.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&report)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// The result of verifying a pointer and its body.
+#[derive(Debug, Clone)]
+pub struct VerifiedIndex {
+    pub pointer: IndexPointer,
+    pub body: IndexBody,
+    pub body_bytes: Vec<u8>,
+}
+
+/// Build and sign an index body. The body carries the creation/expiry window
+/// that the pointer repeats and signs.
+pub fn make_index(body: &IndexBody, key: &SigningKey, now: u64) -> Result<(IndexPointer, Vec<u8>)> {
+    body.validate_for(body.tier)?;
+    body.validate_time(now)?;
+    let expected =
+        settings::remote_key_id(&crate::vault::hex_encode(&key.verifying_key().to_bytes()))?;
+    if body.key_id != expected {
+        bail!(
+            "remote index body is pinned to {} but the signing key is {}",
+            body.key_id,
+            expected
+        );
+    }
+    let bytes = body.canonical_bytes()?;
+    if bytes.len() as u64 > MAX_INDEX_BODY_BYTES {
+        bail!(
+            "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
+            bytes.len()
+        );
+    }
+    let mut pointer = IndexPointer {
+        schema: body.schema,
+        key_id: body.key_id.clone(),
+        sequence: body.sequence,
+        created: body.created,
+        expires: body.expires,
+        body_sha256: sha256_hex(&bytes),
+        body_size: bytes.len() as u64,
+        signature: String::new(),
+    };
+    pointer.sign(key)?;
+    Ok((pointer, bytes))
+}
+
+/// Verify the pointer signature and the body hash/size. The body is checked
+/// for canonical encoding before it is returned.
+pub fn verify_body(pointer: &IndexPointer, bytes: &[u8], now: u64) -> Result<IndexBody> {
+    if bytes.len() as u64 != pointer.body_size {
+        bail!(
+            "remote index body is {} bytes but the pointer commits to {}",
+            bytes.len(),
+            pointer.body_size
+        );
+    }
+    if bytes.len() as u64 > MAX_INDEX_BODY_BYTES {
+        bail!(
+            "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
+            bytes.len()
+        );
+    }
+    if sha256_hex(bytes) != pointer.body_sha256 {
+        bail!("remote index body does not match the SHA-256 in the signed pointer");
+    }
+    let body: IndexBody = serde_json::from_slice(bytes).context("parsing the remote index body")?;
+    if body.canonical_bytes()? != bytes {
+        bail!("remote index body is not in canonical form");
+    }
+    body.validate_shape()?;
+    body.validate_time(now)?;
+    if body.schema != pointer.schema
+        || body.key_id != pointer.key_id
+        || body.sequence != pointer.sequence
+        || body.created != pointer.created
+        || body.expires != pointer.expires
+    {
+        bail!("remote index body metadata does not match the signed pointer");
+    }
+    Ok(body)
+}
+
+/// Parse and fully verify `index.json` + `indexes/<sha256>.json`.
+pub fn verify_index(
+    pointer_bytes: &[u8],
+    body_bytes: &[u8],
+    pinned_public_key: &str,
+    now: u64,
+) -> Result<VerifiedIndex> {
+    if pointer_bytes.len() as u64 > MAX_INDEX_POINTER_BYTES {
+        bail!("remote index pointer is too large");
+    }
+    let pointer: IndexPointer =
+        serde_json::from_slice(pointer_bytes).context("parsing the remote index pointer")?;
+    pointer.verify(pinned_public_key, now)?;
+    let body = verify_body(&pointer, body_bytes, now)?;
+    Ok(VerifiedIndex {
+        pointer,
+        body,
+        body_bytes: body_bytes.to_vec(),
+    })
+}
+
+/// Write a verified pointer/body pair into a local staging tree.
+///
+/// The body and blobs are put-if-absent (an existing object must have the same
+/// bytes); `publisher.json` and `index.json` are replaced last.
+pub fn write_index_tree(root: &Path, pointer: &IndexPointer, body_bytes: &[u8]) -> Result<()> {
+    let body = verify_body(pointer, body_bytes, now_secs())?;
+    let body_file = body_path(root, &pointer.body_sha256)?;
+    match crate::util::metadata_nofollow(&body_file) {
+        Ok(meta) if meta.is_file() => {
+            let existing = read_capped(&body_file, MAX_INDEX_BODY_BYTES, "index body")?;
+            if existing != body_bytes {
+                bail!(
+                    "index body {} already exists with different bytes",
+                    body_file.display()
+                );
+            }
+        }
+        Ok(_) => bail!("index body {} is not a regular file", body_file.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            crate::util::write_atomic_private(&body_file, body_bytes)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            bail!(
+                "index body {} is a symlink/reparse point",
+                body_file.display()
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", body_file.display()));
+        }
+    }
+    let report = publisher_report(pointer, &body)?;
+    let report_path = root.join(super::PUBLISHER_FILE);
+    crate::util::write_atomic_private(&report_path, &report)?;
+    let pointer_path = root.join(super::INDEX_FILE);
+    let pointer_bytes = serde_json::to_vec(pointer)?;
+    crate::util::write_atomic_private(&pointer_path, &pointer_bytes)?;
+    Ok(())
+}
+
+/// Read and verify a local staging tree (used by tests and the publisher's
+/// post-upload check).
+pub fn read_index_tree(root: &Path, pinned_public_key: &str, now: u64) -> Result<VerifiedIndex> {
+    let pointer_bytes = read_capped(
+        &root.join(super::INDEX_FILE),
+        MAX_INDEX_POINTER_BYTES,
+        "index pointer",
+    )?;
+    let pointer: IndexPointer =
+        serde_json::from_slice(&pointer_bytes).context("parsing the remote index pointer")?;
+    // Authenticate the pointer before reading whatever body it names.
+    pointer.verify(pinned_public_key, now)?;
+    let body_bytes = read_capped(
+        &body_path(root, &pointer.body_sha256)?,
+        MAX_INDEX_BODY_BYTES,
+        "index body",
+    )?;
+    verify_index(&pointer_bytes, &body_bytes, pinned_public_key, now)
+}
+
+fn signing_message(unsigned: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(SIGNING_DOMAIN.len() + unsigned.len());
+    message.extend_from_slice(SIGNING_DOMAIN);
+    message.extend_from_slice(unsigned);
+    message
+}
+
+fn verifying_key(public_key: &str) -> Result<VerifyingKey> {
+    let bytes = crate::vault::hex_decode(public_key, "publisher public key")?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("publisher public key must be 32 bytes"))?;
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|err| anyhow::anyhow!("publisher public key is invalid: {err}"))
+}
+
+fn validate_key_id(text: &str) -> Result<()> {
+    let Some(hex) = text.strip_prefix("ed25519:") else {
+        bail!("remote key id {text:?} must start with `ed25519:`");
+    };
+    if hex.len() != 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("remote key id {text:?} must be `ed25519:` plus 16 hex characters");
+    }
+    Ok(())
+}
+
+fn validate_window(created: u64, expires: u64) -> Result<()> {
+    if created == 0 {
+        bail!("remote index created time must be a Unix timestamp");
+    }
+    if expires <= created {
+        bail!("remote index expiry must be after its creation");
+    }
+    if expires - created > MAX_INDEX_VALIDITY_SECS {
+        bail!(
+            "remote index validity is {} seconds (cap {MAX_INDEX_VALIDITY_SECS})",
+            expires - created
+        );
+    }
+    Ok(())
+}
+
+fn validate_text(value: &str, what: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{what} must not be empty");
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        bail!("{what} must not contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_optional_text(value: &str, what: &str) -> Result<()> {
+    if value
+        .chars()
+        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+    {
+        bail!("{what} must not contain control characters");
+    }
+    Ok(())
+}

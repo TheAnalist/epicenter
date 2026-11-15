@@ -1347,7 +1347,7 @@ fn view_selectors_hit(
 /// `epicenter evict --generation <key>` — delete whole parity-key stores.
 fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Result<()> {
     let store_root = crate::vault::store_root(build_root);
-    if store_root.exists() {
+    if metadata_nofollow(&store_root).is_ok() {
         crate::vault::check_store_trust(&store_root)?;
     }
     let generations = crate::vault::generations(&store_root)?;

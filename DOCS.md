@@ -339,6 +339,26 @@ publisher_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
 
 **Publisher-key handoff:** CI prints the public key and its key id; a developer copies the exact `setup --remote-key ...` command or file from that trusted output. A key fetched from the bucket is only a TOFU hint, not a trust anchor, and epicenter does not use it automatically.
 
+#### Index and CAS layout
+
+A published bucket is deliberately small:
+
+```text
+index.json                 small Ed25519-signed pointer
+indexes/<sha256>.json      immutable canonical index body
+publisher.json             human-readable copy of the signed metadata
+blobs/<sha256>             immutable stored file (gzip or raw)
+```
+
+- `index.json` carries the schema, publisher key id, sequence, created/expiry, body SHA-256/size and the signature over its canonical bytes (domain-separated).
+- `indexes/<sha256>.json` is the canonical body: tier, publisher metadata, compatibility tuple and unit/file refs. It is immutable and addressed by the hash the signed pointer commits to.
+- `blobs/<sha256>` stores one file per object. The index records the stored hash/size and the decoded hash/size, so a reader verifies the object before decompressing it and verifies the decoded bytes again.
+- `publisher.json` mirrors the signed metadata for humans and CI logs; it is not a trust anchor.
+
+Readers verify the pointer signature, key id, sequence/expiry, body hash/size/canonical form and then each blob. They keep the highest accepted sequence per endpoint/key under the OS state directory and reject rollback, same-sequence equivocation and expired indexes. Rotation/revocation is a trusted-channel operation: re-pin the new key with `setup`; an old-key index fails both the key-id and signature checks. A deliberate sequence reset under the same key requires clearing the local state.
+
+`libraries` indexes contain only non-executable library/metadata units. `full` may add build-script trees and proc-macro/shared objects; a `libraries` reader refuses a `full` index. Path/workspace units are always excluded. `doctor` compares the last verified index tuple (rustc, Cargo, target, cargo home, flags, layout, registry source path) with this machine and names each mismatch; the reader will apply the same tuple when filtering units.
+
 ### Presets Explained (`auto`, `dev`, `ci`)
 
 | Preset | Best For | What `setup` writes to Cargo config | What `exec` sets |

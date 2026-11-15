@@ -44,7 +44,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::settings::LinkPolicy;
-use crate::util::{self, FileLock};
+use crate::util::{self, FileLock, metadata_nofollow};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -199,7 +199,13 @@ fn parity_key_with(tc: &Toolchain) -> Result<String> {
 
 /// Digest of the flags that live outside the fingerprint: the flag
 /// environment plus the flag-relevant keys of Cargo's global config.
-fn flags_digest(host: &str) -> String {
+pub(crate) fn flags_digest(host: &str) -> String {
+    flags_digest_of(host, None)
+}
+
+/// Same digest for a rustup selector; the child Cargo version is part of the
+/// fingerprint, so `exec +nightly` must not compare against the default one.
+pub(crate) fn flags_digest_of(host: &str, selector: Option<&str>) -> String {
     let mut input = String::from(PARITY_SEED);
     for name in [
         "RUSTFLAGS",
@@ -242,6 +248,9 @@ fn flags_digest(host: &str) -> String {
         }
     }
     if let Ok(mut cargo) = util::command_for("cargo") {
+        if let Some(selector) = selector {
+            cargo.arg(format!("+{selector}"));
+        }
         if let Ok(output) = cargo.arg("-V").output() {
             if output.status.success() {
                 input.push('\0');
@@ -709,7 +718,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     result
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
@@ -717,7 +726,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn hex_decode(text: &str, what: &str) -> Result<Vec<u8>> {
+pub(crate) fn hex_decode(text: &str, what: &str) -> Result<Vec<u8>> {
     let text = text.trim();
     if text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("{what} is not a valid hex string");
@@ -1198,23 +1207,20 @@ pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
         fs::read_dir(store_root).with_context(|| format!("reading {}", store_root.display()))?
     {
         let entry = entry?;
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !entry.file_type()?.is_dir() || util::is_reparse_point(&meta) {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with('.') {
-            if names.len() >= MAX_GENERATIONS {
+        if let Ok(meta) = metadata_nofollow(&entry.path())
+            && meta.is_dir()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && names.len() >= MAX_GENERATIONS {
+                names.push(name);
+            } else {
                 anyhow::bail!(
                     "store {} has more than {} generation directories — refusing an unbounded scan",
                     store_root.display(),
                     MAX_GENERATIONS
                 );
             }
-            names.push(name);
-        }
+        };
     }
     names.sort();
     Ok(names)
@@ -1235,7 +1241,7 @@ pub struct StoredUnit {
 
 /// Every stored unit across all generations, manifest-driven.
 pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
-    if store_root.exists() {
+    if metadata_nofollow(store_root).is_ok() {
         check_store_trust(store_root)?;
     }
     let mut out = Vec::new();
@@ -2969,6 +2975,7 @@ pub fn restore_with(
     };
     // Verify store ownership/mode before parsing its manifest. A fresh store
     // is allowed to be absent (cold start); a present-but-unsafe one is not.
+    // Already checked its not a symlink in main (cmd_restore)
     if store_root.exists() {
         check_store_trust(store_root)?;
     }

@@ -1,0 +1,528 @@
+//! Compatibility tuples and local-vs-index diagnostics.
+//!
+//! The exact per-unit tuple is copied from Cargo's fingerprint JSON. The
+//! fleet-level tuple records the machine identity (rustc, Cargo, target,
+//! cargo-home, registry source path, flags) so `doctor`/`exec` can explain a
+//! likely miss before Cargo recompiles.
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+use super::{RemoteUnit, sha256_hex};
+use crate::fingerprint::FingerprintJson;
+
+/// `rustc -vV` facts that name a compiler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RustcIdentity {
+    pub release: String,
+    pub commit: String,
+    pub host: String,
+    /// Empty when the toolchain does not report an LLVM version.
+    pub llvm: String,
+}
+
+impl RustcIdentity {
+    fn validate(&self) -> Result<()> {
+        validate_text(&self.release, "rustc release")?;
+        validate_text(&self.commit, "rustc commit")?;
+        validate_text(&self.host, "rustc host")?;
+        validate_optional_text(&self.llvm, "rustc LLVM version")?;
+        Ok(())
+    }
+}
+
+/// The registry identity and the absolute-path digest that Cargo folds into
+/// each unit's `path` hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryIdentity {
+    pub name: String,
+    /// Registry index URL, e.g. `https://github.com/rust-lang/crates.io-index`.
+    pub index: String,
+    /// SHA-256 of the normalized absolute `$CARGO_HOME/registry/src` path.
+    /// The path itself is not published.
+    pub source_path_hash: String,
+}
+
+impl RegistryIdentity {
+    fn validate(&self) -> Result<()> {
+        validate_text(&self.name, "registry name")?;
+        validate_text(&self.index, "registry index")?;
+        super::ensure_sha256(&self.source_path_hash, "registry source path hash")?;
+        Ok(())
+    }
+}
+
+/// Fleet-level compatibility tuple.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Compatibility {
+    pub rustc: RustcIdentity,
+    pub cargo: String,
+    pub target: String,
+    /// Profiles present in this index, sorted and unique.
+    pub profiles: Vec<String>,
+    /// Union of unit features, sorted and unique.
+    pub features: Vec<String>,
+    /// `crate::vault::flags_digest` (8 hex characters).
+    pub rustflags_digest: String,
+    /// SHA-256 over the sorted unique unit `config` hashes.
+    pub config_digest: String,
+    /// Absolute `CARGO_HOME` string used by the publisher.
+    pub cargo_home: String,
+    /// `classic`, `new`, or `mixed`.
+    pub layout: String,
+    pub registry: RegistryIdentity,
+}
+
+impl Compatibility {
+    /// Derive the fleet tuple from a local environment and the published units.
+    pub fn from_local(local: &LocalEnvironment, units: &[RemoteUnit]) -> Result<Self> {
+        let mut profiles: Vec<String> = units.iter().map(|unit| unit.profile.clone()).collect();
+        profiles.sort();
+        profiles.dedup();
+
+        let mut features: Vec<String> = units
+            .iter()
+            .flat_map(|unit| unit.compat.features.iter().cloned())
+            .collect();
+        features.sort();
+        features.dedup();
+
+        let mut configs: Vec<&str> = units
+            .iter()
+            .map(|unit| unit.compat.config.as_str())
+            .collect();
+        configs.sort_unstable();
+        configs.dedup();
+        let mut config_input = String::new();
+        for config in configs {
+            config_input.push_str(config);
+            config_input.push('\n');
+        }
+
+        let layout = if units.is_empty() {
+            local.layout.clone()
+        } else if units
+            .iter()
+            .all(|unit| unit.layout == crate::fingerprint::UnitLayout::Classic)
+        {
+            "classic".to_string()
+        } else if units
+            .iter()
+            .all(|unit| unit.layout == crate::fingerprint::UnitLayout::New)
+        {
+            "new".to_string()
+        } else {
+            "mixed".to_string()
+        };
+
+        let compatibility = Compatibility {
+            rustc: local.rustc.clone(),
+            cargo: local.cargo.clone(),
+            target: local.target.clone(),
+            profiles,
+            features,
+            rustflags_digest: local.rustflags_digest.clone(),
+            config_digest: sha256_hex(config_input.as_bytes()),
+            cargo_home: local.cargo_home.clone(),
+            layout,
+            registry: local.registry.clone(),
+        };
+        compatibility.validate()?;
+        Ok(compatibility)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.rustc.validate()?;
+        validate_text(&self.cargo, "cargo version")?;
+        validate_text(&self.target, "target")?;
+        if self.profiles.len() > 64 {
+            bail!("too many profiles in the compatibility tuple");
+        }
+        if self.profiles.iter().any(|profile| profile.is_empty()) {
+            bail!("compatibility profiles must not be empty");
+        }
+        if !is_sorted_unique(&self.profiles) {
+            bail!("compatibility profiles must be sorted and unique");
+        }
+        if self.features.iter().any(|feature| feature.is_empty()) {
+            bail!("compatibility features must not be empty");
+        }
+        if !is_sorted_unique(&self.features) {
+            bail!("compatibility features must be sorted and unique");
+        }
+        if self.rustflags_digest.len() != 8
+            || !self.rustflags_digest.bytes().all(super::is_lower_hex)
+        {
+            bail!("rustflags digest must be 8 hex characters");
+        }
+        super::ensure_sha256(&self.config_digest, "config digest")?;
+        validate_text(&self.cargo_home, "cargo home")?;
+        if !Path::new(&self.cargo_home).is_absolute() {
+            bail!("cargo home in the compatibility tuple must be absolute");
+        }
+        match self.layout.as_str() {
+            "classic" | "new" | "mixed" => {}
+            other => bail!("unknown Cargo layout {other:?}"),
+        }
+        self.registry.validate()?;
+        Ok(())
+    }
+
+    /// Compare the machine-level fields with this machine. Profiles, features
+    /// and per-unit fingerprints are checked when the reader filters units.
+    pub fn compare_local(&self, local: &LocalEnvironment) -> Vec<Mismatch> {
+        let mut out = Vec::new();
+        compare(
+            &mut out,
+            "rustc release",
+            &self.rustc.release,
+            &local.rustc.release,
+        );
+        compare(
+            &mut out,
+            "rustc commit",
+            &self.rustc.commit,
+            &local.rustc.commit,
+        );
+        compare(&mut out, "rustc host", &self.rustc.host, &local.rustc.host);
+        if !self.rustc.llvm.is_empty() && !local.rustc.llvm.is_empty() {
+            compare(&mut out, "rustc LLVM", &self.rustc.llvm, &local.rustc.llvm);
+        }
+        compare(&mut out, "cargo", &self.cargo, &local.cargo);
+        compare(&mut out, "target", &self.target, &local.target);
+        compare_path(&mut out, "cargo home", &self.cargo_home, &local.cargo_home);
+        compare(
+            &mut out,
+            "rustflags digest",
+            &self.rustflags_digest,
+            &local.rustflags_digest,
+        );
+        compare(&mut out, "Cargo layout", &self.layout, &local.layout);
+        compare(
+            &mut out,
+            "registry name",
+            &self.registry.name,
+            &local.registry.name,
+        );
+        compare(
+            &mut out,
+            "registry index",
+            &self.registry.index,
+            &local.registry.index,
+        );
+        compare(
+            &mut out,
+            "registry source path",
+            &self.registry.source_path_hash,
+            &local.registry.source_path_hash,
+        );
+        out
+    }
+}
+
+/// Exact per-unit tuple copied from Cargo's fingerprint JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnitCompatibility {
+    /// Cargo's opaque rustc hash.
+    pub rustc: String,
+    pub target: String,
+    pub profile: String,
+    /// Parsed from Cargo's `features` JSON string.
+    pub features: Vec<String>,
+    pub rustflags: Vec<String>,
+    /// Cargo's opaque config hash.
+    pub config: String,
+    /// Cargo's opaque source-path hash.
+    pub path: String,
+    pub compile_kind: String,
+}
+
+impl UnitCompatibility {
+    pub fn from_fingerprint(json: &FingerprintJson) -> Self {
+        Self {
+            rustc: json.rustc.clone(),
+            target: json.target.clone(),
+            profile: json.profile.clone(),
+            features: json.features.clone(),
+            rustflags: json.rustflags.clone(),
+            config: json.config.clone(),
+            path: json.path.clone(),
+            compile_kind: json.compile_kind.clone(),
+        }
+    }
+
+    /// Stable digest of the exact tuple, for indexing and diagnostics.
+    pub fn compat_key(&self) -> Result<String> {
+        Ok(sha256_hex(&serde_json::to_vec(self)?))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_opaque(&self.rustc, "unit rustc hash")?;
+        validate_opaque(&self.target, "unit target hash")?;
+        validate_opaque(&self.profile, "unit profile hash")?;
+        validate_opaque(&self.config, "unit config hash")?;
+        validate_opaque(&self.path, "unit source path hash")?;
+        validate_opaque(&self.compile_kind, "unit compile kind")?;
+        for feature in &self.features {
+            validate_feature(feature, "unit feature")?;
+        }
+        for flag in &self.rustflags {
+            if flag.contains('\0') {
+                bail!("unit rustflags must not contain NUL");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One mismatch between the publisher tuple and this machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Mismatch {
+    pub field: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+impl std::fmt::Display for Mismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: publisher {}, local {}",
+            self.field, self.expected, self.actual
+        )
+    }
+}
+
+/// Machine-level facts used for compatibility checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalEnvironment {
+    pub rustc: RustcIdentity,
+    pub cargo: String,
+    pub target: String,
+    pub cargo_home: String,
+    pub rustflags_digest: String,
+    pub layout: String,
+    pub registry: RegistryIdentity,
+}
+
+impl LocalEnvironment {
+    /// Collect `rustc -vV`, `cargo -V`, the effective cargo home and the
+    /// registry source-path digest. Read-only and safe for `doctor`.
+    pub fn gather() -> Result<Self> {
+        Self::gather_for(None)
+    }
+
+    /// Gather for a rustup selector; `exec +nightly` must compare the child
+    /// toolchain, not the default one.
+    pub fn gather_for(selector: Option<&str>) -> Result<Self> {
+        let rustc = local_rustc(selector)?;
+        let cargo = local_cargo(selector)?;
+        let target = std::env::var("CARGO_BUILD_TARGET")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| rustc.host.clone());
+        let cargo_home = crate::paths::cargo_home()?;
+        let cargo_home_text = cargo_home.to_string_lossy().to_string();
+        let layout = match crate::fingerprint::layout_for_cargo(&cargo, &[]) {
+            crate::fingerprint::UnitLayout::Classic => "classic",
+            crate::fingerprint::UnitLayout::New => "new",
+        }
+        .to_string();
+        let registry = local_registry(&cargo_home);
+        Ok(Self {
+            rustc: rustc.clone(),
+            cargo,
+            target,
+            cargo_home: cargo_home_text,
+            rustflags_digest: crate::vault::flags_digest_of(&rustc.host, selector),
+            layout,
+            registry,
+        })
+    }
+}
+
+/// Compare a verified index tuple with this machine and return readable
+/// mismatch lines. Empty means the machine-level tuple matches.
+pub fn compare_compatibility(
+    compatibility: &Compatibility,
+    local: &LocalEnvironment,
+) -> Vec<Mismatch> {
+    compatibility.compare_local(local)
+}
+
+fn local_rustc(selector: Option<&str>) -> Result<RustcIdentity> {
+    let mut command = crate::util::command_for("rustc")?;
+    if let Some(selector) = selector {
+        command.arg(format!("+{selector}"));
+    }
+    let output = command.arg("-vV").output().context("running `rustc -vV`")?;
+    if !output.status.success() {
+        bail!("`rustc -vV` failed — is a toolchain installed?");
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut release = String::new();
+    let mut commit = String::new();
+    let mut host = String::new();
+    let mut llvm = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("rustc ") {
+            let mut parts = rest.split_whitespace();
+            if let Some(version) = parts.next() {
+                release = version.to_string();
+            }
+            if let Some(value) = parts.next() {
+                commit = value.trim_start_matches('(').to_string();
+            }
+        } else if let Some(value) = line.strip_prefix("host: ") {
+            host = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("LLVM version: ") {
+            llvm = value.trim().to_string();
+        }
+    }
+    if release.is_empty() || commit.is_empty() || host.is_empty() {
+        bail!("`rustc -vV` did not report a complete toolchain identity");
+    }
+    Ok(RustcIdentity {
+        release,
+        commit,
+        host,
+        llvm,
+    })
+}
+
+fn local_cargo(selector: Option<&str>) -> Result<String> {
+    let mut command = crate::util::command_for("cargo")?;
+    if let Some(selector) = selector {
+        command.arg(format!("+{selector}"));
+    }
+    let output = command.arg("-V").output().context("running `cargo -V`")?;
+    if !output.status.success() {
+        bail!("`cargo -V` failed — is Cargo installed?");
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        bail!("`cargo -V` returned an empty version");
+    }
+    Ok(text)
+}
+
+/// Registry identity from Cargo's config, defaulting to crates.io.
+fn local_registry(cargo_home: &Path) -> RegistryIdentity {
+    let mut name = "crates-io".to_string();
+    let mut index = "https://github.com/rust-lang/crates.io-index".to_string();
+    if let Ok(path) = crate::config::cargo_config_path()
+        && let Ok(text) = crate::util::read_trusted_config(&path, 1024 * 1024)
+    {
+        if let Some(replacement) =
+            crate::config::read_table_key(&text, "source.crates-io", "replace-with")
+        {
+            name = replacement.clone();
+            let table = format!("source.{replacement}");
+            if let Some(url) = crate::config::read_table_key(&text, &table, "registry") {
+                index = url;
+            } else if let Some(url) = crate::config::read_table_key(&text, &table, "local-registry")
+            {
+                index = format!("local-registry+{url}");
+            } else if let Some(url) = crate::config::read_table_key(&text, &table, "directory") {
+                index = format!("directory+{url}");
+            }
+        } else if let Some(url) =
+            crate::config::read_table_key(&text, "source.crates-io", "registry")
+        {
+            index = url;
+        }
+    }
+    RegistryIdentity {
+        name,
+        index,
+        source_path_hash: source_path_hash(cargo_home),
+    }
+}
+
+/// SHA-256 of the normalized absolute `$CARGO_HOME/registry/src` path.
+pub fn source_path_hash(cargo_home: &Path) -> String {
+    let path = cargo_home.join("registry").join("src");
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    while text.len() > 1 && text.ends_with('/') {
+        text.pop();
+    }
+    if cfg!(windows) {
+        text.make_ascii_lowercase();
+    }
+    sha256_hex(text.as_bytes())
+}
+
+fn compare(out: &mut Vec<Mismatch>, field: &str, expected: &str, actual: &str) {
+    if expected != actual {
+        out.push(Mismatch {
+            field: field.to_string(),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+}
+
+fn compare_path(out: &mut Vec<Mismatch>, field: &str, expected: &str, actual: &str) {
+    if path_key(expected) != path_key(actual) {
+        out.push(Mismatch {
+            field: field.to_string(),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+}
+
+fn path_key(value: &str) -> String {
+    let mut text = value.replace('\\', "/");
+    while text.len() > 1 && text.ends_with('/') {
+        text.pop();
+    }
+    if cfg!(windows) {
+        text.make_ascii_lowercase();
+    }
+    text
+}
+
+fn validate_text(value: &str, what: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{what} must not be empty");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("{what} must not contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_optional_text(value: &str, what: &str) -> Result<()> {
+    if value
+        .chars()
+        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+    {
+        bail!("{what} must not contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_opaque(value: &str, what: &str) -> Result<()> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("{what} must be a non-empty decimal hash");
+    }
+    Ok(())
+}
+
+fn validate_feature(value: &str, what: &str) -> Result<()> {
+    if value.is_empty() || value.contains('\0') {
+        bail!("{what} must be non-empty and contain no NUL");
+    }
+    Ok(())
+}
+
+fn is_sorted_unique(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}

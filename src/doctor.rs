@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 
@@ -692,7 +692,9 @@ fn check_toolchain_generation(rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
 /// Stale vault generations occupy space even when the build view is aligned
 /// with the installed toolchain. They are safe to remove as whole generations.
 fn check_store_generations(store: &Path) -> Vec<Check> {
-    if !store.is_dir() {
+    if let Ok(meta) = metadata_nofollow(store)
+        && !meta.is_dir()
+    {
         return Vec::new();
     }
     match crate::vault::generations(store) {
@@ -1004,6 +1006,8 @@ pub struct ProfileSummary {
     pub remote_transport: String,
     pub remote_region: Option<String>,
     pub remote_cache: String,
+    pub remote_index: Option<crate::remote::IndexStatus>,
+    pub remote_index_error: Option<String>,
     pub store: String,
     pub project: Option<String>,
     pub dev: ProfileValues,
@@ -1042,6 +1046,8 @@ impl ProfileSummary {
             "remote_transport": self.remote_transport,
             "remote_region": self.remote_region,
             "remote_cache": self.remote_cache,
+            "remote_index": self.remote_index,
+            "remote_index_error": self.remote_index_error,
             "store": self.store,
             "project": self.project,
             "dev": {
@@ -1091,6 +1097,14 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
         .and_then(profiles)
         .unwrap_or_else(|| (ProfileValues::default(), ProfileValues::default(), false));
     let remote_url = remote.redacted_url();
+    let (remote_index, remote_index_error) = if remote.enabled {
+        match crate::remote::status(&remote) {
+            Ok(status) => (status, None),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        }
+    } else {
+        (None, None)
+    };
 
     Ok(ProfileSummary {
         preset: preset.as_str().to_string(),
@@ -1119,6 +1133,8 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
         remote_transport: remote.transport.as_str().to_string(),
         remote_region: remote.region,
         remote_cache: remote.cache.display().to_string(),
+        remote_index,
+        remote_index_error,
         store: store.display().to_string(),
         project: project.map(|path| path.display().to_string()),
         dev,
@@ -1401,6 +1417,56 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
             Level::Warn,
             "remote publisher key is configured but there is no `[remote] url` — remote stays disabled",
         ));
+    }
+    if profile.remote_enabled {
+        match (&profile.remote_index, &profile.remote_index_error) {
+            (Some(index), _) => {
+                let published =
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(index.publisher.built_at);
+                checks.push(check(
+                    SEC_CONFIG,
+                    if index.mismatches.is_empty() {
+                        Level::Pass
+                    } else {
+                        Level::Warn
+                    },
+                    format!(
+                        "remote index: sequence {} · published {} ago · {}",
+                        index.sequence,
+                        human_age(published),
+                        if index.mismatches.is_empty() {
+                            "compatibility matches"
+                        } else {
+                            "compatibility mismatch"
+                        }
+                    ),
+                ));
+                for mismatch in &index.mismatches {
+                    checks.push(check(
+                        SEC_CONFIG,
+                        Level::Warn,
+                        format!("remote compatibility: {mismatch}"),
+                    ));
+                }
+                if index.expires < crate::remote::now_secs() {
+                    checks.push(check(
+                        SEC_CONFIG,
+                        Level::Warn,
+                        "remote index has expired — ask CI to publish a fresh sequence",
+                    ));
+                }
+            }
+            (None, Some(err)) => checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!("remote index state: {err}"),
+            )),
+            (None, None) => checks.push(check(
+                SEC_CONFIG,
+                Level::Info,
+                "remote index: no verified index yet — `exec` fetches one",
+            )),
+        }
     }
     if let Ok(state) = paths::state_dir() {
         checks.push(check(

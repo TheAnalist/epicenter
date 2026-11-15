@@ -11,6 +11,7 @@ pub mod fingerprint;
 pub mod paths;
 pub mod profile;
 pub mod prune;
+pub mod remote;
 pub mod settings;
 pub mod status;
 pub mod util;

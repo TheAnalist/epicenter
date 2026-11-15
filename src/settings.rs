@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::util::metadata_nofollow;
@@ -126,7 +126,7 @@ impl LinkPolicy {
 
 /// Remote artifact tier. `libraries` excludes executable build-script and
 /// proc-macro units; `full` includes them for a trusted, homogeneous fleet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RemoteTier {
     Libraries,

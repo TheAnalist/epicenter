@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use epicenter_cli::util::metadata_nofollow;
 use epicenter_cli::{config, doctor, exec, paths, profile, prune, settings, status, util, vault};
 
 #[derive(Parser)]
@@ -1280,6 +1281,7 @@ fn cmd_prune(args: &PruneArgs) -> Result<()> {
 
 fn cmd_overlap(args: &OverlapArgs) -> Result<()> {
     let store = vault::store_root(&config::cache_root()?);
+    metadata_nofollow(&store)?;
     let packages = vault::overlap(&store)?;
     if args.json {
         println!(
@@ -1574,6 +1576,8 @@ fn cmd_restore(
     let view = into
         .map(std::path::Path::to_path_buf)
         .unwrap_or(root.clone());
+    // ensure view dir is not a symlink/reparse point
+    metadata_nofollow(&view)?;
     if into.is_none() && root.is_dir() {
         util::ensure_private_dir(&root)?;
     }
@@ -1592,6 +1596,8 @@ fn cmd_restore(
         );
     }
     let store = vault::store_root(&config::cache_root()?);
+    // ensure store is not a symlink/reparse point
+    metadata_nofollow(&store)?;
     let report = vault::restore_policy(&view, &store, unit, dry_run, link)?;
     println!("  {} {}", label("parity"), report.parity);
     if let Some(note) = &report.note {
@@ -1645,6 +1651,7 @@ fn cmd_restore(
 fn cmd_vault() -> Result<()> {
     let root = config::cache_root()?;
     let store = vault::store_root(&root);
+    metadata_nofollow(&store)?;
     println!(
         "{}",
         util::heading("epicenter vault — durable store of Cargo unit groups")
@@ -1730,6 +1737,7 @@ fn cmd_vault() -> Result<()> {
 fn cmd_verify() -> Result<()> {
     let root = config::cache_root()?;
     let store = vault::store_root(&root);
+    metadata_nofollow(&store)?;
     println!("{}", util::heading("epicenter verify — vault audit"));
     let reports = vault::verify(&store)?;
     let mut failed = false;
