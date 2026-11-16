@@ -153,6 +153,13 @@ pub(crate) fn record_state_at(
     let body = super::verify_body(pointer, &canonical, now)?;
     body.validate_reader(remote.tier)?;
     ensure_metadata_matches(pointer, &body)?;
+    // Serialize the load-check-write per endpoint/key. Without this, two
+    // concurrent fetches can both read the old sequence and accept different
+    // bodies at the same sequence, or write a lower sequence after a higher
+    // one. The lock is held through the atomic write.
+    let path = state_file(root, remote)?;
+    let lock_path = path.with_extension("json.lock");
+    let _state_lock = crate::util::FileLock::acquire(&lock_path)?;
     let existing = load_state_at(root, remote)?;
     check_replay(existing.as_ref(), pointer)?;
     if existing.as_ref().is_some_and(|state| {
@@ -172,7 +179,6 @@ pub(crate) fn record_state_at(
         compatibility: body.compatibility.clone(),
     };
     state.validate(remote)?;
-    let path = state_file(root, remote)?;
     let bytes = serde_json::to_vec_pretty(&state)?;
     crate::util::write_atomic_private(&path, &bytes)?;
     Ok(())
@@ -239,6 +245,9 @@ pub fn clear_state(remote: &RemotePolicy) -> Result<()> {
 
 pub(crate) fn clear_state_at(root: &Path, remote: &RemotePolicy) -> Result<()> {
     let path = state_file(root, remote)?;
+    // Serialize with record_state_at: a clear racing a record must not leave
+    // the state half-removed/half-recreated.
+    let _state_lock = crate::util::FileLock::acquire(&path.with_extension("json.lock"))?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

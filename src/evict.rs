@@ -1031,13 +1031,18 @@ fn evict_work_dirs(
 /// (directory mtimes only move when entries are added or removed).
 fn dir_newest(dir: &Path) -> Option<SystemTime> {
     let mut newest = None;
+    let mut budget = crate::util::ScanBudget::new("job freshness");
     for entry in WalkDir::new(dir)
         .min_depth(1)
+        .max_depth(crate::util::MAX_SCAN_DEPTH)
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
         .flatten()
     {
+        if !budget.take() {
+            break;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1056,24 +1061,29 @@ fn dir_accounting(dir: &Path) -> (u64, u64, u64, u64) {
     let mut unique = 0u64;
     let mut shared = 0u64;
     let mut files = 0u64;
+    let mut budget = crate::util::ScanBudget::new("work dir accounting");
     for entry in WalkDir::new(dir)
         .min_depth(1)
+        .max_depth(crate::util::MAX_SCAN_DEPTH)
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
         .flatten()
     {
+        if !budget.take() {
+            break;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
         let size = meta.len();
-        bytes += size;
-        files += 1;
+        bytes = bytes.saturating_add(size);
+        files = files.saturating_add(1);
         if crate::vault::link_count(entry.path(), &meta) > 1 {
-            shared += size;
+            shared = shared.saturating_add(size);
         } else {
-            unique += size;
+            unique = unique.saturating_add(size);
         }
     }
     (bytes, unique, shared, files)
@@ -1161,13 +1171,19 @@ fn view_unit_files(unit: &Unit, arts: &ArtifactInfo) -> Vec<PathBuf> {
 }
 
 fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut budget = crate::util::ScanBudget::new("store tree");
     for entry in WalkDir::new(dir)
         .min_depth(1)
+        .max_depth(crate::util::MAX_SCAN_DEPTH)
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
+        .filter_entry(|entry| crate::util::walk_entry_is_safe(dir, entry))
         .flatten()
     {
+        if !budget.take() {
+            return;
+        }
         if entry.file_type().is_file() {
             out.push(entry.path().to_path_buf());
         }
@@ -1246,12 +1262,13 @@ fn candidate_for<'a>(
 }
 
 fn push_place(candidate: &mut Candidate, place: Place) {
-    candidate.bytes += place
+    candidate.bytes = place
         .files()
         .iter()
         .filter_map(|path| fs::metadata(path).ok())
-        .map(|meta| meta.len())
-        .sum::<u64>();
+        .fold(candidate.bytes, |total, meta| {
+            total.saturating_add(meta.len())
+        });
     candidate.places.push(place);
 }
 
@@ -1369,7 +1386,7 @@ fn view_selectors_hit(
 /// `epicenter evict --generation <key>` — delete whole parity-key stores.
 fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Result<()> {
     let store_root = crate::vault::store_root(build_root);
-    if metadata_nofollow(&store_root).is_ok() {
+    if store_root.exists() {
         crate::vault::check_store_trust(&store_root)?;
     }
     let generations = crate::vault::generations(&store_root)?;

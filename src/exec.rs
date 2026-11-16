@@ -157,7 +157,9 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
     let Ok(entries) = std::fs::read_dir(work_root(build_root)) else {
         return Ok(tier);
     };
+    let mut budget = util::ScanBudget::new("work dirs");
     for entry in entries.flatten() {
+        budget.spend()?;
         if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -176,17 +178,19 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
         };
         for file in WalkDir::new(entry.path())
             .min_depth(1)
+            .max_depth(util::MAX_SCAN_DEPTH)
             .follow_links(false)
             .follow_root_links(false)
             .into_iter()
             .flatten()
         {
+            budget.spend()?;
             if !file.file_type().is_file() {
                 continue;
             }
             if let Ok(meta) = file.metadata() {
-                info.files += 1;
-                info.bytes += meta.len();
+                info.files = info.files.saturating_add(1);
+                info.bytes = info.bytes.saturating_add(meta.len());
                 if let Ok(modified) = meta.modified() {
                     if info.newest.map_or(true, |current| modified > current) {
                         info.newest = Some(modified);
@@ -194,9 +198,9 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
                 }
             }
         }
-        tier.dirs += 1;
-        tier.files += info.files;
-        tier.bytes += info.bytes;
+        tier.dirs = tier.dirs.saturating_add(1);
+        tier.files = tier.files.saturating_add(info.files);
+        tier.bytes = tier.bytes.saturating_add(info.bytes);
         if let Some(modified) = info.newest {
             if tier.newest.map_or(true, |current| modified > current) {
                 tier.newest = Some(modified);
@@ -222,12 +226,104 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
     // `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
     // bounded depth and take every lock, not just direct children.
     //
+    // A profile directory without a lock file gets a sentinel: otherwise a
+    // build that starts after this check is not fenced at all. Creating the
+    // sentinel is safe because Cargo uses the same path and only contends on
+    // the advisory lock.
+    //
     // Windows refuses to rename a directory while any file inside it is open
     // (even with FILE_SHARE_DELETE), so a caller that renames/removes `dir`
     // must drop these handles first.
+    let mut lock_paths = std::collections::BTreeSet::new();
     let entries = WalkDir::new(dir)
         .min_depth(1)
         .max_depth(3)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    for entry in entries {
+        if entry.file_name().to_string_lossy() == ".cargo-build-lock" {
+            lock_paths.insert(entry.path().to_path_buf());
+            continue;
+        }
+        if entry.depth() <= 2
+            && metadata_nofollow(entry.path()).is_ok_and(|meta| meta.is_dir())
+            && is_cargo_profile_dir(entry.path())
+        {
+            lock_paths.insert(entry.path().join(".cargo-build-lock"));
+        }
+    }
+    if is_cargo_profile_dir(dir) {
+        lock_paths.insert(dir.join(".cargo-build-lock"));
+    }
+
+    let mut locks = Vec::with_capacity(lock_paths.len());
+    for path in lock_paths {
+        // `open_lock_file` is no-follow, creates a missing sentinel with
+        // O_EXCL, and rejects a symlink/reparse target. Any failure fails
+        // closed: the caller treats it as "a build may be running".
+        let Ok(file) = util::open_lock_file(&path) else {
+            return Ok(None);
+        };
+        if !try_lock_now(&file) {
+            return Ok(None);
+        }
+        locks.push(file);
+    }
+    Ok(Some(locks))
+}
+
+/// Does `dir` look like a Cargo profile directory? A profile is the only
+/// place Cargo puts `.cargo-build-lock`; `deps`/`.fingerprint`/`build`/
+/// `incremental` identify one before the first build creates the lock.
+fn is_cargo_profile_dir(dir: &Path) -> bool {
+    [
+        ".cargo-build-lock",
+        "deps",
+        ".fingerprint",
+        "build",
+        "incremental",
+    ]
+    .iter()
+    .any(|name| dir.join(name).symlink_metadata().is_ok())
+}
+
+/// Advisory check: existing locks only, no sentinel creation. Used by read
+/// paths (`status`, `evict` discovery) that must not write into a view.
+pub(crate) fn dir_locked(dir: &Path) -> bool {
+    match existing_cargo_locks(dir) {
+        Ok(Some(locks)) => {
+            drop(locks);
+            false
+        }
+        _ => true,
+    }
+}
+
+/// `try_lock` can be interrupted by a signal from an unrelated child process;
+/// retry that case, but treat every other error (including contention) as
+/// "in use".
+fn try_lock_now(file: &fs::File) -> bool {
+    loop {
+        match file.try_lock() {
+            Ok(()) => return true,
+            Err(std::fs::TryLockError::Error(err))
+                if err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn existing_cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
+    let entries = WalkDir::new(dir)
+        .min_depth(1)
+        .max_depth(3)
+        .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
     let mut locks = Vec::new();
@@ -239,30 +335,15 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
         if !entry.file_type().is_file() {
             return Ok(None);
         }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(entry.path())
-            .or_else(|_| fs::File::open(entry.path()));
-        let Ok(file) = file else {
+        let Ok(file) = util::open_lock_file(entry.path()) else {
             return Ok(None);
         };
-        if file.try_lock().is_err() {
+        if !try_lock_now(&file) {
             return Ok(None);
         }
         locks.push(file);
     }
     Ok(Some(locks))
-}
-
-pub(crate) fn dir_locked(dir: &Path) -> bool {
-    match cargo_locks(dir) {
-        Ok(Some(locks)) => {
-            drop(locks);
-            false
-        }
-        _ => true,
-    }
 }
 
 /// Path of the per-job epicenter lock (outside the job dir, so `--rm` can
@@ -1800,6 +1881,48 @@ mod tests {
         assert!(
             dir_locked(&home.path().join("cross")),
             "target-triple lock must be found"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_locks_creates_a_sentinel_for_an_existing_profile() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let job = home.path().join("job");
+        let profile = job.join("debug");
+        fs::create_dir_all(profile.join("deps"))?;
+
+        let locks = cargo_locks(&job)?.expect("sentinel acquired");
+        let lock_path = profile.join(".cargo-build-lock");
+        assert!(lock_path.is_file(), "the sentinel is created");
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        assert!(
+            second.try_lock().is_err(),
+            "a second opener must contend with the held sentinel"
+        );
+        drop(locks);
+        assert!(
+            cargo_locks(&job)?.is_some(),
+            "the sentinel is reusable after the lock is released"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_locks_refuses_a_symlinked_lock() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let profile = home.path().join("job/debug");
+        fs::create_dir_all(&profile)?;
+        let victim = home.path().join("victim");
+        fs::write(&victim, b"")?;
+        std::os::unix::fs::symlink(&victim, profile.join(".cargo-build-lock"))?;
+        assert!(
+            cargo_locks(&home.path().join("job"))?.is_none(),
+            "a symlinked lock fails closed"
         );
         Ok(())
     }

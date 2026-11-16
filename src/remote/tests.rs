@@ -92,6 +92,7 @@ fn test_unit(
     RemoteUnit {
         name: format!("{package}-0011223344556677"),
         package: package.to_string(),
+        version: None,
         profile: "release".to_string(),
         memo: memo.to_string(),
         hash: "aabbccddeeff0011".to_string(),
@@ -224,6 +225,10 @@ fn expiry_future_clock_and_validity_cap_are_enforced() -> Result<()> {
     stale.publisher.built_at = now.saturating_sub(500);
     let (pointer, _) = make_index(&stale, &key, now.saturating_sub(500))?;
     assert!(pointer.verify(&public_key(&key), now).is_err());
+    assert!(
+        pointer.verify_signature(&public_key(&key)).is_ok(),
+        "a publisher may read the sequence from an expired index"
+    );
 
     let future = now + MAX_CLOCK_SKEW_SECS + 100;
     let body = body_for(&key, future, 5, RemoteTier::Libraries, Vec::new());
@@ -295,6 +300,42 @@ fn replay_state_rejects_rollback_and_equivocation() -> Result<()> {
             .sequence,
         8
     );
+    Ok(())
+}
+
+#[test]
+fn replay_state_serializes_concurrent_writers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let key = signing_key(7);
+    let remote = remote_policy(&public_key(&key));
+
+    let mut a = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
+    a.publisher.ci_job = "ci/a".to_string();
+    let (pa, _) = make_index(&a, &key, now)?;
+    let mut b = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
+    b.publisher.ci_job = "ci/b".to_string();
+    let (pb, _) = make_index(&b, &key, now)?;
+
+    let barrier = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            state::record_state_at(dir.path(), &remote, &pa, &a, now)
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            state::record_state_at(dir.path(), &remote, &pb, &b, now)
+        });
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert!(
+        first.is_ok() != second.is_ok(),
+        "exactly one writer wins a sequence: {first:?} / {second:?}"
+    );
+    let loaded = state::load_state_at(dir.path(), &remote)?.expect("state");
+    let winner = if first.is_ok() { &pa } else { &pb };
+    assert_eq!(loaded.body_sha256, winner.body_sha256);
     Ok(())
 }
 

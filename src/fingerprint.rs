@@ -407,9 +407,11 @@ pub fn parse_fingerprint(text: &str) -> Option<FingerprintJson> {
 /// one build dir, so this is shape-based rather than a single global mode.
 pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
     let mut units = Vec::new();
+    let mut budget = crate::util::ScanBudget::new("build units");
     for profile_entry in fs::read_dir(build_root)
         .with_context(|| format!("reading build dir {}", build_root.display()))?
     {
+        budget.spend()?;
         let profile_entry = profile_entry?;
         if !metadata_nofollow(&profile_entry.path()).is_ok_and(|meta| meta.is_dir()) {
             continue;
@@ -426,6 +428,7 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
             for unit_entry in
                 fs::read_dir(&fp_root).with_context(|| format!("reading {}", fp_root.display()))?
             {
+                budget.spend()?;
                 let unit_entry = unit_entry?;
                 if !metadata_nofollow(&unit_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                     continue;
@@ -442,6 +445,7 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
             for package_entry in fs::read_dir(&build_dir)
                 .with_context(|| format!("reading {}", build_dir.display()))?
             {
+                budget.spend()?;
                 let package_entry = package_entry?;
                 if !metadata_nofollow(&package_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                     continue;
@@ -453,6 +457,7 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
                 for hash_entry in fs::read_dir(package_entry.path())
                     .with_context(|| format!("reading {}", package_entry.path().display()))?
                 {
+                    budget.spend()?;
                     let hash_entry = hash_entry?;
                     if !metadata_nofollow(&hash_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                         continue;
@@ -693,15 +698,19 @@ pub struct ArtifactInfo {
 
 pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
     let mut paths = Vec::new();
+    // A hostile view can hold millions of files. Stop collecting at the
+    // budget: a truncated list leaves artifacts behind instead of walking
+    // forever, and eviction never removes more than it saw.
+    let mut budget = crate::util::ScanBudget::new("artifact scan");
     match unit.layout {
-        UnitLayout::Classic => collect_classic_artifacts(build_root, unit, &mut paths),
-        UnitLayout::New => collect_new_artifacts(unit, &mut paths),
+        UnitLayout::Classic => collect_classic_artifacts(build_root, unit, &mut paths, &mut budget),
+        UnitLayout::New => collect_new_artifacts(unit, &mut paths, &mut budget),
     }
 
-    let mut bytes = 0;
+    let mut bytes = 0u64;
     let mut newest: Option<SystemTime> = None;
     for (_, size, mtime) in &paths {
-        bytes += size;
+        bytes = bytes.saturating_add(*size);
         if let Some(m) = mtime {
             if newest.map_or(true, |n| *m > n) {
                 newest = Some(*m);
@@ -719,6 +728,7 @@ fn collect_classic_artifacts(
     build_root: &Path,
     unit: &Unit,
     paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>,
+    budget: &mut crate::util::ScanBudget,
 ) {
     let profile_dir = build_root.join(&unit.profile);
     let deps_dir = profile_dir.join("deps");
@@ -726,6 +736,9 @@ fn collect_classic_artifacts(
         let suffix = format!("-{}", unit.dir_suffix);
         if let Ok(entries) = fs::read_dir(&deps_dir) {
             for entry in entries.flatten() {
+                if !budget.take() {
+                    return;
+                }
                 // Regular files only; a symlink/FIFO here must not be copied.
                 if !entry
                     .file_type()
@@ -758,9 +771,13 @@ fn collect_classic_artifacts(
             }
             for entry in WalkDir::new(&candidate)
                 .min_depth(1)
+                .max_depth(crate::util::MAX_SCAN_DEPTH)
                 .follow_links(false)
                 .follow_root_links(false)
             {
+                if !budget.take() {
+                    return;
+                }
                 let Ok(entry) = entry else { continue };
                 if !entry.file_type().is_file() {
                     continue;
@@ -777,7 +794,11 @@ fn collect_classic_artifacts(
 /// build-script binaries), `run/` (run-build-script state) and at the unit
 /// root (`output`, `stderr`, `stdout`, `root-output`, …). `fingerprint/` is
 /// handled separately by the vault.
-fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>) {
+fn collect_new_artifacts(
+    unit: &Unit,
+    paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>,
+    budget: &mut crate::util::ScanBudget,
+) {
     for sub in ["out", "run"] {
         let dir = unit.unit_dir.join(sub);
         if !metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
@@ -785,9 +806,13 @@ fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<Syst
         }
         for entry in WalkDir::new(&dir)
             .min_depth(1)
+            .max_depth(crate::util::MAX_SCAN_DEPTH)
             .follow_links(false)
             .follow_root_links(false)
         {
+            if !budget.take() {
+                return;
+            }
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() {
                 continue;
@@ -801,6 +826,9 @@ fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<Syst
         return;
     };
     for entry in entries.flatten() {
+        if !budget.take() {
+            return;
+        }
         if !entry
             .file_type()
             .map(|kind| kind.is_file())

@@ -70,8 +70,6 @@ pub const PUBKEY_FILE: &str = ".epicenter-pubkey";
 
 /// Bound the number of generation directories a directory scan will accept.
 const MAX_GENERATIONS: usize = 4096;
-/// Bound a full store scan so a hostile tree cannot burn CPU/IO indefinitely.
-const MAX_SCAN_FILES: u64 = 2_000_000;
 
 // ── toolchain identity ──────────────────────────────────────────────────────
 
@@ -413,6 +411,24 @@ pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
 /// `units/` directory (so an orphan generation can still be fully deleted).
 pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<String>> {
     util::validate_component(parity, "generation")?;
+    match metadata_nofollow(store_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("store {} is a symlink/reparse point", store_root.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
+        }
+    }
+    let generation = store_root.join(parity);
+    if store_chain_has_reparse(store_root, &generation)? {
+        anyhow::bail!(
+            "generation {} is a symlink/reparse point",
+            generation.display()
+        );
+    }
     if let Ok(Some(manifest)) = load_manifest(store_root, parity) {
         return Ok(manifest
             .units
@@ -420,8 +436,12 @@ pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<Stri
             .map(|entry| entry.name.clone())
             .collect());
     }
+    let units = units_dir(store_root, parity);
+    if store_chain_has_reparse(store_root, &units)? {
+        anyhow::bail!("units dir {} is a symlink/reparse point", units.display());
+    }
     let mut names = Vec::new();
-    if let Ok(entries) = fs::read_dir(units_dir(store_root, parity)) {
+    if let Ok(entries) = fs::read_dir(&units) {
         for entry in entries.flatten() {
             if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 continue;
@@ -1051,10 +1071,55 @@ fn load_manifest(store_root: &Path, parity: &str) -> Result<Option<Manifest>> {
     load_manifest_at(store_root, parity, false)
 }
 
+/// Inspect a path component-by-component from the store root. Returns `true`
+/// when a symlink/reparse point appears anywhere in the chain. A missing path
+/// returns `false`: callers treat a missing generation/unit as an empty slot,
+/// not as a reparse escape.
+fn store_chain_has_reparse(store_root: &Path, target: &Path) -> Result<bool> {
+    let root = util::metadata_nofollow(store_root)
+        .with_context(|| format!("inspecting store {}", store_root.display()))?;
+    if !root.is_dir() {
+        anyhow::bail!("store {} is not a real directory", store_root.display());
+    }
+    let rel = target
+        .strip_prefix(store_root)
+        .with_context(|| format!("{} is outside {}", target.display(), store_root.display()))?;
+    let mut current = store_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::CurDir => continue,
+            _ => anyhow::bail!("refusing non-normal component in {}", target.display()),
+        }
+        match util::metadata_nofollow(&current) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => return Ok(true),
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", current.display()));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Load a manifest. `repair` is true only for writer paths that already hold
 /// the generation lock; readers never delete units or rewrite the manifest.
 fn load_manifest_at(store_root: &Path, parity: &str, repair: bool) -> Result<Option<Manifest>> {
     let path = manifest_path(store_root, parity);
+    let rel = Path::new(parity).join("manifest.json");
+    if let Err(err) = util::check_regular_chain(store_root, &rel) {
+        if is_not_found(&err) {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("validating manifest path {}", path.display()));
+    }
     let meta = match util::metadata_nofollow(&path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
@@ -1248,8 +1313,16 @@ pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest
 
 /// Names of the store generations (directories under `store/`).
 pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
-    if !store_root.is_dir() {
-        return Ok(Vec::new());
+    match metadata_nofollow(store_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("store {} is a symlink/reparse point", store_root.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
+        }
     }
     let mut names = Vec::new();
     for entry in
@@ -1260,16 +1333,13 @@ pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
         if name.starts_with('.') {
             continue;
         }
+        if util::has_reparse_component(store_root, &entry.path()) {
+            continue;
+        }
         let meta = match metadata_nofollow(&entry.path()) {
             Ok(meta) => meta,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                continue;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => continue,
             Err(err) => {
                 return Err(err).with_context(|| format!("inspecting {}", entry.path().display()));
             }
@@ -1279,7 +1349,7 @@ pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
         }
         if names.len() >= MAX_GENERATIONS {
             anyhow::bail!(
-                "store {} has more than {} generation directories — refusing an unbounded scan",
+                "store {} has more than {} generation directories - refusing an unbounded scan",
                 store_root.display(),
                 MAX_GENERATIONS
             );
@@ -1301,12 +1371,23 @@ pub struct StoredUnit {
     pub entry: UnitEntry,
     /// `store/<generation>/units/<name>`.
     pub dir: PathBuf,
+    /// Store root this unit was enumerated from. Kept so readers can
+    /// revalidate the whole chain before opening a unit file.
+    pub store_root: PathBuf,
 }
 
 /// Every stored unit across all generations, manifest-driven.
 pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
-    if metadata_nofollow(&store_root).is_ok() {
-        check_store_trust(store_root)?;
+    match metadata_nofollow(store_root) {
+        Ok(meta) if meta.is_dir() => check_store_trust(store_root)?,
+        Ok(_) => anyhow::bail!("store {} is not a real directory", store_root.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            anyhow::bail!("store {} is a symlink/reparse point", store_root.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
+        }
     }
     let mut out = Vec::new();
     for generation in generation_names(store_root)? {
@@ -1314,12 +1395,26 @@ pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
             continue;
         };
         let units = units_dir(store_root, &generation);
+        if store_chain_has_reparse(store_root, &units)? {
+            anyhow::bail!("units dir {} is a symlink/reparse point", units.display());
+        }
         for entry in manifest.units {
             let dir = units.join(&entry.name);
+            match util::metadata_nofollow(&dir) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                    anyhow::bail!("unit {} is a symlink/reparse point", dir.display());
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("inspecting unit {}", dir.display()));
+                }
+            }
             out.push(StoredUnit {
                 generation: generation.clone(),
                 entry,
                 dir,
+                store_root: store_root.to_path_buf(),
             });
         }
     }
@@ -1328,13 +1423,12 @@ pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
 
 /// The `rustc` identity recorded in a stored unit's Fingerprint JSON.
 pub fn stored_unit_rustc(unit: &StoredUnit) -> Option<String> {
-    let dir_meta = util::metadata_nofollow(&unit.dir).ok()?;
-    if !dir_meta.is_dir() {
-        return None;
-    }
-    let rel = PathBuf::from(format!("{}.json", unit.entry.memo));
-    util::check_regular_chain(&unit.dir, &rel).ok()?;
-    let text = fs::read_to_string(unit.dir.join(&rel)).ok()?;
+    let rel = Path::new(&unit.generation)
+        .join("units")
+        .join(&unit.entry.name)
+        .join(format!("{}.json", unit.entry.memo));
+    util::check_regular_chain(&unit.store_root, &rel).ok()?;
+    let text = fs::read_to_string(unit.store_root.join(&rel)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     match value.get("rustc") {
         Some(serde_json::Value::Number(number)) => Some(number.to_string()),
@@ -1477,14 +1571,19 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
         .collect();
     let blobs = store_root.join(generation).join("blobs");
     let generation_root = store_root.join(generation);
+    let mut budget = util::ScanBudget::new("blob sweep");
     let walker = WalkDir::new(&blobs)
         .min_depth(1)
+        .max_depth(util::MAX_SCAN_DEPTH)
         .follow_links(false)
         .follow_root_links(false)
         .contents_first(true)
         .into_iter()
         .filter_entry(|entry| util::walk_entry_is_safe(&blobs, entry));
     for entry in walker {
+        if !budget.take() {
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -1602,13 +1701,6 @@ pub fn harvest_with_trust(
     authorize_harvest(&build_root, trust)?;
     // Fence the writer against a live Cargo build. A lock check that drops the
     // handles races the build that starts one instruction later.
-    let _build_locks = match crate::exec::cargo_locks(&build_root)? {
-        Some(locks) => Some(locks),
-        None => anyhow::bail!(
-            "build dir {} is in use by a live build — harvest skipped",
-            build_root.display()
-        ),
-    };
     let tc = toolchain_of(selector)?;
     let parity = parity_key_with(&tc)?;
     let mut report = HarvestReport {
@@ -1676,6 +1768,15 @@ pub fn harvest_with_trust(
         None
     };
 
+    // Fence the writer against a live Cargo build. Acquire after the
+    // toolchain probe: a forked/exec'd child must not inherit the lock fd.
+    let _build_locks = match crate::exec::cargo_locks(&build_root)? {
+        Some(locks) => Some(locks),
+        None => anyhow::bail!(
+            "build dir {} is in use by a live build — harvest skipped",
+            build_root.display()
+        ),
+    };
     let mut rows = read_rows(&build_root, pool.as_ref())?;
 
     // A view that mixes both layouts is ambiguous: keep the layout of the
@@ -1817,8 +1918,8 @@ pub fn harvest_with_trust(
         }
         if dry_run {
             report.stored += 1;
-            report.files += plan.files.len();
-            report.bytes += plan.bytes;
+            report.files = report.files.saturating_add(plan.files.len());
+            report.bytes = report.bytes.saturating_add(plan.bytes);
             continue;
         }
         pending.push(at);
@@ -1873,8 +1974,8 @@ pub fn harvest_with_trust(
                     report.stored += 1;
                 }
             }
-            report.files += plan.files.len();
-            report.bytes += plan.bytes;
+            report.files = report.files.saturating_add(plan.files.len());
+            report.bytes = report.bytes.saturating_add(plan.bytes);
         }
     }
 
@@ -3325,7 +3426,7 @@ pub fn restore_with(
         report.files_missing += outcome.files_missing;
         report.files_linked += outcome.files_linked;
         report.files_copied += outcome.files_copied;
-        report.bytes += outcome.bytes;
+        report.bytes = report.bytes.saturating_add(outcome.bytes);
         report.errors += outcome.errors;
         report.fatal_errors += outcome.fatal_errors;
         if outcome.touched {
@@ -3434,7 +3535,7 @@ fn restore_unit(
             } else {
                 out.files_copied += 1;
             }
-            out.bytes += file.size;
+            out.bytes = out.bytes.saturating_add(file.size);
             continue;
         }
         // The Windows restore path is path-based, so create and hold every
@@ -3466,12 +3567,12 @@ fn restore_unit(
                 Ok(RestoreOutcome::Missing) => out.files_missing += 1,
                 Ok(RestoreOutcome::Copied) => {
                     out.files_copied += 1;
-                    out.bytes += file.size;
+                    out.bytes = out.bytes.saturating_add(file.size);
                     out.touched = true;
                 }
                 Ok(RestoreOutcome::Linked) => {
                     out.files_linked += 1;
-                    out.bytes += file.size;
+                    out.bytes = out.bytes.saturating_add(file.size);
                     out.touched = true;
                 }
                 Err(err) => {
@@ -3511,12 +3612,12 @@ fn restore_unit(
                 }
                 Ok(RestoreOutcome::Linked) => {
                     out.files_linked += 1;
-                    out.bytes += file.size;
+                    out.bytes = out.bytes.saturating_add(file.size);
                     out.touched = true;
                 }
                 Ok(RestoreOutcome::Copied) => {
                     out.files_copied += 1;
-                    out.bytes += file.size;
+                    out.bytes = out.bytes.saturating_add(file.size);
                     out.touched = true;
                 }
                 Err(err) => {
@@ -3567,7 +3668,7 @@ fn restore_unit(
                     } else {
                         out.files_copied += 1;
                     }
-                    out.bytes += file.size;
+                    out.bytes = out.bytes.saturating_add(file.size);
                     out.touched = true;
                 }
                 Err(err) => {
@@ -3833,6 +3934,7 @@ impl VerifyReport {
 /// hash content; plus a count of unit groups the manifest doesn't know.
 pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
     let mut reports = Vec::new();
+    let mut budget = util::ScanBudget::new("verify");
     for parity in generation_names(store_root)? {
         let mut report = VerifyReport {
             parity: parity.clone(),
@@ -3880,8 +3982,8 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                             continue;
                         }
                     }
-                    report.files += 1;
-                    report.bytes += file.size;
+                    report.files = report.files.saturating_add(1);
+                    report.bytes = report.bytes.saturating_add(file.size);
                     match util::decompress_file_hashed(&blob, !read_only, file.size) {
                         Ok((size, hash)) if size == file.size && hash == file.sha256 => {}
                         Ok((size, hash)) => report.problems.push(format!(
@@ -3935,8 +4037,8 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
                         display_join(&path, &units)
                     ));
                 }
-                report.files += 1;
-                report.bytes += meta.len();
+                report.files = report.files.saturating_add(1);
+                report.bytes = report.bytes.saturating_add(meta.len());
                 if meta.len() != file.size {
                     report.problems.push(format!(
                         "size drift: {} (recorded {}, found {})",
@@ -4013,23 +4115,29 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
             let unit_dir = units.join(&entry.name);
             let expected: std::collections::BTreeSet<String> =
                 entry.files.iter().map(|file| file.path.clone()).collect();
-            let walk = match WalkDir::new(&unit_dir)
+            let walk = WalkDir::new(&unit_dir)
                 .min_depth(1)
+                .max_depth(util::MAX_SCAN_DEPTH)
                 .follow_links(false)
                 .follow_root_links(false)
                 .into_iter()
-                .filter_entry(|entry| util::walk_entry_is_safe(&unit_dir, entry))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(walk) => walk,
-                Err(err) => {
+                .filter_entry(|entry| util::walk_entry_is_safe(&unit_dir, entry));
+            for file in walk {
+                if budget.spend().is_err() {
                     report
                         .problems
-                        .push(format!("unreadable unit dir: units/{} ({err})", entry.name));
-                    continue;
+                        .push("scan budget exceeded — extra-file audit truncated".to_string());
+                    break;
                 }
-            };
-            for file in walk {
+                let file = match file {
+                    Ok(file) => file,
+                    Err(err) => {
+                        report
+                            .problems
+                            .push(format!("unreadable unit dir: units/{} ({err})", entry.name));
+                        continue;
+                    }
+                };
                 match metadata_nofollow(&file.path()) {
                     Ok(meta) if !meta.is_file() => continue,
                     Ok(_) => (),
@@ -4183,8 +4291,11 @@ pub fn overlap(store_root: &Path) -> Result<Vec<OverlapPackage>> {
                 .unwrap_or(unit.name.as_str())
                 .to_string();
             let entry = pools.entry((package, unit.profile.clone())).or_default();
-            entry.0 += 1;
-            entry.1 += unit.files.iter().map(|file| file.size).sum::<u64>();
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = unit
+                .files
+                .iter()
+                .fold(entry.1, |total, file| total.saturating_add(file.size));
             entry.2.insert(generation.clone());
             entry.3.insert(unit.hash.clone());
         }
@@ -4230,6 +4341,9 @@ pub struct GenerationInfo {
 
 /// Summarize every generation of the vault.
 pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
     let active = parity_key().ok();
     let mut out = Vec::new();
     let mut scanned = 0u64;
@@ -4245,11 +4359,12 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
             info.updated = Some(manifest.updated);
         }
         let units = units_dir(store_root, &parity);
-        if metadata_nofollow(&units).is_ok() && units.is_dir() {
+        if !util::has_reparse_component(store_root, &units) && units.is_dir() {
             #[cfg(any(unix, windows))]
             let mut seen_inodes = std::collections::HashSet::new();
             let walker = WalkDir::new(&units)
                 .min_depth(1)
+                .max_depth(util::MAX_SCAN_DEPTH)
                 .follow_links(false)
                 .follow_root_links(false)
                 .into_iter()
@@ -4257,11 +4372,11 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
             for entry in walker {
                 let entry = entry?;
                 scanned = scanned.saturating_add(1);
-                if scanned > MAX_SCAN_FILES {
+                if scanned > util::MAX_SCAN_FILES {
                     anyhow::bail!(
                         "store {} has more than {} files — refusing an unbounded scan",
                         store_root.display(),
-                        MAX_SCAN_FILES
+                        util::MAX_SCAN_FILES
                     );
                 }
                 if !entry.file_type().is_file() {
@@ -4279,9 +4394,9 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
                     .unwrap_or(true);
                 #[cfg(not(any(unix, windows)))]
                 let unique = true;
-                info.files += 1;
+                info.files = info.files.saturating_add(1);
                 if unique {
-                    info.bytes += meta.len();
+                    info.bytes = info.bytes.saturating_add(meta.len());
                 }
                 if link_count(entry.path(), &meta) > 1 {
                     info.linked += 1;
@@ -6201,6 +6316,94 @@ mod tests {
             .find(|entry| entry.name == "serde-102a33f055a8d229")
             .expect("serde unit stored");
         assert_eq!(entry.version.as_deref(), Some("1.0.219"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> Result<()> {
+        let script = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' -ErrorAction Stop | Out-Null",
+            link.display(),
+            target.display()
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("mklink /J failed for {}", link.display());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_root_junction_is_rejected_by_read_paths() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let base = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        harvest(build.path(), store.path(), None, false)?;
+
+        let link = base.path().join("store-link");
+        make_junction(&link, store.path())?;
+        let names = generation_names(&link);
+        let units = stored_units(&link);
+        let generations = generations(&link);
+        let verify = verify(&link);
+        fs::remove_dir(&link)?;
+
+        assert!(
+            names.is_err(),
+            "generation_names must reject a store-root junction"
+        );
+        assert!(
+            units.is_err(),
+            "stored_units must reject a store-root junction"
+        );
+        assert!(
+            generations.is_err(),
+            "generations must reject a store-root junction"
+        );
+        assert!(verify.is_err(), "verify must reject a store-root junction");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn units_junction_is_rejected_by_stored_units() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        harvest(build.path(), store.path(), None, false)?;
+        let generation = generation_names(store.path())?.remove(0);
+        let units = units_dir(store.path(), &generation);
+        let victim = tempfile::tempdir()?;
+        let units_real = store.path().join("units.real");
+        fs::rename(&units, &units_real)?;
+        make_junction(&units, victim.path())?;
+        let result = stored_units(store.path());
+        fs::remove_dir(&units)?;
+        assert!(result.is_err(), "stored_units must reject a units junction");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unit_junction_is_rejected_by_stored_units() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        harvest(build.path(), store.path(), None, false)?;
+        let unit = stored_units(store.path())?.remove(0);
+        let stored_dir = unit.dir.clone();
+        let unit_real = store.path().join("unit.real");
+        fs::rename(&stored_dir, &unit_real)?;
+        let victim = tempfile::tempdir()?;
+        make_junction(&stored_dir, victim.path())?;
+        let result = stored_units(store.path());
+        fs::remove_dir(&stored_dir)?;
+        assert!(result.is_err(), "stored_units must reject a unit junction");
         Ok(())
     }
 

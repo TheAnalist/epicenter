@@ -173,13 +173,16 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
 /// Walk `root` and group every file into units.
 pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+    let mut budget = util::ScanBudget::new("prune");
     let walker = WalkDir::new(root)
         .min_depth(1)
+        .max_depth(util::MAX_SCAN_DEPTH)
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
         .filter_entry(|entry| util::walk_entry_is_safe(root, entry));
     for entry in walker {
+        budget.spend()?;
         // Unreadable entries are skipped rather than failing the whole scan.
         let entry = match entry {
             Ok(e) => e,
@@ -229,7 +232,7 @@ pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
             incremental,
         });
         group.incremental |= incremental;
-        group.bytes += meta.len();
+        group.bytes = group.bytes.saturating_add(meta.len());
         group.files.push(entry.into_path());
         if let Ok(mtime) = meta.modified() {
             if group.newest.map_or(false, |n| mtime > n) || group.newest.is_none() {

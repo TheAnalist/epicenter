@@ -1831,6 +1831,67 @@ fn check_parent_components(root: &Path, rel: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn open_delete_dir_handle(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening directory handle {}", path.display()))?;
+    let meta = file.metadata()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
+        anyhow::bail!("{} is not a real directory", path.display());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn mark_delete_on_close(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("marking entry for deletion");
+    }
+    Ok(())
+}
+
+/// Remove a non-directory entry through a held handle. The handle pins the
+/// exact object, so a rename/replacement after the type check cannot redirect
+/// the delete to another file. `FILE_FLAG_OPEN_REPARSE_POINT` makes a junction
+/// or symlink delete the link itself, never its target.
+#[cfg(windows)]
+fn remove_entry_by_handle(target: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)
+        .with_context(|| format!("opening {}", target.display()))?;
+    let meta = file.metadata()?;
+    if meta.is_dir() && !meta.file_type().is_symlink() && !is_reparse_point(&meta) {
+        anyhow::bail!("{} changed to a real directory", target.display());
+    }
+    mark_delete_on_close(&file)
+}
+
 #[cfg(not(unix))]
 fn remove_tree_path(target: &Path) -> Result<()> {
     let meta = match std::fs::symlink_metadata(target) {
@@ -1839,19 +1900,50 @@ fn remove_tree_path(target: &Path) -> Result<()> {
         Err(err) => return Err(err).with_context(|| format!("inspecting {}", target.display())),
     };
     if meta.is_dir() && !meta.file_type().is_symlink() && !is_reparse_point(&meta) {
-        for entry in
-            std::fs::read_dir(target).with_context(|| format!("reading {}", target.display()))?
-        {
-            let entry = entry?;
+        #[cfg(windows)]
+        let guard = match open_delete_dir_handle(target) {
+            Ok(guard) => guard,
+            Err(err) => {
+                // The name changed type after the lookup. Remove the exact
+                // replacement entry (a link/file) by handle; a new real
+                // directory is refused by remove_entry_by_handle.
+                return remove_entry_by_handle(target).with_context(|| {
+                    format!(
+                        "removing {} after it changed type: {err:#}",
+                        target.display()
+                    )
+                });
+            }
+        };
+        // `read_dir` is path-based, but `guard` prevents this directory from
+        // being renamed/replaced while its entries are enumerated.
+        let entries: Vec<_> = std::fs::read_dir(target)
+            .with_context(|| format!("reading {}", target.display()))?
+            .collect::<std::io::Result<_>>()?;
+        for entry in entries {
             remove_tree_path(&entry.path())?;
         }
-        std::fs::remove_dir(target).with_context(|| format!("removing {}", target.display()))?;
-    } else if meta.is_dir() {
-        // A junction/reparse directory: remove the entry itself, never its
-        // target.
+        #[cfg(windows)]
+        {
+            // Delete through the same pinned handle, not by path: a swap after
+            // enumeration cannot redirect the final remove.
+            mark_delete_on_close(&guard)?;
+        }
+        #[cfg(not(windows))]
         std::fs::remove_dir(target).with_context(|| format!("removing {}", target.display()))?;
     } else {
-        std::fs::remove_file(target).with_context(|| format!("removing {}", target.display()))?;
+        // Junction/reparse directory, symlink, or regular file: a handle pins
+        // the entry and `FILE_FLAG_OPEN_REPARSE_POINT` keeps links as links.
+        #[cfg(windows)]
+        remove_entry_by_handle(target).with_context(|| format!("removing {}", target.display()))?;
+        #[cfg(not(windows))]
+        if meta.is_dir() {
+            std::fs::remove_dir(target)
+                .with_context(|| format!("removing {}", target.display()))?;
+        } else {
+            std::fs::remove_file(target)
+                .with_context(|| format!("removing {}", target.display()))?;
+        }
     }
     Ok(())
 }
@@ -2115,6 +2207,16 @@ pub fn read_small_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
 /// descriptor, so a symlink/file swap between a path check and this read
 /// cannot redirect the trust anchor.
 pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    read_trusted_text(path, max_bytes, false)
+}
+
+/// Read a private secret file: no-follow, regular-file-only, owner-only
+/// (`0600` on Unix, private DACL on Windows), and bounded in size.
+pub fn read_private_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    read_trusted_text(path, max_bytes, true)
+}
+
+fn read_trusted_text(path: &Path, max_bytes: u64, private: bool) -> std::io::Result<String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2141,10 +2243,15 @@ pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<Strin
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if meta.mode() & 0o022 != 0 {
+        let mask = if private { 0o077 } else { 0o022 };
+        if meta.mode() & mask != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "config file is group/world-writable",
+                if private {
+                    "private file is accessible by other users"
+                } else {
+                    "config file is group/world-writable"
+                },
             ));
         }
     }
@@ -2351,6 +2458,61 @@ fn copy_file_hashed_mode(src: &Path, dst: &Path, require_owner: bool) -> Result<
 /// Upper bound for one stored artifact. This is a disk-fill guard, not a
 /// performance target: rustc artifacts are normally far smaller.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Bound one tree scan so a hostile tree cannot burn CPU/IO indefinitely.
+pub(crate) const MAX_SCAN_FILES: u64 = 2_000_000;
+
+/// Bound the depth of a recursive scan; deeper trees are truncated.
+pub(crate) const MAX_SCAN_DEPTH: usize = 64;
+
+/// A shared entry budget for a tree walk. `spend` is for fallible scans that
+/// should report the hostile tree; `take` is for infallible summaries that
+/// truncate instead (a partial listing is safer than unbounded work).
+pub(crate) struct ScanBudget {
+    remaining: u64,
+    limit: u64,
+    what: &'static str,
+}
+
+impl ScanBudget {
+    pub(crate) fn new(what: &'static str) -> Self {
+        Self {
+            remaining: MAX_SCAN_FILES,
+            limit: MAX_SCAN_FILES,
+            what,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limit(limit: u64, what: &'static str) -> Self {
+        Self {
+            remaining: limit,
+            limit,
+            what,
+        }
+    }
+
+    pub(crate) fn spend(&mut self) -> Result<()> {
+        if self.take() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "{} scan exceeded {} entries — refusing a hostile tree",
+                self.what,
+                self.limit
+            )
+        }
+    }
+
+    pub(crate) fn take(&mut self) -> bool {
+        if self.remaining == 0 {
+            false
+        } else {
+            self.remaining -= 1;
+            true
+        }
+    }
+}
 
 /// Files below this size are stored raw; gzip headers would erase the win.
 pub(crate) const COMPRESS_MIN_BYTES: u64 = 4 * 1024;
@@ -2736,12 +2898,12 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
         let mut nominal = 0u64;
         let mut freed = 0u64;
         for (size, links, planned) in per_inode.values() {
-            nominal += size;
+            nominal = nominal.saturating_add(*size);
             if planned >= links {
-                freed += size;
+                freed = freed.saturating_add(*size);
             }
         }
-        (nominal, freed, nominal - freed, count)
+        (nominal, freed, nominal.saturating_sub(freed), count)
     }
     #[cfg(windows)]
     {
@@ -2772,12 +2934,12 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
         let mut nominal = 0u64;
         let mut freed = 0u64;
         for (size, links, planned) in per_inode.values() {
-            nominal += size;
+            nominal = nominal.saturating_add(*size);
             if planned >= links {
-                freed += size;
+                freed = freed.saturating_add(*size);
             }
         }
-        (nominal, freed, nominal - freed, count)
+        (nominal, freed, nominal.saturating_sub(freed), count)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2789,8 +2951,8 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
                 continue;
             }
             if let Ok(meta) = fs::metadata(path) {
-                nominal += meta.len();
-                count += 1;
+                nominal = nominal.saturating_add(meta.len());
+                count = count.saturating_add(1);
             }
         }
         (nominal, nominal, 0, count)
@@ -2999,7 +3161,7 @@ fn windows_no_reparse(options: &mut OpenOptions) {
 }
 
 /// Open an existing lock file without following a symlink/reparse point.
-fn open_lock_file(path: &Path) -> Result<File> {
+pub(crate) fn open_lock_file(path: &Path) -> Result<File> {
     let mut create = OpenOptions::new();
     create.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -3058,10 +3220,18 @@ impl FileLock {
             create_private_dir_all(parent)?;
         }
         let file = open_lock_file(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { file })),
-            // Contention (or an unsupported lock): fail closed as "in use".
-            Err(_) => Ok(None),
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { file })),
+                // A signal from an unrelated child can interrupt the syscall.
+                Err(std::fs::TryLockError::Error(err))
+                    if err.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                // Contention (or an unsupported lock): fail closed as "in use".
+                Err(_) => return Ok(None),
+            }
         }
     }
 }
@@ -3226,6 +3396,17 @@ mod tests {
     }
 
     #[test]
+    fn scan_budget_stops_at_the_limit() {
+        let mut budget = ScanBudget::with_limit(2, "test");
+        assert!(budget.take());
+        assert!(budget.take());
+        assert!(!budget.take(), "the budget is exhausted");
+        let mut budget = ScanBudget::with_limit(1, "test");
+        assert!(budget.spend().is_ok());
+        assert!(budget.spend().is_err(), "fallible scans report the limit");
+    }
+
+    #[test]
     fn concurrent_dir_chain_creation_accepts_already_exists() {
         let root = tempfile::tempdir().unwrap();
         let mut handles = Vec::new();
@@ -3376,6 +3557,72 @@ mod tests {
         assert!(!empty.exists());
         assert!(remove_empty_dir(root.path(), &full).is_err());
         assert!(full.join("keep").exists());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> Result<()> {
+        let script = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' -ErrorAction Stop | Out-Null",
+            link.display(),
+            target.display()
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("mklink /J failed for {}", link.display());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_tree_deletes_a_regular_tree_on_windows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let unit = root.path().join("unit");
+        fs::create_dir_all(unit.join("sub"))?;
+        fs::write(unit.join("sub/file"), b"x")?;
+        remove_tree(root.path(), &unit)?;
+        assert!(!unit.exists(), "the whole tree is gone");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_tree_unlinks_a_nested_junction_without_following_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        let unit = root.path().join("unit");
+        fs::create_dir_all(&unit)?;
+        fs::write(victim.path().join("keep"), b"keep")?;
+        make_junction(&unit.join("sub"), victim.path())?;
+
+        remove_tree(root.path(), &unit)?;
+        assert!(!unit.exists(), "the unit tree is gone");
+        assert!(
+            victim.path().join("keep").exists(),
+            "the junction target must survive"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_dir_handle_pins_the_directory_against_rename() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("pinned");
+        fs::create_dir(&dir)?;
+        let guard = open_delete_dir_handle(&dir)?;
+        let renamed = root.path().join("renamed");
+        assert!(
+            fs::rename(&dir, &renamed).is_err(),
+            "a no-delete-share handle must block rename"
+        );
+        drop(guard);
+        assert!(dir.is_dir());
+        remove_tree(root.path(), &dir)?;
         Ok(())
     }
 

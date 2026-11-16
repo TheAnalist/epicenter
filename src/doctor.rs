@@ -810,15 +810,17 @@ fn check_incremental_state(root: &Path, rows: &[(Unit, ArtifactInfo)]) -> Vec<Ch
 }
 
 fn directory_bytes(root: &Path) -> u64 {
+    let mut budget = crate::util::ScanBudget::new("doctor");
     WalkDir::new(root)
+        .max_depth(crate::util::MAX_SCAN_DEPTH)
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
         .filter_map(|entry| entry.ok())
+        .take_while(|_| budget.take())
         .filter_map(|entry| entry.metadata().ok())
         .filter(|meta| meta.is_file())
-        .map(|meta| meta.len())
-        .sum()
+        .fold(0u64, |total, meta| total.saturating_add(meta.len()))
 }
 
 /// Mtime discipline across the unit graph: cargo re-runs a unit when a

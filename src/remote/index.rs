@@ -25,6 +25,7 @@ const SIGNING_DOMAIN: &[u8] = b"epicenter.remote.index.v1\0";
 const EXECUTABLE_EXTENSIONS: [&str; 6] = ["exe", "dll", "dylib", "so", "dSYM", "efi"];
 const MAX_REMOTE_PATH_BYTES: usize = 4096;
 const MAX_SOURCE_ID_BYTES: usize = 4096;
+const MAX_PACKAGE_VERSION_BYTES: usize = 128;
 pub(crate) const MAX_TOOL_BYTES: usize = 256;
 pub(crate) const MAX_COMMIT_BYTES: usize = 256;
 pub(crate) const MAX_CI_JOB_BYTES: usize = 4096;
@@ -64,8 +65,19 @@ impl IndexPointer {
     /// match the pinned key: rotation happens only through the trusted
     /// CI/admin channel.
     pub fn verify(&self, pinned_public_key: &str, now: u64) -> Result<()> {
+        self.verify_signature(pinned_public_key)?;
+        self.validate_time(now)
+    }
+
+    /// Verify the pinned key id and signature without applying the expiry
+    /// window. A publisher needs this to read the last sequence from an index
+    /// that has expired; readers still use [`IndexPointer::verify`].
+    pub fn verify_signature(&self, pinned_public_key: &str) -> Result<()> {
         self.validate_shape()?;
-        self.validate_time(now)?;
+        ensure!(
+            !self.signature.is_empty(),
+            "remote index pointer is not signed"
+        );
         let pinned = settings::normalize_remote_publisher_key(pinned_public_key)?;
         let expected = settings::remote_key_id(&pinned)?;
         ensure!(
@@ -369,6 +381,10 @@ pub struct RemoteUnit {
     /// `<package>-<16hex>`, exactly the Cargo fingerprint dir name.
     pub name: String,
     pub package: String,
+    /// Package version recorded by Cargo's dep-info, when known. It is
+    /// diagnostic only: Cargo's memo hash remains the authoritative key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub profile: String,
     /// Memo file name, e.g. `lib-serde`.
     pub memo: String,
@@ -397,6 +413,9 @@ impl RemoteUnit {
     fn validate(&self) -> Result<()> {
         super::validate::component(&self.name, "remote unit name")?;
         super::validate::component(&self.package, "remote package")?;
+        if let Some(version) = &self.version {
+            super::validate::text(version, "remote package version", MAX_PACKAGE_VERSION_BYTES)?;
+        }
         super::validate::component(&self.profile, "remote profile")?;
         super::validate::component(&self.memo, "remote memo file")?;
         let (package, suffix) = self

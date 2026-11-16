@@ -12,7 +12,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use epicenter_cli::util::metadata_nofollow;
-use epicenter_cli::{config, doctor, exec, paths, profile, prune, settings, status, util, vault};
+use epicenter_cli::{
+    config, doctor, exec, paths, profile, prune, remote, settings, status, util, vault,
+};
 
 #[derive(Parser)]
 #[command(
@@ -319,6 +321,58 @@ struct HarvestArgs {
 }
 
 #[derive(clap::Args)]
+struct PublishArgs {
+    /// Override the configured remote URL. Must be `s3://bucket/prefix`.
+    #[arg(long)]
+    url: Option<String>,
+    /// Reader-facing URL for the printed setup handoff (defaults to --url).
+    #[arg(long)]
+    reader_url: Option<String>,
+    /// Publish tier; `libraries` excludes executable units.
+    #[arg(long, value_enum)]
+    tier: Option<RemoteTierArg>,
+    /// Generation directory in the store (default: the active parity key).
+    #[arg(long)]
+    generation: Option<String>,
+    /// Publish only this profile when a store generation has several.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Rustup selector used for the build (`nightly`, `1.91.0`, ...).
+    #[arg(long)]
+    toolchain: Option<String>,
+    /// Explicit index sequence (must advance past the staged index).
+    #[arg(long)]
+    sequence: Option<u64>,
+    /// Index lifetime, e.g. 30d.
+    #[arg(long, default_value = "30d")]
+    valid_for: String,
+    /// Source commit recorded in publisher.json; detected from CI/git if absent.
+    #[arg(long)]
+    source_commit: Option<String>,
+    /// CI job identifier recorded in publisher.json.
+    #[arg(long)]
+    ci_job: Option<String>,
+    /// Free-form publisher note; never put credentials here.
+    #[arg(long)]
+    notes: Option<String>,
+    /// Pin expected publisher key id (or 64-hex public key).
+    #[arg(long)]
+    expect_key_id: Option<String>,
+    /// Rotate the publisher identity and print the new pin.
+    #[arg(long)]
+    rotate_key: bool,
+    /// Persistent directory holding the publisher identity.
+    #[arg(long)]
+    publisher_state: Option<PathBuf>,
+    /// Staging directory; defaults to the state directory.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+    /// Path to Cargo.lock (default: nearest lock above the working directory).
+    #[arg(long)]
+    lockfile: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
 struct RestoreArgs {
     /// Working dir to fill (default: the shared build dir).
     #[arg(long)]
@@ -445,6 +499,9 @@ enum StoreCommand {
     Restore(RestoreArgs),
     /// Report package/profile variants that occupy the vault repeatedly.
     Overlap(OverlapArgs),
+    /// CI-only: sign a local index and stage the immutable object tree.
+    #[command(hide = true)]
+    Publish(PublishArgs),
 }
 
 fn main() {
@@ -564,7 +621,179 @@ fn cmd_store(command: StoreCommand, settings: &settings::Settings) -> Result<()>
             )
         }
         StoreCommand::Overlap(args) => cmd_overlap(&args),
+        StoreCommand::Publish(args) => cmd_publish(&args, settings),
     }
+}
+
+fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> {
+    let policy = settings.remote()?;
+    let tier = args.tier.map(Into::into).unwrap_or(policy.tier);
+    let url = match args.url.as_deref() {
+        Some(raw) => settings::normalize_remote_url(raw)?,
+        None => policy
+            .url
+            .clone()
+            .context("no `[remote] url`; pass `--url s3://bucket/prefix`")?,
+    };
+    let expected_key_id = match args.expect_key_id.as_deref() {
+        Some(raw) if raw.contains(':') => Some(raw.to_string()),
+        Some(raw) => {
+            let key = settings::normalize_remote_publisher_key(raw)?;
+            Some(settings::remote_key_id(&key)?)
+        }
+        // A rotation deliberately changes the pinned identity; do not treat
+        // the old global pin as an expectation for the new key.
+        None if args.rotate_key => None,
+        None => policy.key_id.clone(),
+    };
+    let valid_for = util::parse_duration(&args.valid_for)?;
+    let source_commit = detect_source_commit(args.source_commit.as_deref())?;
+    let ci_job = detect_ci_job(args.ci_job.as_deref());
+    let build_root = config::cache_root()?;
+    let store_root = vault::store_root(&build_root);
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+
+    let outcome = remote::publish(&remote::PublishRequest {
+        store_root: &store_root,
+        cwd: &cwd,
+        url: &url,
+        tier,
+        generation: args.generation.as_deref(),
+        profile: args.profile.as_deref(),
+        selector: args.toolchain.as_deref(),
+        sequence: args.sequence,
+        current_pointer: None,
+        valid_for,
+        source_commit: &source_commit,
+        ci_job: &ci_job,
+        notes: args.notes.as_deref().unwrap_or_default(),
+        expect_key_id: expected_key_id.as_deref(),
+        rotate_key: args.rotate_key,
+        publisher_state: args.publisher_state.as_deref(),
+        out_dir: args.out_dir.as_deref(),
+        lockfile: args.lockfile.as_deref(),
+    })?;
+
+    let heading = if args.rotate_key {
+        "epicenter store publish — CI publisher (key rotation)"
+    } else {
+        "epicenter store publish — CI publisher"
+    };
+    println!("{}", util::heading(heading));
+    println!("  {} {}", label("endpoint"), outcome.url);
+    println!("  {} {}", label("tier"), outcome.tier.as_str());
+    println!("  {} {}", label("generation"), outcome.generation);
+    println!(
+        "  {} {} unit(s) · {} file(s) · {}",
+        label("staged"),
+        outcome.units,
+        outcome.files,
+        util::human_bytes(outcome.bytes)
+    );
+    if outcome.skipped_workspace > 0 || outcome.skipped_tier > 0 {
+        println!(
+            "  {} {} workspace/path · {} outside the tier",
+            label("skipped"),
+            outcome.skipped_workspace,
+            outcome.skipped_tier
+        );
+    }
+    println!(
+        "  {} sequence {} · {} blob(s) · {} upload(s)",
+        label("index"),
+        outcome.sequence,
+        outcome.blobs,
+        outcome.uploads.len()
+    );
+    println!("  {} expires {} (unix)", label("validity"), outcome.expires);
+    println!("  {} {}", label("key id"), outcome.key_id);
+    println!("  {} {}", label("public key"), outcome.public_key);
+    println!("  {} {}", label("staging"), outcome.out_dir.display());
+    println!(
+        "  {} {}",
+        label("identity"),
+        outcome.publisher_state.display()
+    );
+    if outcome.identity_created {
+        println!(
+            "  {} new publisher identity created; keep the publisher state directory private \
+             and persistent",
+            util::warn(util::GLYPH_WARN)
+        );
+    }
+    let reader_url = match args.reader_url.as_deref() {
+        Some(raw) => settings::normalize_remote_url(raw)?,
+        None => outcome.url.clone(),
+    };
+    println!();
+    println!("  {}", util::dim("handoff for readers:"));
+    println!(
+        "  epicenter setup --remote-url '{}' --remote-key '{}' --remote-tier {}",
+        reader_url,
+        outcome.public_key,
+        outcome.tier.as_str()
+    );
+    println!(
+        "  {}",
+        util::dim(
+            "upload `blobs/`, `indexes/`, `publisher.json`, then `index.json` last; \
+             the local staging tree is the upload plan"
+        )
+    );
+    Ok(())
+}
+
+fn detect_source_commit(explicit: Option<&str>) -> Result<String> {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(value.to_string());
+    }
+    for name in [
+        "EPICENTER_SOURCE_COMMIT",
+        "GITHUB_SHA",
+        "CI_COMMIT_SHA",
+        "CI_COMMIT_ID",
+        "BUILD_SOURCEVERSION",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    if let Ok(mut git) = util::command_for("git")
+        && let Ok(output) = git.args(["rev-parse", "HEAD"]).output()
+        && output.status.success()
+    {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    anyhow::bail!(
+        "publisher source commit is unknown; pass `--source-commit <sha>` or set \
+         GITHUB_SHA/CI_COMMIT_SHA"
+    )
+}
+
+fn detect_ci_job(explicit: Option<&str>) -> String {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    for name in [
+        "EPICENTER_CI_JOB",
+        "CI_JOB_URL",
+        "GITHUB_RUN_URL",
+        "BUILD_BUILDURI",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn cmd_evict(args: &EvictArgs) -> Result<()> {
@@ -658,6 +887,15 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         }
         _ => None,
     };
+    // Persist the resolved absolute path. Cargo resolves a bare name itself,
+    // and on Windows `CreateProcess` searches the current directory before
+    // PATH, so a repository-local `sccache.exe`/`kache.exe` would run.
+    let wrapper_value = match (&wrapper, &wrapper_path) {
+        (Some(config::WrapperAction::Set(_)), Some(path)) => {
+            Some(path.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
 
     let memory = args
         .memory
@@ -720,7 +958,15 @@ fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
         use_default: args.use_default,
         preset,
         linker,
-        wrapper,
+        wrapper: match wrapper {
+            Some(config::WrapperAction::Set(_)) => Some(config::WrapperAction::Set(
+                wrapper_value
+                    .as_deref()
+                    .expect("a Set wrapper has a resolved path"),
+            )),
+            Some(config::WrapperAction::Remove) => Some(config::WrapperAction::Remove),
+            None => None,
+        },
         memory,
         memory_text: args.memory.as_deref(),
         work_root_arg: args.work_root.as_deref(),
@@ -2109,5 +2355,39 @@ mod cli_tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("cannot be used with"), "{err}");
+    }
+
+    #[test]
+    fn publish_accepts_ci_flags() {
+        let cli = Cli::try_parse_from([
+            "epicenter",
+            "store",
+            "publish",
+            "--url",
+            "s3://bucket/prefix",
+            "--reader-url",
+            "https://cache.example/prefix",
+            "--tier",
+            "full",
+            "--profile",
+            "release",
+            "--toolchain",
+            "nightly",
+            "--valid-for",
+            "7d",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Store {
+                command: StoreCommand::Publish(args),
+            } => {
+                assert_eq!(args.url.as_deref(), Some("s3://bucket/prefix"));
+                assert!(matches!(args.tier, Some(RemoteTierArg::Full)));
+                assert_eq!(args.profile.as_deref(), Some("release"));
+                assert_eq!(args.toolchain.as_deref(), Some("nightly"));
+                assert_eq!(args.valid_for, "7d");
+            }
+            _ => panic!("expected store publish"),
+        }
     }
 }

@@ -15,10 +15,14 @@
 //! creation/expiry and signature. A body that does not hash to the committed
 //! value is never parsed. Readers persist the highest accepted sequence per
 //! endpoint/key and refuse rollbacks, equivocation and expired indexes.
+//!
+//! The CI-only publisher turns one vault generation into that tree under a
+//! private staging root; transport uploads are a separate layer.
 
 mod cas;
 mod compat;
 mod index;
+mod publish;
 mod state;
 pub(crate) mod validate;
 
@@ -38,6 +42,7 @@ pub use index::{
     RemoteUnitKind, SourceKind, UnitSource, VerifiedIndex, make_index, publisher_report,
     read_index_tree, verify_body, verify_index, write_index_tree,
 };
+pub use publish::{PublishOutcome, PublishRequest, publish};
 pub use state::{
     IndexStatus, RemoteState, clear_state, load_state, record_state, state_path, status,
 };

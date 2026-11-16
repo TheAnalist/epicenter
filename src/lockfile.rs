@@ -8,14 +8,29 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Result, bail, ensure};
+
 use crate::util;
 
 /// One `[[package]]` entry from a lock file.
 #[derive(Debug, Clone)]
 pub struct LockPackage {
     pub version: String,
-    /// Registry checksum or git URL+rev; empty for path packages.
+    /// Registry index or git URL+rev; empty for path packages.
     pub source: String,
+    /// Registry checksum; absent for git/path packages.
+    pub checksum: Option<String>,
+}
+
+/// A source resolved from `Cargo.lock` for one stored unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockSource {
+    /// A registry index and the crate checksum Cargo records.
+    Registry { index: String, checksum: String },
+    /// A git URL+revision, including Cargo's `git+` prefix.
+    Git { id: String },
+    /// A path/workspace package; never publishable remotely.
+    Path,
 }
 
 /// Package names and versions a project resolves to.
@@ -78,6 +93,11 @@ impl LockIndex {
                         .and_then(toml::Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    checksum: package
+                        .get("checksum")
+                        .and_then(toml::Value::as_str)
+                        .filter(|checksum| !checksum.is_empty())
+                        .map(str::to_string),
                 });
         }
         (!packages.is_empty()).then_some(Self { packages })
@@ -101,6 +121,60 @@ impl LockIndex {
             None => true,
             Some(wanted) => packages.iter().any(|package| package.version == wanted),
         }
+    }
+
+    /// Resolve one publishable source. `Ok(None)` means the package is not in
+    /// the lock (a workspace member that was not resolved as a dependency).
+    ///
+    /// Ambiguity is an error: two named packages at the same version with
+    /// different sources cannot be mapped to one stored unit.
+    pub fn resolve(&self, name: &str, version: Option<&str>) -> Result<Option<LockSource>> {
+        let Some(packages) = self.packages.get(name) else {
+            return Ok(None);
+        };
+        let candidates: Vec<&LockPackage> = packages
+            .iter()
+            .filter(|package| version.is_none_or(|wanted| package.version == wanted))
+            .collect();
+        let Some(first) = candidates.first() else {
+            return Ok(None);
+        };
+        ensure!(
+            candidates
+                .iter()
+                .all(|package| package.source == first.source && package.checksum == first.checksum),
+            "Cargo.lock resolves {name} {:?} to multiple sources; refusing an ambiguous remote unit",
+            version.unwrap_or("<unrecorded>")
+        );
+        if first.source.is_empty() {
+            return Ok(Some(LockSource::Path));
+        }
+        if let Some(index) = first
+            .source
+            .strip_prefix("registry+")
+            .or_else(|| first.source.strip_prefix("sparse+"))
+        {
+            let checksum = first.checksum.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("Cargo.lock has no checksum for registry package {name}")
+            })?;
+            ensure!(
+                checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "Cargo.lock checksum for {name} is not 64 hex characters"
+            );
+            return Ok(Some(LockSource::Registry {
+                index: index.to_string(),
+                checksum: checksum.to_ascii_lowercase(),
+            }));
+        }
+        if first.source.starts_with("git+") {
+            return Ok(Some(LockSource::Git {
+                id: first.source.clone(),
+            }));
+        }
+        bail!(
+            "Cargo.lock source {:?} for {name} is not a registry, git or path source",
+            first.source
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -162,6 +236,60 @@ mod tests {
             .expect("lock parses");
         assert!(index.matches("serde", None));
         assert!(!index.matches("other", None));
+    }
+
+    #[test]
+    fn resolves_registry_git_and_path_sources() {
+        let index = lock(
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB\"\n\n\
+             [[package]]\nname = \"gitdep\"\nversion = \"0.1.0\"\n\
+             source = \"git+https://github.com/example/gitdep?rev=abc#deadbeef\"\n\n\
+             [[package]]\nname = \"local\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("lock parses");
+        assert_eq!(
+            index.resolve("serde", Some("1.0.219")).unwrap(),
+            Some(LockSource::Registry {
+                index: "https://github.com/rust-lang/crates.io-index".to_string(),
+                checksum: "ab".repeat(32),
+            })
+        );
+        assert_eq!(
+            index.resolve("gitdep", Some("0.1.0")).unwrap(),
+            Some(LockSource::Git {
+                id: "git+https://github.com/example/gitdep?rev=abc#deadbeef".to_string(),
+            })
+        );
+        assert_eq!(
+            index.resolve("local", Some("0.1.0")).unwrap(),
+            Some(LockSource::Path)
+        );
+        assert!(index.resolve("missing", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn registry_checksum_is_required() {
+        let index = lock(
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        )
+        .expect("lock parses");
+        assert!(index.resolve("serde", Some("1.0.219")).is_err());
+    }
+
+    #[test]
+    fn ambiguous_sources_are_refused() {
+        let index = lock(
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"registry+https://one.example/index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"git+https://example/git?rev=abc\"\n",
+        )
+        .expect("lock parses");
+        assert!(index.resolve("serde", Some("1.0.219")).is_err());
     }
 
     #[test]
