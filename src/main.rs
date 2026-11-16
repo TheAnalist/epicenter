@@ -1602,7 +1602,7 @@ fn cmd_restore(
     // ensure view dir is not a symlink/reparse point
     metadata_nofollow(&view)?;
     if into.is_none() && root.is_dir() {
-        util::ensure_private_dir(&root)?;
+        util::check_private_dir(&root, util::Privacy::Repair)?;
     }
     if dry_run {
         println!(

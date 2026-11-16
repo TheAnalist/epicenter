@@ -453,7 +453,7 @@ fn ensure_store_root(store_root: &Path) -> Result<()> {
                     store_root.display()
                 );
             }
-            util::ensure_private_dir(store_root)?;
+            util::check_private_dir(store_root, util::Privacy::Repair)?;
         }
         Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
             anyhow::bail!(
@@ -1086,6 +1086,32 @@ fn load_manifest_at(store_root: &Path, parity: &str, repair: bool) -> Result<Opt
                 meta.mode() & 0o777
             );
         }
+    }
+    // A private store root is not enough: a generation (or its manifest) can
+    // carry a child ACL that grants another principal write access. Check the
+    // generation before trusting any of its entries. A read-only foreign store
+    // is verified by the manifest signature instead.
+    #[cfg(windows)]
+    if !read_only {
+        let generation = store_root.join(parity);
+        match util::metadata_nofollow(&generation) {
+            Ok(meta) if meta.is_dir() => require_private_windows_acl(&generation, "generation")?,
+            Ok(_) => anyhow::bail!(
+                "generation {} is not a real directory",
+                generation.display()
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                anyhow::bail!(
+                    "generation {} is a symlink/reparse point",
+                    generation.display()
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", generation.display()));
+            }
+        }
+        require_private_windows_acl(&path, "manifest")?;
     }
     let text = if read_only {
         crate::util::read_small_text(&path, 16 * 1024 * 1024)
@@ -2746,6 +2772,16 @@ fn restore_file_at(
             src.display()
         );
     }
+    // A writable store file must not be writable by another principal, even
+    // when the unit group is private (an inherited ACE can outlive the group
+    // fix). A read-only foreign store is signature-verified instead.
+    #[cfg(windows)]
+    if !link.read_only && util::windows_acl_is_private(src) != Some(true) {
+        anyhow::bail!(
+            "stored file {} DACL grants write access to another principal",
+            src.display()
+        );
+    }
     if meta.len() != file.size {
         anyhow::bail!(
             "stored file {} size drift (recorded {}, found {})",
@@ -3333,6 +3369,19 @@ fn restore_unit(
 ) -> RestoreUnitResult {
     let mut out = RestoreUnitResult::default();
 
+    // A writable store's unit group must be owner-only too: a private root with
+    // a permissive child would let another principal replace the artifacts the
+    // manifest is about to install. A read-only foreign store is signature-
+    // verified instead.
+    #[cfg(windows)]
+    if !link.read_only {
+        if let Err(err) = require_private_windows_acl(&units.join(&entry.name), "unit group") {
+            out.fatal_errors += 1;
+            out.messages.push(format!("restore: {err:#}"));
+            return out;
+        }
+    }
+
     for file in &entry.files {
         if let Some(owners) = owners {
             if owners
@@ -3555,11 +3604,20 @@ fn authorize_harvest(build_root: &Path, trust: HarvestTrust<'_>) -> Result<()> {
         );
     }
     if let Some(token) = crate::exec::job_marker_token(build_root)? {
-        if crate::exec::record_covers(build_root, &token)?.is_none() {
-            anyhow::bail!(
-                "job dir {} has no epicenter exec record on this host — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
+        match crate::exec::record_covers(build_root, &token)? {
+            crate::exec::RecordCoverage::Matching => {}
+            crate::exec::RecordCoverage::Absent => anyhow::bail!(
+                "job dir {} has no exec record on this host — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
                 build_root.display()
-            );
+            ),
+            crate::exec::RecordCoverage::Mismatch => anyhow::bail!(
+                "job dir {} has an exec record for a different build (token or path mismatch) — refusing to sign it",
+                build_root.display()
+            ),
+            crate::exec::RecordCoverage::Untrusted => anyhow::bail!(
+                "job dir {} has an exec record this host does not trust (symlink, foreign owner, or permissive mode) — refusing to sign it",
+                build_root.display()
+            ),
         }
     }
     Ok(())
@@ -4188,7 +4246,7 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
         }
         let units = units_dir(store_root, &parity);
         if metadata_nofollow(&units).is_ok() && units.is_dir() {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             let mut seen_inodes = std::collections::HashSet::new();
             let walker = WalkDir::new(&units)
                 .min_depth(1)
@@ -4215,13 +4273,17 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
                     use std::os::unix::fs::MetadataExt;
                     seen_inodes.insert((meta.dev(), meta.ino()))
                 };
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                let unique = crate::util::windows_file_identity(entry.path())
+                    .map(|(volume, index, _, _)| seen_inodes.insert((u64::from(volume), index)))
+                    .unwrap_or(true);
+                #[cfg(not(any(unix, windows)))]
                 let unique = true;
                 info.files += 1;
                 if unique {
                     info.bytes += meta.len();
                 }
-                if link_count(&meta) > 1 {
+                if link_count(entry.path(), &meta) > 1 {
                     info.linked += 1;
                 }
             }
@@ -4232,15 +4294,23 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
 }
 
 /// Hard links of one inode as the file system knows it (1 where unsupported).
-pub(crate) fn link_count(meta: &fs::Metadata) -> u64 {
+pub(crate) fn link_count(path: &Path, meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = path;
         meta.nlink()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = meta;
+        crate::util::windows_file_identity(path)
+            .map(|(_, _, links, _)| u64::from(links))
+            .unwrap_or(1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, meta);
         1
     }
 }
@@ -6059,6 +6129,28 @@ mod tests {
             "epicenter-job-v1\n0123456789abcdef0123456789abcdef\n",
         )?;
         Ok(build)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_manifest_refuses_a_permissive_generation_acl() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let generation = store.path().join("gen");
+        fs::create_dir(&generation)?;
+        // The ACL check runs before parsing, so the body need not be valid.
+        fs::write(generation.join("manifest.json"), b"{}")?;
+        let status = std::process::Command::new("icacls")
+            .arg(&generation)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(M)"])
+            .status()
+            .context("running icacls")?;
+        assert!(status.success(), "icacls could not add the test ACE");
+        let err = load_manifest(store.path(), "gen").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("grants write access"),
+            "{err:#}"
+        );
+        Ok(())
     }
 
     #[test]

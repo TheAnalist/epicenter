@@ -451,7 +451,8 @@ mod tests {
         assert_eq!(flags[0], "-C");
         assert_eq!(flags[1], "link-arg=-fuse-ld=lld");
         assert_eq!(flags[2], "-C");
-        assert_eq!(flags[3], format!("link-arg=-B{}", dir.display()));
+        // rustc flags use forward slashes on every host.
+        assert_eq!(flags[3], format!("link-arg=-B{}", forward(&dir)));
         assert!(lld.rustflags_toml().starts_with('['));
     }
 

@@ -88,7 +88,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
     let work_root = crate::exec::work_root(build_root);
     let store_root = crate::vault::store_root(build_root);
     if work_root.exists() {
-        crate::util::ensure_private_dir(&work_root)?;
+        crate::util::check_private_dir(&work_root, crate::util::Privacy::Repair)?;
     }
     if work_root.starts_with(&store_root) || store_root.starts_with(&work_root) {
         bail!(
@@ -1070,7 +1070,7 @@ fn dir_accounting(dir: &Path) -> (u64, u64, u64, u64) {
         let size = meta.len();
         bytes += size;
         files += 1;
-        if crate::vault::link_count(&meta) > 1 {
+        if crate::vault::link_count(entry.path(), &meta) > 1 {
             shared += size;
         } else {
             unique += size;
@@ -1176,12 +1176,14 @@ fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Remove one unit from one view: fingerprint dir, build anchors, artifacts.
 fn remove_view_unit(root: &Path, unit: &Unit, arts: &ArtifactInfo, errors: &mut u64) {
+    // Artifacts first: in the new layout they live inside the unit root, and
+    // removing that root first would make the later file removals fail.
+    for (path, _, _) in &arts.paths {
+        remove_file(root, path, errors);
+    }
     remove_dir(root, &unit.fingerprint_dir, errors);
     for anchor in fingerprint::build_anchor_dirs(root, unit) {
         remove_dir(root, &anchor, errors);
-    }
-    for (path, _, _) in &arts.paths {
-        remove_file(root, path, errors);
     }
 }
 

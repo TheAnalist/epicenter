@@ -224,7 +224,7 @@ How `epicenter exec` works:
 
 Common `exec` flags:
 * `--id <NAME>`: Name the job directory (`work/<NAME>/`). New job directories are created with `O_EXCL` and stamped with `.epicenter-job`.
-* `--reuse`: Reuse an existing job directory with the same `--id` (refuses safely if another build is holding the lock or if the directory is unmarked/foreign-owned).
+* `--reuse`: Reuse an existing job directory with the same `--id`. It must carry the `.epicenter-job` marker and the matching `ExecRecord` from this host; a marker-only dir is adopted, while a dir with build state and no record (including one from epicenter < 0.1.0) is refused.
 * `--target-dir [DIR]`: Give the job its own `CARGO_TARGET_DIR` (defaults to `<work-dir>/target` if no path is given) so final binaries don't collide either.
 * `--work-root <PATH>`: Override the per-VM work directory root for this run.
 * `--harvest`: After the command succeeds, harvest newly built units back into the vault.

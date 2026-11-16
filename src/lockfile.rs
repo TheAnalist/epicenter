@@ -173,7 +173,19 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&real, &link).unwrap();
+        {
+            // A file symlink needs SeCreateSymbolicLinkPrivilege (Developer
+            // Mode or elevation). The no-follow path is covered on Unix; skip
+            // the fixture when the OS denies it.
+            if let Err(err) = std::os::windows::fs::symlink_file(&real, &link) {
+                if err.raw_os_error() == Some(1314)
+                    || err.kind() == std::io::ErrorKind::PermissionDenied
+                {
+                    return;
+                }
+                panic!("creating a symlink: {err}");
+            }
+        }
         assert!(LockIndex::parse(&link).is_none());
     }
 }

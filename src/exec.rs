@@ -14,12 +14,12 @@
 //! frame lines go to stderr, and the command's exit code becomes epicenter's
 //! exit code.
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 
 use walkdir::WalkDir;
 
@@ -118,7 +118,7 @@ fn create_job_dir(work_dir: &Path) -> Result<String> {
     {
         fs::create_dir(work_dir)
             .with_context(|| format!("creating job dir {}", work_dir.display()))?;
-        crate::util::ensure_private_dir(work_dir)?;
+        crate::util::check_private_dir(work_dir, crate::util::Privacy::Repair)?;
     }
     match write_job_marker(work_dir) {
         Ok(token) => Ok(token),
@@ -390,43 +390,114 @@ fn write_record(work_root: &Path, job_id: &str, record: &ExecRecord) -> Result<(
         .with_context(|| format!("writing the exec record for job {job_id}"))
 }
 
-fn load_record(work_root: &Path, job_id: &str) -> Result<Option<ExecRecord>> {
+/// What a record file on disk is, before the job/token comparison.
+enum RecordFile {
+    /// No record at all: a new job, or a dir from an epicenter that did not
+    /// write records yet.
+    Absent,
+    /// The path exists but is not a trusted regular file: a symlink/reparse
+    /// point, a foreign owner, a permissive mode, an oversized file, or JSON
+    /// that does not parse. Never adopt or overwrite it.
+    Untrusted,
+    Present(ExecRecord),
+}
+
+/// What `record_covers` found for one job dir.
+pub(crate) enum RecordCoverage {
+    /// A trusted record for this exact job dir and marker token.
+    Matching,
+    /// No record file.
+    Absent,
+    /// A record exists, but for a different token, version, or build path.
+    Mismatch,
+    /// A record path exists but is not something this host wrote.
+    Untrusted,
+}
+
+/// Does this error mean "the record path exists but is not ours"?
+///
+/// `read_trusted_config` reports a non-regular/oversized file or a reparse
+/// point as `InvalidInput`, a foreign owner or permissive mode as
+/// `PermissionDenied`, and `O_NOFOLLOW` reports a symlink as `ELOOP`.
+fn is_untrusted_record_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    false
+}
+
+fn load_record(work_root: &Path, job_id: &str) -> Result<RecordFile> {
     let path = record_path(work_root, job_id);
     let text = match crate::util::read_trusted_config(&path, EXEC_RECORD_MAX_BYTES) {
         Ok(text) => text,
-        Err(err)
-            if err.kind() == std::io::ErrorKind::NotFound
-                || err.kind() == std::io::ErrorKind::InvalidInput =>
-        {
-            return Ok(None);
+        // No record: a new job, or a migration from epicenter < 0.1.0.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(RecordFile::Absent),
+        // The path exists but is a symlink/reparse point, not a regular file,
+        // owned by another user, group/world-writable, or oversized. It is not
+        // ours, so it is neither adopted nor overwritten.
+        Err(err) if is_untrusted_record_error(&err) => {
+            return Ok(RecordFile::Untrusted);
         }
         Err(err) => {
             return Err(err).with_context(|| format!("reading the exec record {}", path.display()));
         }
     };
-    Ok(serde_json::from_str(&text).ok())
+    match serde_json::from_str(&text) {
+        Ok(record) => Ok(RecordFile::Present(record)),
+        Err(_) => Ok(RecordFile::Untrusted),
+    }
 }
 
 /// The record covering `build_root`, if this host wrote it for the job whose
-/// marker token is `token`. A path or token mismatch is a different build.
-pub(crate) fn record_covers(build_root: &Path, token: &str) -> Result<Option<ExecRecord>> {
+/// marker token is `token`.
+pub(crate) fn record_covers(build_root: &Path, token: &str) -> Result<RecordCoverage> {
     let (Some(work_root), Some(job_id)) = (
         build_root.parent(),
         build_root.file_name().and_then(|name| name.to_str()),
     ) else {
-        return Ok(None);
+        bail!(
+            "cannot derive a job id from {} — refusing to read its exec record",
+            build_root.display()
+        );
     };
-    let Some(record) = load_record(work_root, job_id)? else {
-        return Ok(None);
+    let record = match load_record(work_root, job_id)? {
+        RecordFile::Absent => return Ok(RecordCoverage::Absent),
+        RecordFile::Untrusted => return Ok(RecordCoverage::Untrusted),
+        RecordFile::Present(record) => record,
     };
     if record.version != EXEC_RECORD_VERSION || record.token != token {
-        return Ok(None);
+        return Ok(RecordCoverage::Mismatch);
     }
     let canonical = std::fs::canonicalize(build_root).unwrap_or_else(|_| build_root.to_path_buf());
     if record.build_root != canonical.to_string_lossy() {
-        return Ok(None);
+        return Ok(RecordCoverage::Mismatch);
     }
-    Ok(Some(record))
+    Ok(RecordCoverage::Matching)
+}
+
+/// True when the job dir holds nothing but its marker.
+///
+/// That is the only safe adoption case: a crash between `create_job_dir` and
+/// `write_record`, or a dir from an intermediate version. There is no planted
+/// build state to consume.
+fn job_dir_is_unseeded(work_dir: &Path) -> Result<bool> {
+    for entry in
+        fs::read_dir(work_dir).with_context(|| format!("reading job dir {}", work_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_name() == JOB_MARKER {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -589,6 +660,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     };
     let work_dir = work_root.join(&job_id);
     let mut reused = false;
+    let mut adopted = false;
     let mut reuse_locks: Option<Vec<fs::File>> = None;
     let job_token = if let Ok(meta) = metadata_nofollow(&work_dir) {
         if !opts.reuse {
@@ -600,14 +672,40 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         if !meta.is_dir() {
             bail!("{} exists and is not a real directory", work_dir.display());
         }
-        crate::util::ensure_private_dir(&work_dir)?;
+        // Reject, never repair: a permissive job dir may have been planted
+        // before a chmod could run.
+        crate::util::check_private_dir(&work_dir, crate::util::Privacy::Enforce)?;
         let Some(token) = job_marker_token(&work_dir)? else {
             bail!(
-                "job dir {} was not created by epicenter (missing {}); refusing --reuse",
+                "job dir {} has no {} marker (created by epicenter < 0.1.0?); remove it or use a new --id",
                 work_dir.display(),
                 JOB_MARKER
             );
         };
+        match record_covers(&work_dir, &token)? {
+            RecordCoverage::Matching => {}
+            // A marker-only dir is safe to adopt: there is no build state a
+            // previous writer could have planted. The record is written below,
+            // before restore.
+            RecordCoverage::Absent => {
+                if !job_dir_is_unseeded(&work_dir)? {
+                    bail!(
+                        "job dir {} has no exec record and contains build state; refusing --reuse — remove it or use a new --id",
+                        work_dir.display()
+                    );
+                }
+                adopted = true;
+            }
+            RecordCoverage::Mismatch => bail!(
+                "job dir {} has an exec record for a different build (token or path mismatch); refusing --reuse — remove it or use a new --id",
+                work_dir.display()
+            ),
+            RecordCoverage::Untrusted => bail!(
+                "job dir {} has an exec record this host does not trust (symlink, foreign owner, or permissive mode); refusing --reuse",
+                work_dir.display()
+            ),
+        }
+
         let Some(locks) = cargo_locks(&work_dir)? else {
             bail!(
                 "job dir {} is in use by a live build — wait for it, or use another --id",
@@ -641,6 +739,12 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             String::new()
         }
     );
+    if adopted {
+        eprintln!(
+            "  {} adopting a marker-only job dir (no exec record yet)",
+            util::info(GLYPH_INFO)
+        );
+    }
 
     // An empty vault is a cold build (fail-open), but a corrupt/tampered
     // vault is not: never run the command over unverified artifacts.
@@ -662,6 +766,38 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let layout = cargo_version
         .as_deref()
         .map(|version| fingerprint::layout_for_cargo(version, opts.command));
+
+    // Write the provenance record before restore, so a crash mid-restore still
+    // leaves a recorded job and the next `--reuse` is allowed. It lives in the
+    // private work root, never in the build dir the child can write.
+    let canonical_build = std::fs::canonicalize(&work_dir).unwrap_or_else(|_| work_dir.clone());
+    let mut record = ExecRecord {
+        version: EXEC_RECORD_VERSION,
+        run_id: format!("{job_id}-{job_token}"),
+        token: job_token.clone(),
+        build_root: canonical_build.to_string_lossy().into_owned(),
+        source_root: source_dir
+            .as_deref()
+            .map(|dir| {
+                std::fs::canonicalize(dir)
+                    .unwrap_or_else(|_| dir.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default(),
+        toolchain: cargo_version.clone().unwrap_or_default(),
+        command: opts
+            .command
+            .join(" ")
+            .chars()
+            .take(EXEC_COMMAND_MAX_CHARS)
+            .collect(),
+        started: unix_now(),
+        finished: 0,
+        exit_code: -1,
+    };
+    write_record(work_root, &job_id, &record)?;
+
     let restore = vault::restore_with(
         &work_dir,
         store_root,
@@ -731,37 +867,6 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     drop(reuse_locks);
     eprintln!("{}", util::dim("  ── command ──"));
     let _ = std::io::stderr().flush();
-
-    // Write the provenance record before the child starts, so a harvest that
-    // races the end of the build still sees it. It lives in the private work
-    // root, never in the build dir the child can write.
-    let canonical_build = std::fs::canonicalize(&work_dir).unwrap_or_else(|_| work_dir.clone());
-    let mut record = ExecRecord {
-        version: EXEC_RECORD_VERSION,
-        run_id: format!("{job_id}-{job_token}"),
-        token: job_token.clone(),
-        build_root: canonical_build.to_string_lossy().into_owned(),
-        source_root: source_dir
-            .as_deref()
-            .map(|dir| {
-                std::fs::canonicalize(dir)
-                    .unwrap_or_else(|_| dir.to_path_buf())
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_default(),
-        toolchain: cargo_version.clone().unwrap_or_default(),
-        command: opts
-            .command
-            .join(" ")
-            .chars()
-            .take(EXEC_COMMAND_MAX_CHARS)
-            .collect(),
-        started: unix_now(),
-        finished: 0,
-        exit_code: -1,
-    };
-    write_record(work_root, &job_id, &record)?;
 
     let started = Instant::now();
     let mut child = crate::util::command_for(program)?;
@@ -1644,9 +1749,12 @@ mod tests {
     fn exec_reuse_refuses_a_locked_dir() -> Result<()> {
         let (_build, store) = seeded_store()?;
         let work = tempfile::tempdir()?;
-        let debug = work.path().join("busy/debug");
-        fs::create_dir_all(&debug)?;
-        write_job_marker(&work.path().join("busy"))?;
+        let dir = work.path().join("busy");
+        crate::util::create_private_dir_all(&dir)?;
+        let debug = dir.join("debug");
+        crate::util::create_private_dir_all(&debug)?;
+        write_job_marker(&dir)?;
+        record_for_test(&dir)?;
         let lock = debug.join(".cargo-build-lock");
         fs::write(&lock, b"")?;
         let held = fs::OpenOptions::new().write(true).open(&lock)?;
@@ -1725,7 +1833,136 @@ mod tests {
             ..fresh
         };
         let err = run(store.path(), work.path(), &reuse).unwrap_err();
-        assert!(err.to_string().contains("missing .epicenter-job"), "{err}");
+        assert!(err.to_string().contains(".epicenter-job"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn exec_reuse_adopts_a_marker_only_dir() -> Result<()> {
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let dir = work.path().join("adopt");
+        crate::util::create_private_dir_all(&dir)?;
+        write_job_marker(&dir)?;
+
+        let command: Vec<String> = vec!["true".into()];
+        let opts = Options {
+            job_id: Some("adopt"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: true,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: None,
+            no_remote: false,
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+        assert!(
+            work.path().join(".exec-adopt.json").is_file(),
+            "a marker-only dir is adopted with a record"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exec_reuse_refuses_a_planted_dir_without_a_record() -> Result<()> {
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let dir = work.path().join("planted");
+        crate::util::create_private_dir_all(&dir)?;
+        write_job_marker(&dir)?;
+        fs::write(dir.join("planted.txt"), b"payload")?;
+
+        let command: Vec<String> = vec!["true".into()];
+        let opts = Options {
+            job_id: Some("planted"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: true,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: None,
+            no_remote: false,
+            command: &command,
+        };
+        let err = run(store.path(), work.path(), &opts).unwrap_err();
+        assert!(err.to_string().contains("no exec record"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn exec_reuse_refuses_a_record_for_another_token() -> Result<()> {
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let dir = work.path().join("mismatch");
+        crate::util::create_private_dir_all(&dir)?;
+        write_job_marker(&dir)?;
+        record_for_test(&dir)?;
+        // Replace the marker token; the record still names the old one.
+        fs::write(
+            dir.join(JOB_MARKER),
+            format!("{JOB_MARKER_VERSION}\n{}\n", "f".repeat(32)),
+        )?;
+
+        let command: Vec<String> = vec!["true".into()];
+        let opts = Options {
+            job_id: Some("mismatch"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: true,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: None,
+            no_remote: false,
+            command: &command,
+        };
+        let err = run(store.path(), work.path(), &opts).unwrap_err();
+        assert!(err.to_string().contains("different build"), "{err}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_reuse_refuses_a_symlinked_record() -> Result<()> {
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let dir = work.path().join("linked");
+        crate::util::create_private_dir_all(&dir)?;
+        write_job_marker(&dir)?;
+        record_for_test(&dir)?;
+        let record = work.path().join(".exec-linked.json");
+        let target = work.path().join("record-target.json");
+        fs::write(&target, b"{}")?;
+        fs::remove_file(&record)?;
+        std::os::unix::fs::symlink(&target, &record)?;
+
+        let command: Vec<String> = vec!["true".into()];
+        let opts = Options {
+            job_id: Some("linked"),
+            cwd: None,
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: true,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: None,
+            no_remote: false,
+            command: &command,
+        };
+        let err = run(store.path(), work.path(), &opts).unwrap_err();
+        assert!(err.to_string().contains("does not trust"), "{err}");
         Ok(())
     }
 

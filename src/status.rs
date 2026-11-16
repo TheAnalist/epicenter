@@ -55,7 +55,7 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
 
     // Per top-level bucket (profile dirs like `debug`/`release`, usually).
     let mut buckets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut seen_inodes = std::collections::HashSet::new();
     let walker = WalkDir::new(root)
         .min_depth(1)
@@ -81,14 +81,18 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
             use std::os::unix::fs::MetadataExt;
             seen_inodes.insert((meta.dev(), meta.ino()))
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let unique = crate::util::windows_file_identity(entry.path())
+            .map(|(volume, index, _, _)| seen_inodes.insert((u64::from(volume), index)))
+            .unwrap_or(true);
+        #[cfg(not(any(unix, windows)))]
         let unique = true;
 
         if unique {
             summary.total_bytes += meta.len();
         }
         summary.total_files += 1;
-        if crate::vault::link_count(&meta) > 1 {
+        if crate::vault::link_count(entry.path(), &meta) > 1 {
             summary.linked_files += 1;
         }
         if let Ok(mtime) = meta.modified() {

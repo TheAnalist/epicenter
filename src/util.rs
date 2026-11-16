@@ -843,8 +843,28 @@ pub fn create_private_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verify (and, when possible, repair) an existing private directory.
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
+/// How to handle a directory that is group/world-accessible.
+#[derive(Clone, Copy)]
+pub enum Privacy {
+    /// Tighten the mode to 0700. Windows has no repair path, so a permissive
+    /// DACL is always rejected.
+    Repair,
+    /// Reject instead of tightening.
+    Enforce,
+}
+
+/// Verify an existing directory is owned by us and owner-only, applying the
+/// requested [`Privacy`] policy to a permissive mode.
+///
+/// `Repair` is for paths where tightening a legacy `0755` directory is safe
+/// (store/build/work roots). `Enforce` is for paths where a permissive mode is
+/// a security signal: a reused job dir may already have been written by
+/// another principal before a chmod could run, so tightening it would hide
+/// the exposure.
+pub fn check_private_dir(path: &Path, privacy: Privacy) -> Result<()> {
+    // Windows has no repair path: a permissive DACL is always rejected.
+    #[cfg(not(unix))]
+    let _ = privacy;
     refuse_destructive_chmod(path)?;
     let meta = match metadata_nofollow(path) {
         Ok(meta) => meta,
@@ -860,7 +880,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     }
     if !owned_by_us(path, &meta) {
         anyhow::bail!(
-            "{} is owned by an untrusted principal — refusing a shared/untrusted cache",
+            "{} is owned by an untrusted principal — refusing a shared/untrusted directory",
             path.display()
         );
     }
@@ -868,8 +888,17 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if meta.mode() & 0o077 != 0 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("securing {}", path.display()))?;
+            match privacy {
+                Privacy::Repair => {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("securing {}", path.display()))?;
+                }
+                Privacy::Enforce => anyhow::bail!(
+                    "{} grants group/world access (mode {:o}) — refusing a shared/untrusted directory",
+                    path.display(),
+                    meta.mode() & 0o777
+                ),
+            }
         }
     }
     #[cfg(windows)]
@@ -1662,7 +1691,9 @@ pub(crate) fn remove_tree(root: &Path, target: &Path) -> Result<()> {
     {
         let rel = relative_under(root, target)?;
         #[cfg(windows)]
-        let _pins = pin_parent_handles(root, &rel)?;
+        let Some(_pins) = pin_parent_handles_or_missing(root, &rel)? else {
+            return Ok(());
+        };
         check_parent_components(root, &rel)?;
         remove_tree_path(target)
     }
@@ -1681,7 +1712,9 @@ pub(crate) fn remove_file(root: &Path, target: &Path) -> Result<()> {
     {
         let rel = relative_under(root, target)?;
         #[cfg(windows)]
-        let _pins = pin_parent_handles(root, &rel)?;
+        let Some(_pins) = pin_parent_handles_or_missing(root, &rel)? else {
+            return Ok(());
+        };
         check_parent_components(root, &rel)?;
         match std::fs::symlink_metadata(target) {
             Ok(meta) if meta.is_dir() => {
@@ -1708,7 +1741,9 @@ pub(crate) fn remove_empty_dir(root: &Path, target: &Path) -> Result<()> {
     {
         let rel = relative_under(root, target)?;
         #[cfg(windows)]
-        let _pins = pin_parent_handles(root, &rel)?;
+        let Some(_pins) = pin_parent_handles_or_missing(root, &rel)? else {
+            return Ok(());
+        };
         check_parent_components(root, &rel)?;
         match std::fs::symlink_metadata(target) {
             Ok(meta) if meta.is_dir() => std::fs::remove_dir(target)
@@ -1740,6 +1775,24 @@ fn pin_parent_handles(root: &Path, rel: &Path) -> Result<Vec<File>> {
         handles.push(open_dir_handle(&current)?);
     }
     Ok(handles)
+}
+
+/// `None` when a parent is already gone: the target cannot exist, so removal
+/// is a successful no-op (same contract as the Unix `open_parent_at` path).
+#[cfg(windows)]
+fn pin_parent_handles_or_missing(root: &Path, rel: &Path) -> Result<Option<Vec<File>>> {
+    match pin_parent_handles(root, rel) {
+        Ok(pins) => Ok(Some(pins)),
+        Err(err) if is_missing_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn is_missing_error(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[cfg(not(unix))]
@@ -2690,7 +2743,43 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
         }
         (nominal, freed, nominal - freed, count)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::collections::{HashMap, HashSet};
+
+        // NTFS reports the volume/file index and link count; dedupe by inode
+        // exactly like the Unix branch. A filesystem that cannot report them
+        // is treated as one link per path (fail-open, never over-credits a
+        // released link as freed).
+        let mut per_inode: HashMap<(u32, u64), (u64, u64, u64)> = HashMap::new();
+        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut count = 0u64;
+        for path in files {
+            if !seen.insert(path.as_path()) {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(path) else {
+                continue;
+            };
+            count += 1;
+            let (key, size, links) = match windows_file_identity(path) {
+                Some((volume, index, links, size)) => ((volume, index), size, u64::from(links)),
+                None => ((0, u64::MAX - count), meta.len(), 1),
+            };
+            let entry = per_inode.entry(key).or_insert((size, links, 0));
+            entry.2 += 1;
+        }
+        let mut nominal = 0u64;
+        let mut freed = 0u64;
+        for (size, links, planned) in per_inode.values() {
+            nominal += size;
+            if planned >= links {
+                freed += size;
+            }
+        }
+        (nominal, freed, nominal - freed, count)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
         let mut nominal = 0u64;
@@ -2706,6 +2795,31 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
         }
         (nominal, nominal, 0, count)
     }
+}
+
+/// Volume serial, file index, link count and size for one path.
+///
+/// `std`'s `MetadataExt` file-index helpers are still unstable, so ask the
+/// kernel directly through the handle we already open.
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(path: &Path) -> Option<(u32, u64, u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = fs::File::open(path).ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((
+        info.dwVolumeSerialNumber,
+        index,
+        info.nNumberOfLinks,
+        file.metadata().ok()?.len(),
+    ))
 }
 
 /// Hard-link a regular owned source into a new destination while hashing it.

@@ -15,7 +15,13 @@ fn public_key(key: &SigningKey) -> String {
 }
 
 fn local_environment() -> LocalEnvironment {
-    let cargo_home = "/opt/epicenter/cargo";
+    // Must be absolute on the host running the test: `/opt/...` is not an
+    // absolute Windows path (it has no drive/UNC prefix).
+    let cargo_home = if cfg!(windows) {
+        r"C:\epicenter\cargo"
+    } else {
+        "/opt/epicenter/cargo"
+    };
     LocalEnvironment {
         rustc: RustcIdentity {
             release: "1.91.0".to_string(),
