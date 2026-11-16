@@ -8,14 +8,14 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    MAX_BLOB_BYTES, blob_path, body_path, ensure_sha256, publisher_report, sha256_hex, verify_body,
+    MAX_BLOB_BYTES, SignedIndex, blob_path, body_path, ensure_sha256, publisher_report, sha256_hex,
 };
-use crate::util::{COMPRESS_MIN_BYTES, metadata_nofollow, temp_nonce};
+use crate::util::{COMPRESS_MIN_BYTES, metadata_nofollow};
 
 const MAX_OBJECT_KEY_BYTES: usize = 4096;
 
@@ -26,15 +26,6 @@ pub enum Compression {
     Gzip,
     #[serde(rename = "none")]
     Raw,
-}
-
-impl Compression {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Compression::Gzip => "gzip",
-            Compression::Raw => "none",
-        }
-    }
 }
 
 /// One immutable CAS object plus the decoded facts the index records.
@@ -52,15 +43,11 @@ pub struct BlobRef {
 /// Store one file in the CAS, compressing when it wins. A missing blob is
 /// created atomically; an existing blob is verified and never overwritten.
 pub fn write_blob(src: &Path, root: &Path) -> Result<BlobRef> {
-    let meta = match metadata_nofollow(src) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            bail!(
-                "{} is a symlink/reparse point or not a regular file",
-                src.display()
-            );
-        }
-        Err(err) => return Err(err).with_context(|| format!("inspecting {}", src.display())),
+    let Some(meta) = crate::util::probe(src, "blob source")? else {
+        bail!(
+            "{} is a symlink/reparse point or not a regular file",
+            src.display()
+        );
     };
     ensure!(meta.is_file(), "{} is not a regular file", src.display());
     ensure!(
@@ -105,17 +92,7 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
     use flate2::Compression as GzipLevel;
     use flate2::write::GzEncoder;
 
-    let tmp = blobs.join(format!(".tmp-{}-{}.gz", std::process::id(), temp_nonce()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
+    let (tmp, file) = crate::util::create_temp(blobs, "tmp", ".gz", 0o600)?;
     let mut encoder = GzEncoder::new(file, GzipLevel::fast());
     let mut input = open_nofollow(src)?;
     let mut decoded = Sha256Writer::new();
@@ -158,18 +135,8 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
 }
 
 fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
-    let tmp = blobs.join(format!(".tmp-{}-{}", std::process::id(), temp_nonce()));
     let mut input = open_nofollow(src)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut output = options
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
+    let (tmp, mut output) = crate::util::create_temp(blobs, "tmp", "", 0o600)?;
     let mut hasher = Sha256Writer::new();
     let mut buf = [0u8; 64 * 1024];
     let result = (|| -> Result<()> {
@@ -286,8 +253,6 @@ pub const MAX_IN_MEMORY_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 /// signed `blob.size`, so a gzip bomb cannot expand past the expected artifact
 /// size, and both the stored and decoded SHA-256 are checked.
 pub fn decode_blob<W: Write>(root: &Path, blob: &BlobRef, writer: &mut W) -> Result<()> {
-    use sha2::Digest;
-
     verify_blob(root, blob)?;
     let path = blob_path(root, &blob.blob)?;
     let input = open_nofollow(&path)?;
@@ -296,43 +261,7 @@ pub fn decode_blob<W: Write>(root: &Path, blob: &BlobRef, writer: &mut W) -> Res
         Compression::Gzip => Box::new(flate2::read::GzDecoder::new(input)),
     };
 
-    let mut hasher = sha2::Sha256::new();
-    let mut written = 0u64;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        written = written
-            .checked_add(n as u64)
-            .context("decoded blob size overflow")?;
-        ensure!(
-            written <= blob.size,
-            "decoded blob {} exceeds the expected {} bytes",
-            path.display(),
-            blob.size
-        );
-        hasher.update(&buf[..n]);
-        writer
-            .write_all(&buf[..n])
-            .with_context(|| format!("writing verified blob {}", path.display()))?;
-    }
-    ensure!(
-        written == blob.size,
-        "decoded blob {} is {written} bytes, expected {}",
-        path.display(),
-        blob.size
-    );
-    let digest = crate::vault::hex_encode(&hasher.finalize());
-    ensure!(
-        digest == blob.sha256,
-        "decoded blob {} failed its SHA-256 check",
-        path.display()
-    );
-    Ok(())
+    crate::util::copy_verified(&mut reader, writer, blob.size, &blob.sha256, &path)
 }
 
 /// Buffer a small blob. Artifacts above [`MAX_IN_MEMORY_BLOB_BYTES`] must use
@@ -350,25 +279,7 @@ pub fn read_blob(root: &Path, blob: &BlobRef) -> Result<Vec<u8>> {
 }
 
 fn open_nofollow(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let meta = file.metadata()?;
-    ensure!(meta.is_file(), "{} is not a regular file", path.display());
-    Ok(file)
+    crate::util::open_regular(path, false).with_context(|| format!("opening {}", path.display()))
 }
 
 /// One object the publisher must upload.
@@ -390,17 +301,13 @@ pub enum UploadMode {
     Replace,
 }
 
-/// Plan the upload for a verified index tree. Blobs and the body are
+/// Plan the upload for a signed index tree. Blobs and the body are
 /// put-if-absent; `publisher.json` and the signed pointer are replaced last.
-pub fn upload_plan(
-    root: &Path,
-    pointer: &super::IndexPointer,
-    body_bytes: &[u8],
-) -> Result<Vec<Upload>> {
-    let body = verify_body(pointer, body_bytes, super::now_secs())?;
+pub fn upload_plan(root: &Path, index: &SignedIndex) -> Result<Vec<Upload>> {
+    let pointer = index.pointer();
     let mut uploads = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for file in body.units.iter().flat_map(|unit| &unit.files) {
+    for file in index.body().units.iter().flat_map(|unit| &unit.files) {
         if !seen.insert(file.blob.as_str()) {
             continue;
         }
@@ -422,7 +329,7 @@ pub fn upload_plan(
         UploadMode::PutIfAbsent,
     )?);
 
-    let report = publisher_report(pointer, &body)?;
+    let report = publisher_report(index)?;
     uploads.push(upload_source(
         super::PUBLISHER_FILE.to_string(),
         root.join(super::PUBLISHER_FILE),
@@ -431,7 +338,7 @@ pub fn upload_plan(
         UploadMode::Replace,
     )?);
 
-    let pointer_bytes = serde_json::to_vec(pointer)?;
+    let pointer_bytes = index.pointer_bytes()?;
     uploads.push(upload_source(
         super::INDEX_FILE.to_string(),
         root.join(super::INDEX_FILE),

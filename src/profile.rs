@@ -89,14 +89,8 @@ fn profile_table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Tab
 }
 
 fn write_manifest(path: &Path, dry_run: bool, dev_debug: DevDebug) -> Result<Report> {
-    let meta = match crate::util::metadata_nofollow(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("refusing symlinked Cargo.toml: {}", path.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", path.display()));
-        }
+    let Some(meta) = crate::util::probe(path, "Cargo.toml")? else {
+        anyhow::bail!("Cargo.toml {} does not exist", path.display());
     };
     if !meta.is_file() {
         anyhow::bail!("{} is not a regular file", path.display());

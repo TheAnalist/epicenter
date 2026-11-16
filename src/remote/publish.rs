@@ -17,8 +17,8 @@ use std::time::Duration;
 use super::{
     BlobRef, Compression, FileRole, IndexBody, IndexPointer, LocalEnvironment,
     MAX_INDEX_VALIDITY_SECS, PublisherMetadata, RemoteFile, RemoteUnit, RemoteUnitKind,
-    SCHEMA_VERSION, SourceKind, UnitSource, Upload, make_index, now_secs, read_capped, sha256_hex,
-    upload_plan, write_index_tree,
+    SCHEMA_VERSION, SignedIndex, SourceKind, UnitSource, Upload, make_index, now_secs, read_capped,
+    sha256_hex, upload_plan, write_index_tree,
 };
 use crate::fingerprint;
 use crate::lockfile::{LockIndex, LockSource};
@@ -64,16 +64,11 @@ pub struct PublishOutcome {
     pub blobs: usize,
     pub skipped_workspace: usize,
     pub skipped_tier: usize,
-    pub sequence: u64,
-    pub expires: u64,
-    pub key_id: String,
     pub public_key: String,
     pub identity_created: bool,
     pub publisher_state: PathBuf,
     pub out_dir: PathBuf,
-    pub pointer: IndexPointer,
-    pub body: IndexBody,
-    pub body_bytes: Vec<u8>,
+    pub index: SignedIndex,
     pub uploads: Vec<Upload>,
 }
 
@@ -228,12 +223,12 @@ pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
         compatibility,
         units,
     };
-    let (pointer, body_bytes) = make_index(&body, &identity.key, now)?;
+    let index = make_index(body, &identity.key, now)?;
 
-    write_index_tree(&out_dir, &pointer, &body_bytes)?;
+    write_index_tree(&out_dir, &index)?;
     // Read our own output through the reader path before declaring success.
     super::read_index_tree(&out_dir, &identity.public_key, request.tier, now)?;
-    let uploads = upload_plan(&out_dir, &pointer, &body_bytes)?;
+    let uploads = upload_plan(&out_dir, &index)?;
 
     let blobs = uploads
         .iter()
@@ -250,16 +245,11 @@ pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
         blobs,
         skipped_workspace: selection.skipped_workspace,
         skipped_tier: selection.skipped_tier,
-        sequence,
-        expires: body.expires,
-        key_id: identity.key_id,
         public_key: identity.public_key,
         identity_created: identity.created,
         publisher_state: state_dir,
         out_dir,
-        pointer,
-        body,
-        body_bytes,
+        index,
         uploads,
     })
 }
@@ -322,7 +312,7 @@ fn resolve_identity(
             validate_identity_pin(&identity, &path, current_key_id, expected_key_id)?;
             Ok(identity)
         }
-        Err(err) if is_not_found(&err) => {
+        Err(err) if crate::util::is_not_found(&err) => {
             ensure!(
                 current_key_id.is_none() && expected_key_id.is_none(),
                 "publisher identity {} is missing, but {}; mount the publisher state directory \
@@ -451,28 +441,18 @@ fn write_key(path: &Path, key: &SigningKey, replace: bool) -> Result<bool> {
     }
 }
 
-fn is_not_found(err: &anyhow::Error) -> bool {
-    err.root_cause()
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-}
-
 fn read_current_pointer(out_dir: &Path) -> Result<Option<IndexPointer>> {
     let path = out_dir.join(super::INDEX_FILE);
-    match crate::util::metadata_nofollow(&path) {
-        Ok(meta) if meta.is_file() => {
+    match crate::util::probe(&path, "staged index")? {
+        Some(meta) if meta.is_file() => {
             let bytes = read_capped(&path, super::MAX_INDEX_POINTER_BYTES, "index pointer")?;
             let pointer: IndexPointer =
                 serde_json::from_slice(&bytes).context("parsing the staged index pointer")?;
             pointer.validate_shape()?;
             Ok(Some(pointer))
         }
-        Ok(_) => bail!("staged index {} is not a regular file", path.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            bail!("staged index {} is a symlink/reparse point", path.display())
-        }
-        Err(err) => Err(err).with_context(|| format!("inspecting {}", path.display())),
+        Some(_) => bail!("staged index {} is not a regular file", path.display()),
+        None => Ok(None),
     }
 }
 
@@ -720,14 +700,10 @@ fn stage_blobs(out_dir: &Path, units: &[PublishUnit]) -> Result<()> {
 }
 
 fn stage_object(src: &Path, dst: &Path, size: u64, hash: &str) -> Result<()> {
-    match crate::util::metadata_nofollow(dst) {
-        Ok(meta) if meta.is_file() => return verify_object(dst, size, hash),
-        Ok(_) => bail!("staged blob {} is not a regular file", dst.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            bail!("staged blob {} is a symlink/reparse point", dst.display())
-        }
-        Err(err) => return Err(err).with_context(|| format!("inspecting {}", dst.display())),
+    match crate::util::probe(dst, "staged blob")? {
+        Some(meta) if meta.is_file() => return verify_object(dst, size, hash),
+        Some(_) => bail!("staged blob {} is not a regular file", dst.display()),
+        None => {}
     }
     if let Some(parent) = dst.parent() {
         crate::util::create_private_dir_all(parent)?;
@@ -738,9 +714,7 @@ fn stage_object(src: &Path, dst: &Path, size: u64, hash: &str) -> Result<()> {
         Err(_) => match crate::util::copy_file_verified_unowned(src, dst, size, hash) {
             Ok(_) => {}
             Err(err)
-                if err
-                    .root_cause()
-                    .downcast_ref::<std::io::Error>()
+                if crate::util::io_error(&err)
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) => {}
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -1106,7 +1080,7 @@ mod tests {
         let first = publish(&request)?;
         assert_eq!(first.units, 1);
         assert_eq!(first.files, 3);
-        assert_eq!(first.sequence, 1);
+        assert_eq!(first.index.pointer().sequence, 1);
         assert_eq!(
             first.uploads.last().map(|upload| upload.key.as_str()),
             Some("index.json")
@@ -1114,8 +1088,8 @@ mod tests {
         assert!(first.identity_created);
 
         let second = publish(&request)?;
-        assert_eq!(second.sequence, 2);
-        assert_eq!(second.key_id, first.key_id);
+        assert_eq!(second.index.pointer().sequence, 2);
+        assert_eq!(second.index.pointer().key_id, first.index.pointer().key_id);
         assert!(!second.identity_created);
         Ok(())
     }

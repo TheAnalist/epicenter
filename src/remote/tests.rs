@@ -147,16 +147,16 @@ fn index_round_trip_is_canonical_and_verified() -> Result<()> {
     let now = now_secs();
     let key = signing_key(7);
     let body = body_for(&key, now, 3, RemoteTier::Libraries, Vec::new());
-    let (pointer, bytes) = make_index(&body, &key, now)?;
-    assert_eq!(body.canonical_bytes()?, bytes);
-    write_index_tree(dir.path(), &pointer, &bytes)?;
+    let index = make_index(body, &key, now)?;
+    assert_eq!(index.body().canonical_bytes()?, index.body_bytes());
+    write_index_tree(dir.path(), &index)?;
     assert!(dir.path().join(PUBLISHER_FILE).is_file());
 
     let verified = read_index_tree(dir.path(), &public_key(&key), RemoteTier::Libraries, now)?;
-    assert_eq!(verified.pointer.sequence, 3);
-    assert_eq!(verified.body.tier, RemoteTier::Libraries);
-    assert_eq!(verified.body_bytes, bytes);
-    assert!(pointer.signature.len() == 128);
+    assert_eq!(verified.pointer().sequence, 3);
+    assert_eq!(verified.body().tier, RemoteTier::Libraries);
+    assert_eq!(verified.body_bytes(), index.body_bytes());
+    assert!(index.pointer().signature.len() == 128);
     Ok(())
 }
 
@@ -166,7 +166,8 @@ fn signature_and_pinned_key_are_enforced() -> Result<()> {
     let key = signing_key(7);
     let other = signing_key(8);
     let body = body_for(&key, now, 1, RemoteTier::Libraries, Vec::new());
-    let (pointer, _) = make_index(&body, &key, now)?;
+    let index = make_index(body, &key, now)?;
+    let pointer = index.pointer();
     pointer.verify(&public_key(&key), now)?;
     assert!(pointer.verify(&public_key(&other), now).is_err());
 
@@ -189,28 +190,21 @@ fn body_hash_size_and_canonical_form_are_enforced() -> Result<()> {
     let now = now_secs();
     let key = signing_key(7);
     let body = body_for(&key, now, 2, RemoteTier::Libraries, Vec::new());
-    let (pointer, bytes) = make_index(&body, &key, now)?;
+    let index = make_index(body, &key, now)?;
+    let pointer = index.pointer();
+    let bytes = index.body_bytes();
 
-    let mut flipped = bytes.clone();
+    let mut flipped = bytes.to_vec();
     flipped[0] = b' ';
-    assert!(verify_body(&pointer, &flipped, now).is_err());
+    assert!(verify_body(pointer, &flipped, now).is_err());
 
     let short = &bytes[..bytes.len() - 1];
-    assert!(verify_body(&pointer, short, now).is_err());
+    assert!(verify_body(pointer, short, now).is_err());
 
-    let pretty = serde_json::to_vec_pretty(&body)?;
-    assert!(verify_body(&pointer, &pretty, now).is_err());
+    let pretty = serde_json::to_vec_pretty(index.body())?;
+    assert!(verify_body(pointer, &pretty, now).is_err());
 
-    assert!(
-        verify_index(
-            &bytes,
-            &bytes,
-            &public_key(&key),
-            RemoteTier::Libraries,
-            now
-        )
-        .is_err()
-    );
+    assert!(verify_index(bytes, bytes, &public_key(&key), RemoteTier::Libraries, now).is_err());
     Ok(())
 }
 
@@ -223,7 +217,8 @@ fn expiry_future_clock_and_validity_cap_are_enforced() -> Result<()> {
     stale.created = now.saturating_sub(1_000);
     stale.expires = now.saturating_sub(1);
     stale.publisher.built_at = now.saturating_sub(500);
-    let (pointer, _) = make_index(&stale, &key, now.saturating_sub(500))?;
+    let index = make_index(stale, &key, now.saturating_sub(500))?;
+    let pointer = index.pointer();
     assert!(pointer.verify(&public_key(&key), now).is_err());
     assert!(
         pointer.verify_signature(&public_key(&key)).is_ok(),
@@ -232,12 +227,13 @@ fn expiry_future_clock_and_validity_cap_are_enforced() -> Result<()> {
 
     let future = now + MAX_CLOCK_SKEW_SECS + 100;
     let body = body_for(&key, future, 5, RemoteTier::Libraries, Vec::new());
-    let (pointer, _) = make_index(&body, &key, future)?;
+    let index = make_index(body, &key, future)?;
+    let pointer = index.pointer();
     assert!(pointer.verify(&public_key(&key), now).is_err());
 
     let mut future_publisher = body_for(&key, now, 5, RemoteTier::Libraries, Vec::new());
     future_publisher.publisher.built_at = now + MAX_CLOCK_SKEW_SECS + 1;
-    assert!(make_index(&future_publisher, &key, now).is_err());
+    assert!(make_index(future_publisher, &key, now).is_err());
 
     let mut too_long = body_for(&key, now, 6, RemoteTier::Libraries, Vec::new());
     too_long.expires = too_long.created + MAX_INDEX_VALIDITY_SECS + 1;
@@ -251,12 +247,14 @@ fn key_rotation_requires_a_new_pin() -> Result<()> {
     let old = signing_key(7);
     let new = signing_key(8);
     let old_body = body_for(&old, now, 7, RemoteTier::Libraries, Vec::new());
-    let (old_pointer, _) = make_index(&old_body, &old, now)?;
+    let old_index = make_index(old_body, &old, now)?;
+    let old_pointer = old_index.pointer();
     old_pointer.verify(&public_key(&old), now)?;
     assert!(old_pointer.verify(&public_key(&new), now).is_err());
 
     let new_body = body_for(&new, now, 8, RemoteTier::Libraries, Vec::new());
-    let (new_pointer, _) = make_index(&new_body, &new, now)?;
+    let new_index = make_index(new_body, &new, now)?;
+    let new_pointer = new_index.pointer();
     new_pointer.verify(&public_key(&new), now)?;
     assert!(new_pointer.verify(&public_key(&old), now).is_err());
     assert_ne!(
@@ -275,25 +273,23 @@ fn replay_state_rejects_rollback_and_equivocation() -> Result<()> {
     let remote = remote_policy(&public);
 
     let body = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
-    let (pointer, _) = make_index(&body, &key, now)?;
-    state::record_state_at(dir.path(), &remote, &pointer, &body, now)?;
+    let index = make_index(body, &key, now)?;
+    state::record_state_at(dir.path(), &remote, &index, now)?;
     let loaded = state::load_state_at(dir.path(), &remote)?.expect("state");
     assert_eq!(loaded.sequence, 7);
 
     let older = body_for(&key, now, 6, RemoteTier::Libraries, Vec::new());
-    let (older_pointer, _) = make_index(&older, &key, now)?;
-    assert!(state::record_state_at(dir.path(), &remote, &older_pointer, &older, now).is_err());
+    let older_index = make_index(older, &key, now)?;
+    assert!(state::record_state_at(dir.path(), &remote, &older_index, now).is_err());
 
     let mut alternate = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
     alternate.publisher.ci_job = "ci/other".to_string();
-    let (alternate_pointer, _) = make_index(&alternate, &key, now)?;
-    assert!(
-        state::record_state_at(dir.path(), &remote, &alternate_pointer, &alternate, now).is_err()
-    );
+    let alternate_index = make_index(alternate, &key, now)?;
+    assert!(state::record_state_at(dir.path(), &remote, &alternate_index, now).is_err());
 
     let newer = body_for(&key, now, 8, RemoteTier::Libraries, Vec::new());
-    let (newer_pointer, _) = make_index(&newer, &key, now)?;
-    state::record_state_at(dir.path(), &remote, &newer_pointer, &newer, now)?;
+    let newer_index = make_index(newer, &key, now)?;
+    state::record_state_at(dir.path(), &remote, &newer_index, now)?;
     assert_eq!(
         state::load_state_at(dir.path(), &remote)?
             .expect("state")
@@ -312,20 +308,20 @@ fn replay_state_serializes_concurrent_writers() -> Result<()> {
 
     let mut a = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
     a.publisher.ci_job = "ci/a".to_string();
-    let (pa, _) = make_index(&a, &key, now)?;
+    let pa = make_index(a, &key, now)?;
     let mut b = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
     b.publisher.ci_job = "ci/b".to_string();
-    let (pb, _) = make_index(&b, &key, now)?;
+    let pb = make_index(b, &key, now)?;
 
     let barrier = std::sync::Barrier::new(2);
     let (first, second) = std::thread::scope(|scope| {
         let one = scope.spawn(|| {
             barrier.wait();
-            state::record_state_at(dir.path(), &remote, &pa, &a, now)
+            state::record_state_at(dir.path(), &remote, &pa, now)
         });
         let two = scope.spawn(|| {
             barrier.wait();
-            state::record_state_at(dir.path(), &remote, &pb, &b, now)
+            state::record_state_at(dir.path(), &remote, &pb, now)
         });
         (one.join().unwrap(), two.join().unwrap())
     });
@@ -335,7 +331,7 @@ fn replay_state_serializes_concurrent_writers() -> Result<()> {
     );
     let loaded = state::load_state_at(dir.path(), &remote)?.expect("state");
     let winner = if first.is_ok() { &pa } else { &pb };
-    assert_eq!(loaded.body_sha256, winner.body_sha256);
+    assert_eq!(loaded.body_sha256, winner.pointer().body_sha256);
     Ok(())
 }
 
@@ -349,8 +345,8 @@ fn status_reports_the_last_verified_index_and_compatibility() -> Result<()> {
     let local = LocalEnvironment::gather()?;
     let mut body = body_for(&key, now, 19, RemoteTier::Libraries, Vec::new());
     body.compatibility = Compatibility::from_local(&local, &[])?;
-    let (pointer, _) = make_index(&body, &key, now)?;
-    state::record_state_at(dir.path(), &remote, &pointer, &body, now)?;
+    let index = make_index(body, &key, now)?;
+    state::record_state_at(dir.path(), &remote, &index, now)?;
 
     let status = state::status_at(dir.path(), &remote)?.expect("status");
     assert_eq!(status.sequence, 19);
@@ -382,12 +378,13 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
     );
     assert!(body.validate_for(RemoteTier::Libraries).is_err());
 
-    let (pointer, bytes) = make_index(&body, &key, now)?;
-    let pointer_bytes = serde_json::to_vec(&pointer)?;
+    let index = make_index(body, &key, now)?;
+    let pointer_bytes = serde_json::to_vec(index.pointer())?;
+    let bytes = index.body_bytes();
     assert!(
         verify_index(
             &pointer_bytes,
-            &bytes,
+            bytes,
             &public_key(&key),
             RemoteTier::Libraries,
             now
@@ -397,7 +394,7 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
     assert!(
         verify_index(
             &pointer_bytes,
-            &bytes,
+            bytes,
             &public_key(&key),
             RemoteTier::Full,
             now
@@ -405,7 +402,7 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
         .is_ok()
     );
 
-    let mut mislabeled = body;
+    let mut mislabeled = index.body().clone();
     mislabeled.tier = RemoteTier::Libraries;
     assert!(mislabeled.validate_for(RemoteTier::Libraries).is_err());
 
@@ -596,9 +593,9 @@ fn upload_plan_replaces_the_pointer_last() -> Result<()> {
         b"payload",
     );
     let body = body_for(&key, now, 16, RemoteTier::Libraries, vec![unit]);
-    let (pointer, bytes) = make_index(&body, &key, now)?;
-    write_index_tree(dir.path(), &pointer, &bytes)?;
-    let uploads = upload_plan(dir.path(), &pointer, &bytes)?;
+    let index = make_index(body, &key, now)?;
+    write_index_tree(dir.path(), &index)?;
+    let uploads = upload_plan(dir.path(), &index)?;
     assert_eq!(uploads.last().expect("pointer").key, INDEX_FILE);
     assert!(
         uploads.iter().any(
@@ -710,7 +707,7 @@ fn publisher_metadata_rejects_control_characters_and_oversize_text() -> Result<(
 fn file_roles_are_typed_and_round_trip() -> Result<()> {
     let role: FileRole = serde_json::from_str("\"build-tree\"")?;
     assert_eq!(role, FileRole::BuildTree);
-    assert_eq!(role.as_str(), "build-tree");
+    assert_eq!(serde_json::to_string(&role)?, "\"build-tree\"");
     assert!(serde_json::from_str::<FileRole>("\"executable\"").is_err());
     Ok(())
 }
@@ -720,12 +717,12 @@ fn publisher_report_mirrors_the_signed_metadata() -> Result<()> {
     let now = now_secs();
     let key = signing_key(7);
     let body = body_for(&key, now, 17, RemoteTier::Full, Vec::new());
-    let (pointer, _) = make_index(&body, &key, now)?;
-    let bytes = publisher_report(&pointer, &body)?;
+    let index = make_index(body, &key, now)?;
+    let bytes = publisher_report(&index)?;
     let report: PublisherReport = serde_json::from_slice(&bytes)?;
     assert_eq!(report.sequence, 17);
-    assert_eq!(report.key_id, pointer.key_id);
+    assert_eq!(report.key_id, index.pointer().key_id);
     assert_eq!(report.tier, RemoteTier::Full);
-    assert_eq!(report.body_sha256, pointer.body_sha256);
+    assert_eq!(report.body_sha256, index.pointer().body_sha256);
     Ok(())
 }

@@ -69,11 +69,6 @@ fn name_hash(name: &str, strip_ext: bool) -> Option<String> {
     Some(format!("{}-{}", name.replace('-', "_"), hash))
 }
 
-/// A 16-hex unit hash (`9709d57b46b8d526`).
-fn is_hex16(text: &str) -> bool {
-    text.len() == 16 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 /// Classify a file inside the cache into its build unit.
 pub fn artifact_key(root: &Path, path: &Path) -> Option<String> {
     if !path.starts_with(root) {
@@ -105,7 +100,10 @@ pub fn artifact_key(root: &Path, path: &Path) -> Option<String> {
             // New layout: build/<package>/<16hex>/… — one directory per unit.
             "build" => {
                 let first = components.get(i + 1)?;
-                if let Some(hash) = components.get(i + 2).filter(|hash| is_hex16(hash)) {
+                if let Some(hash) = components
+                    .get(i + 2)
+                    .filter(|hash| crate::fingerprint::looks_like_hash(hash))
+                {
                     return Some(format!("{}-{}", first.replace('-', "_"), hash));
                 }
                 // Classic: build/<package>-<hash>/…
@@ -146,7 +144,7 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
                 let new_layout = comps
                     .get(i + 2)
                     .and_then(|c| c.as_os_str().to_str())
-                    .map(is_hex16)
+                    .map(crate::fingerprint::looks_like_hash)
                     .unwrap_or(false);
                 let take = if new_layout { i + 3 } else { i + 2 };
                 let anchor: PathBuf = comps.iter().take(take).collect();
@@ -172,8 +170,18 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
 
 /// Walk `root` and group every file into units.
 pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
+    scan_with(root, "prune", |_, _| {})
+}
+
+/// Scan once and let the caller visit every regular file. `status` uses this
+/// to collect totals from the same walk that classifies prune groups.
+pub(crate) fn scan_with(
+    root: &Path,
+    budget_name: &'static str,
+    mut visit: impl FnMut(&Path, &Metadata),
+) -> Result<BTreeMap<String, Group>> {
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-    let mut budget = util::ScanBudget::new("prune");
+    let mut budget = util::ScanBudget::new(budget_name);
     let walker = WalkDir::new(root)
         .min_depth(1)
         .max_depth(util::MAX_SCAN_DEPTH)
@@ -195,6 +203,7 @@ pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
         if !meta.is_file() {
             continue;
         }
+        visit(entry.path(), &meta);
         // `artifact_key` -> None means "never touch" (locks, root files...).
         let Some(key) = artifact_key(root, entry.path()) else {
             continue;
@@ -273,7 +282,7 @@ pub fn prune(root: &Path, cutoff: SystemTime, delete: bool) -> Result<PruneRepor
 
 fn package_key(key: &str) -> &str {
     key.rsplit_once('-')
-        .filter(|(_, hash)| is_hex16(hash))
+        .filter(|(_, hash)| crate::fingerprint::looks_like_hash(hash))
         .map(|(package, _)| package)
         .unwrap_or(key)
 }

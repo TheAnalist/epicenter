@@ -29,8 +29,6 @@
 //! and a `touch` on a restored file would rewrite the store itself.
 
 use std::fs;
-#[cfg(unix)]
-use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,7 +42,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::settings::LinkPolicy;
-use crate::util::{self, FileLock, metadata_nofollow};
+use crate::util::{self, FileLock, metadata_nofollow, now_secs};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -99,43 +97,11 @@ pub fn toolchain() -> Result<Toolchain> {
 /// Parse `rustc -vV` for a rustup selector (`nightly`, `1.98.0`, …;
 /// `None` = the default toolchain). `exec` uses this for `cargo +nightly`.
 pub fn toolchain_of(selector: Option<&str>) -> Result<Toolchain> {
-    let mut command = util::command_for("rustc")?;
-    if let Some(selector) = selector {
-        command.arg(format!("+{selector}"));
-    }
-    let output = command.arg("-vV").output().context("running `rustc -vV`")?;
-    if !output.status.success() {
-        anyhow::bail!("`rustc -vV` failed — is a toolchain installed?");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    let mut release = "unknown".to_string();
-    let mut commit = "unknown".to_string();
-    let mut host = "unknown".to_string();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("rustc ") {
-            let mut parts = rest.split_whitespace();
-            if let Some(version) = parts.next() {
-                release = version.to_string();
-            }
-            // `rustc 1.99.0 (b940084d7 2026-09-28)` — the token starts `(`.
-            if let Some(commit_part) = parts.next() {
-                let value = commit_part.trim_start_matches('(');
-                if !value.is_empty() {
-                    commit = value.to_string();
-                }
-            }
-        } else if let Some(value) = line.strip_prefix("host: ") {
-            host = value.trim().to_string();
-        }
-    }
-    util::validate_component(&release, "rustc release")?;
-    util::validate_component(&commit, "rustc commit")?;
-    util::validate_component(&host, "rustc host")?;
+    let info = crate::toolchain::rustc_info(selector)?;
     Ok(Toolchain {
-        release,
-        commit,
-        host,
+        release: info.release,
+        commit: info.commit,
+        host: info.host,
     })
 }
 
@@ -148,15 +114,7 @@ pub fn toolchain_install_time() -> Option<SystemTime> {
 
 /// Install time of `selector`'s toolchain (same shape as the default).
 pub fn toolchain_install_time_of(selector: Option<&str>) -> Option<SystemTime> {
-    let mut command = util::command_for("rustc").ok()?;
-    if let Some(selector) = selector {
-        command.arg(format!("+{selector}"));
-    }
-    let output = command.args(["--print", "sysroot"]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sysroot = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let sysroot = crate::toolchain::sysroot(selector).ok()?;
     let rustc = sysroot
         .join("bin")
         .join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
@@ -386,13 +344,8 @@ pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
         check_store_trust(store_root)?;
     }
     let dir = store_root.join(parity);
-    let meta = match util::metadata_nofollow(&dir) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("refusing symlinked/reparse generation {}", dir.display());
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err).context("inspecting generation"),
+    let Some(meta) = util::probe(&dir, "generation")? else {
+        return Ok(false);
     };
     if !meta.is_dir() {
         anyhow::bail!("refusing symlinked/reparse generation {}", dir.display());
@@ -411,16 +364,9 @@ pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
 /// `units/` directory (so an orphan generation can still be fully deleted).
 pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<String>> {
     util::validate_component(parity, "generation")?;
-    match metadata_nofollow(store_root) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Ok(Vec::new()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("store {} is a symlink/reparse point", store_root.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
-        }
+    match util::probe(store_root, "store")? {
+        Some(meta) if meta.is_dir() => {}
+        Some(_) | None => return Ok(Vec::new()),
     }
     let generation = store_root.join(parity);
     if store_chain_has_reparse(store_root, &generation)? {
@@ -465,8 +411,8 @@ pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<Stri
 /// partially prepared directory is never mistaken for a valid store.
 fn ensure_store_root(store_root: &Path) -> Result<()> {
     util::ensure_windows_user_path(store_root, "store")?;
-    match util::metadata_nofollow(store_root) {
-        Ok(meta) => {
+    match util::probe(store_root, "store root")? {
+        Some(meta) => {
             if !meta.is_dir() {
                 anyhow::bail!(
                     "store root {} is not a real directory",
@@ -475,18 +421,7 @@ fn ensure_store_root(store_root: &Path) -> Result<()> {
             }
             util::check_private_dir(store_root, util::Privacy::Repair)?;
         }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!(
-                "store root {} is not a real directory",
-                store_root.display()
-            );
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            util::create_private_dir_all(store_root)?;
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", store_root.display()));
-        }
+        None => util::create_private_dir_all(store_root)?,
     }
     #[cfg(windows)]
     require_private_windows_acl(store_root, "store root")?;
@@ -515,14 +450,10 @@ fn require_private_windows_acl(path: &Path, what: &str) -> Result<()> {
 /// Write a zero-byte marker once; O_EXCL keeps a planted symlink from being
 /// followed. An existing regular marker is accepted.
 fn write_marker(path: &Path) -> Result<()> {
-    match util::metadata_nofollow(path) {
-        Ok(meta) if meta.is_file() => return Ok(()),
-        Ok(_) => anyhow::bail!("marker {} is not a regular file", path.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("marker {} is not a regular file", path.display());
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
+    match util::probe(path, "marker")? {
+        Some(meta) if meta.is_file() => return Ok(()),
+        Some(_) => anyhow::bail!("marker {} is not a regular file", path.display()),
+        None => {}
     }
     match fs::OpenOptions::new()
         .write(true)
@@ -794,20 +725,9 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn read_key_file(path: &Path) -> Result<Vec<u8>> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(path)
+    let mut file = util::open_regular(path, false)
         .with_context(|| format!("opening vault key {}", path.display()))?;
     let meta = file.metadata()?;
-    if !meta.is_file() || util::is_reparse_point(&meta) {
-        anyhow::bail!("vault key {} is not a regular file", path.display());
-    }
     if !util::owned_by_us(path, &meta) {
         anyhow::bail!(
             "vault key {} is owned by an untrusted principal",
@@ -864,14 +784,10 @@ fn write_new_key_file(path: &Path, key: &[u8; 32]) -> Result<Vec<u8>> {
 }
 
 fn read_existing_key(path: &Path) -> Result<Option<Vec<u8>>> {
-    match util::metadata_nofollow(path) {
-        Ok(meta) if meta.is_file() => Ok(Some(read_key_file(path)?)),
-        Ok(_) => anyhow::bail!("vault key {} is not a regular file", path.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("vault key {} is a symlink/reparse point", path.display());
-        }
-        Err(err) => Err(err).with_context(|| format!("inspecting vault key {}", path.display())),
+    match util::probe(path, "vault key")? {
+        Some(meta) if meta.is_file() => Ok(Some(read_key_file(path)?)),
+        Some(_) => anyhow::bail!("vault key {} is not a regular file", path.display()),
+        None => Ok(None),
     }
 }
 
@@ -1103,32 +1019,19 @@ fn store_chain_has_reparse(store_root: &Path, target: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn is_not_found(err: &anyhow::Error) -> bool {
-    err.root_cause()
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-}
-
 /// Load a manifest. `repair` is true only for writer paths that already hold
 /// the generation lock; readers never delete units or rewrite the manifest.
 fn load_manifest_at(store_root: &Path, parity: &str, repair: bool) -> Result<Option<Manifest>> {
     let path = manifest_path(store_root, parity);
     let rel = Path::new(parity).join("manifest.json");
     if let Err(err) = util::check_regular_chain(store_root, &rel) {
-        if is_not_found(&err) {
+        if util::is_not_found(&err) {
             return Ok(None);
         }
         return Err(err).with_context(|| format!("validating manifest path {}", path.display()));
     }
-    let meta = match util::metadata_nofollow(&path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("{} is not a regular manifest file", path.display());
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", path.display()));
-        }
+    let Some(meta) = util::probe(&path, "manifest")? else {
+        return Ok(None);
     };
     // The manifest is the list of files that will be executed/linked. Never
     // parse one that is a symlink. A foreign, writable manifest is not a
@@ -1266,39 +1169,7 @@ pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest
     let what = serde_json::to_string_pretty(&signed)?;
     // O_EXCL + a random, symlink-free temp path: never write through a
     // planted temp link.
-    let nonce = util::temp_nonce();
-    let mut tmp = None;
-    for attempt in 0..100u32 {
-        let candidate = dir.join(format!(
-            "manifest.json.tmp-{}-{nonce}-{attempt}",
-            std::process::id()
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-                }
-                tmp = Some((candidate, file));
-                break;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("creating {}", candidate.display()));
-            }
-        }
-    }
-    let Some((tmp, mut file)) = tmp else {
-        anyhow::bail!(
-            "could not create a unique manifest temp file in {}",
-            dir.display()
-        );
-    };
+    let (tmp, mut file) = util::create_temp(&dir, "manifest.json.tmp", "", 0o600)?;
     file.write_all(what.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -1313,16 +1184,9 @@ pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest
 
 /// Names of the store generations (directories under `store/`).
 pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
-    match metadata_nofollow(store_root) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Ok(Vec::new()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("store {} is a symlink/reparse point", store_root.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
-        }
+    match util::probe(store_root, "store")? {
+        Some(meta) if meta.is_dir() => {}
+        Some(_) | None => return Ok(Vec::new()),
     }
     let mut names = Vec::new();
     for entry in
@@ -1378,16 +1242,10 @@ pub struct StoredUnit {
 
 /// Every stored unit across all generations, manifest-driven.
 pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
-    match metadata_nofollow(store_root) {
-        Ok(meta) if meta.is_dir() => check_store_trust(store_root)?,
-        Ok(_) => anyhow::bail!("store {} is not a real directory", store_root.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("store {} is a symlink/reparse point", store_root.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
-        }
+    match util::probe(store_root, "store")? {
+        Some(meta) if meta.is_dir() => check_store_trust(store_root)?,
+        Some(_) => anyhow::bail!("store {} is not a real directory", store_root.display()),
+        None => return Ok(Vec::new()),
     }
     let mut out = Vec::new();
     for generation in generation_names(store_root)? {
@@ -1400,16 +1258,7 @@ pub fn stored_units(store_root: &Path) -> Result<Vec<StoredUnit>> {
         }
         for entry in manifest.units {
             let dir = units.join(&entry.name);
-            match util::metadata_nofollow(&dir) {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-                    anyhow::bail!("unit {} is a symlink/reparse point", dir.display());
-                }
-                Err(err) => {
-                    return Err(err).with_context(|| format!("inspecting unit {}", dir.display()));
-                }
-            }
+            util::probe(&dir, "unit")?;
             out.push(StoredUnit {
                 generation: generation.clone(),
                 entry,
@@ -1447,47 +1296,29 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
     }
     let lock = FileLock::acquire(&store_lock_path(store_root, generation))?;
     let generation_dir = store_root.join(generation);
-    match metadata_nofollow(&generation_dir) {
-        Ok(meta) if meta.is_dir() => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    match util::probe(&generation_dir, "generation")? {
+        Some(meta) if meta.is_dir() => {}
+        Some(_) => anyhow::bail!("generation {} is not a directory", generation_dir.display()),
+        None => {
             drop(lock);
             remove_generation_lock(store_root, generation);
             return Ok(0);
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!(
-                "generation {} is a symlink/reparse point",
-                generation_dir.display()
-            );
-        }
-        Ok(_) => anyhow::bail!("generation {} is not a directory", generation_dir.display()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", generation_dir.display()));
         }
     }
     let Some(mut manifest) = load_manifest_at(store_root, generation, true)? else {
         return Ok(0);
     };
     let units = units_dir(store_root, generation);
-    match util::metadata_nofollow(&units) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => {
+    match util::probe(&units, "units dir")? {
+        Some(meta) if meta.is_dir() => {}
+        Some(_) => {
             anyhow::bail!(
                 "units dir {} is a symlink/reparse or not a directory",
                 units.display()
             );
         }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!(
-                "units dir {} is a symlink/reparse or not a directory",
-                units.display()
-            );
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        None => {
             // Nothing to remove; the manifest may still be pruned.
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", units.display()));
         }
     }
     let mut kept = Vec::with_capacity(manifest.units.len());
@@ -1729,23 +1560,14 @@ pub fn harvest_with_trust(
         Some(lock)
     };
     let generation_root = store_root.join(&parity);
-    match metadata_nofollow(&generation_root) {
-        Ok(meta) if meta.is_dir() => {}
+    match util::probe(&generation_root, "generation")? {
+        Some(meta) if meta.is_dir() => {}
         // A dry run does not create the generation directory.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!(
-                "generation {} is a symlink/reparse point",
-                generation_root.display()
-            );
-        }
-        Ok(_) => anyhow::bail!(
+        Some(_) => anyhow::bail!(
             "generation {} is not a directory",
             generation_root.display()
         ),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", generation_root.display()));
-        }
+        None => {}
     }
     let blobs = if compress && !dry_run {
         Some(generation_root.clone())
@@ -2528,13 +2350,6 @@ fn ceil_secs(time: SystemTime) -> u64 {
     }
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 fn set_stamp(path: &Path, stamp: u64) -> Result<()> {
     let time = UNIX_EPOCH + Duration::from_secs(stamp);
     // Unix allows futimens on a read-only fd owned by us; Windows requires a
@@ -2649,48 +2464,21 @@ fn restore_compressed_at(
     }
     let input = match util::open_file_nofollow(blob) {
         Ok(file) => file,
-        Err(err)
-            if err
-                .root_cause()
-                .downcast_ref::<std::io::Error>()
-                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
+        Err(err) if util::is_not_found(&err) => {
             return Ok(RestoreOutcome::Missing);
         }
         Err(err) => return Err(err),
     };
-    let mut decoder = GzDecoder::new(input);
     let mut tmp = parent.create_excl(dst_name, 0o600)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut size = 0u64;
     let result = (|| -> Result<()> {
-        loop {
-            let n = decoder.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            size = size.saturating_add(n as u64);
-            if size > file.size {
-                anyhow::bail!(
-                    "blob {} exceeds its recorded size ({} bytes)",
-                    file.path,
-                    file.size
-                );
-            }
-            hasher.update(&buf[..n]);
-            tmp.write_all(&buf[..n])?;
-        }
-        let hash = format!("{:x}", hasher.finalize());
-        if size != file.size || hash != file.sha256 {
-            anyhow::bail!(
-                "blob integrity check failed (recorded {} bytes/{}, found {} bytes/{})",
-                file.size,
-                &file.sha256[..file.sha256.len().min(12)],
-                size,
-                &hash[..hash.len().min(12)]
-            );
-        }
+        let mut decoder = GzDecoder::new(input);
+        util::copy_verified(
+            &mut decoder,
+            &mut tmp,
+            file.size,
+            &file.sha256,
+            Path::new(&file.path),
+        )?;
         util::set_stamp_fd(&tmp, stamp)?;
         Ok(())
     })();
@@ -2724,10 +2512,13 @@ fn install_compressed_copy(
                 temp = Some(candidate);
                 break;
             }
-            Err(err) if matches!(io_error_kind(&err), Some(std::io::ErrorKind::AlreadyExists)) => {
+            Err(err)
+                if util::io_error(&err)
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
                 continue;
             }
-            Err(err) if matches!(io_error_kind(&err), Some(std::io::ErrorKind::NotFound)) => {
+            Err(err) if util::is_not_found(&err) => {
                 // A partial vault is fail-open: Cargo rebuilds the unit.
                 return Ok(RestoreOutcome::Missing);
             }
@@ -2805,13 +2596,6 @@ fn install_compressed_copy(
 }
 
 #[cfg(not(unix))]
-fn io_error_kind(err: &anyhow::Error) -> Option<std::io::ErrorKind> {
-    err.root_cause()
-        .downcast_ref::<std::io::Error>()
-        .map(std::io::Error::kind)
-}
-
-#[cfg(not(unix))]
 fn existing_destination(dst: &Path) -> Result<RestoreOutcome> {
     let meta = match util::metadata_nofollow(dst) {
         Ok(meta) => meta,
@@ -2849,19 +2633,7 @@ fn restore_file_at(
     }
     let mut source = match util::open_file_nofollow(src) {
         Ok(file) => file,
-        Err(err)
-            if err
-                .root_cause()
-                .downcast_ref::<std::io::Error>()
-                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(RestoreOutcome::Missing);
-        }
-        Err(err)
-            if err
-                .downcast_ref::<std::io::Error>()
-                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
+        Err(err) if util::is_not_found(&err) => {
             return Ok(RestoreOutcome::Missing);
         }
         Err(err) => return Err(err),
@@ -3758,14 +3530,8 @@ fn validate_build_root(build_root: &Path) -> Result<PathBuf> {
 /// paths never chmod or repair an operator-selected directory; the writer
 /// marks and tightens it in [`ensure_store_root`].
 pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
-    let meta = match util::metadata_nofollow(store_root) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("store {} is not a real directory", store_root.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting store {}", store_root.display()));
-        }
+    let Some(meta) = util::probe(store_root, "store")? else {
+        anyhow::bail!("store {} is not a real directory", store_root.display());
     };
     if !meta.is_dir() {
         anyhow::bail!("store {} is not a real directory", store_root.display());
@@ -3798,8 +3564,8 @@ pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
 /// additionally requires a private DACL. Existing roots are never chmodded,
 /// so `restore --into /` or `--into ~` cannot change system/home modes.
 fn prepare_view_root(view_root: &Path) -> Result<()> {
-    match util::metadata_nofollow(view_root) {
-        Ok(meta) => {
+    match util::probe(view_root, "view")? {
+        Some(meta) => {
             if !meta.is_dir() {
                 anyhow::bail!("view {} is not a real directory", view_root.display());
             }
@@ -3821,15 +3587,7 @@ fn prepare_view_root(view_root: &Path) -> Result<()> {
                 }
             }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            anyhow::bail!("view {} is not a real directory", view_root.display());
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            util::create_private_dir_all(view_root)?;
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting view {}", view_root.display()));
-        }
+        None => util::create_private_dir_all(view_root)?,
     }
     #[cfg(windows)]
     require_private_windows_acl(view_root, "view")?;

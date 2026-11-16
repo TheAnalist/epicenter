@@ -367,24 +367,33 @@ impl Settings {
         Ok(Self { project, global })
     }
 
+    /// The highest-precedence file that sets `pick`, with its base path and
+    /// source. Project always wins over global; `None` means neither file set
+    /// the value.
+    fn layered<T>(&self, pick: impl Fn(&Loaded) -> Option<T>) -> Option<(&Loaded, T, Source)> {
+        if let Some(file) = self.project.as_ref()
+            && let Some(value) = pick(file)
+        {
+            return Some((file, value, Source::Project));
+        }
+        if let Some(file) = self.global.as_ref()
+            && let Some(value) = pick(file)
+        {
+            return Some((file, value, Source::Global));
+        }
+        None
+    }
+
     pub fn preset(&self) -> (Preset, Source) {
-        if let Some(value) = self.project.as_ref().and_then(|file| file.preset) {
-            return (value, Source::Project);
-        }
-        if let Some(value) = self.global.as_ref().and_then(|file| file.preset) {
-            return (value, Source::Global);
-        }
-        (Preset::Auto, Source::Auto)
+        self.layered(|file| file.preset)
+            .map(|(_, value, source)| (value, source))
+            .unwrap_or((Preset::Auto, Source::Auto))
     }
 
     pub fn linker(&self) -> (LinkerChoice, Source) {
-        if let Some(value) = self.project.as_ref().and_then(|file| file.linker) {
-            return (value, Source::Project);
-        }
-        if let Some(value) = self.global.as_ref().and_then(|file| file.linker) {
-            return (value, Source::Global);
-        }
-        (LinkerChoice::Auto, Source::Auto)
+        self.layered(|file| file.linker)
+            .map(|(_, value, source)| (value, source))
+            .unwrap_or((LinkerChoice::Auto, Source::Auto))
     }
 
     /// How restore installs immutable artifacts.
@@ -417,13 +426,10 @@ impl Settings {
 
     /// Memory budget: project > global > physical RAM.
     pub fn memory_bytes(&self) -> (Option<u64>, Source) {
-        if let Some(value) = self.project.as_ref().and_then(|file| file.memory) {
-            return (Some(value), Source::Project);
+        match self.layered(|file| file.memory) {
+            Some((_, value, source)) => (Some(value), source),
+            None => (physical_memory(), Source::Auto),
         }
-        if let Some(value) = self.global.as_ref().and_then(|file| file.memory) {
-            return (Some(value), Source::Global);
-        }
-        (physical_memory(), Source::Auto)
     }
 
     /// Store path: project > global > default (`<build>/../store`).
@@ -433,22 +439,16 @@ impl Settings {
     /// `..`, may not be the project directory or an ancestor of it, and an
     /// existing directory must already be a marked, private epicenter store.
     pub fn store(&self) -> Result<Option<(PathBuf, Source)>> {
-        if let Some(file) = &self.project {
-            if let Some(raw) = file.store.as_deref() {
-                let path = resolve_path(raw, file.base())?;
-                validate_project_store(&path, file.base())
-                    .with_context(|| format!("project store in {}", file.path.display()))?;
-                return Ok(Some((path, Source::Project)));
-            }
+        let Some((file, raw, source)) = self.layered(|file| file.store.clone()) else {
+            return Ok(None);
+        };
+        let path = resolve_path(&raw, file.base())?;
+        match source {
+            Source::Project => validate_project_store(&path, file.base())
+                .with_context(|| format!("project store in {}", file.path.display()))?,
+            _ => validate_store_path(&path)?,
         }
-        if let Some(file) = &self.global {
-            if let Some(raw) = file.store.as_deref() {
-                let path = resolve_path(raw, file.base())?;
-                validate_store_path(&path)?;
-                return Ok(Some((path, Source::Global)));
-            }
-        }
-        Ok(None)
+        Ok(Some((path, source)))
     }
 
     /// Effective Cargo home: global `cargo_home` > shell `CARGO_HOME` >
@@ -466,10 +466,8 @@ impl Settings {
                  a project must not redirect Cargo's home"
             );
         }
-        if let Some(file) = &self.global {
-            if let Some(raw) = file.cargo_home.as_deref() {
-                return Ok((resolve_cargo_home(raw)?, Source::Global));
-            }
+        if let Some((_, raw, source)) = self.layered(|file| file.cargo_home.clone()) {
+            return Ok((resolve_cargo_home(&raw)?, source));
         }
         Ok((crate::paths::ambient_cargo_home()?, Source::Auto))
     }
@@ -557,24 +555,17 @@ impl Settings {
     /// `exec` creates and removes directories there, so the same rule as
     /// `store` applies. `None` means the per-user OS-local default.
     pub fn work_root(&self) -> Result<Option<(PathBuf, Source)>> {
-        if self
-            .project
-            .as_ref()
-            .and_then(|file| file.work.as_deref())
-            .is_some()
-        {
+        let Some((file, raw, source)) = self.layered(|file| file.work.clone()) else {
+            return Ok(None);
+        };
+        if source == Source::Project {
             bail!(
                 "`work` is only allowed in the global epicenter.toml; \
                  a project must not redirect the writable work root"
             );
         }
-        if let Some(file) = &self.global {
-            if let Some(raw) = file.work.as_deref() {
-                let path = resolve_policy_path(raw, file.base(), "work")?;
-                return Ok(Some((path, Source::Global)));
-            }
-        }
-        Ok(None)
+        let path = resolve_policy_path(&raw, file.base(), "work")?;
+        Ok(Some((path, source)))
     }
 
     /// Configured work root, or the OS-local default.
@@ -674,57 +665,50 @@ fn validate_project_store(path: &Path, project_dir: &Path) -> Result<()> {
             path.display()
         );
     }
-    match crate::util::metadata_nofollow(path) {
-        Ok(meta) => {
-            if !meta.is_dir() {
-                bail!("store {} is not a real directory", path.display());
-            }
-            if !crate::util::owned_by_us(path, &meta) {
-                bail!(
-                    "store {} is owned by an untrusted principal",
-                    path.display()
-                );
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.mode() & 0o077 != 0 {
-                    bail!(
-                        "project store {} is accessible by other users (mode {:o}); a project-selected store must be 0700",
-                        path.display(),
-                        meta.mode() & 0o777
-                    );
-                }
-            }
-            #[cfg(windows)]
-            if crate::util::windows_acl_is_private(path) != Some(true) {
-                bail!(
-                    "project store {} DACL grants write access to an untrusted principal",
-                    path.display()
-                );
-            }
-            let marker = path.join(crate::vault::STORE_MARKER);
-            if !marker.is_file() {
-                // An empty directory is a fresh store: the writer creates and
-                // marks it. A non-empty unmarked directory is the dangerous
-                // case (`store = "~/.cargo"`, `store = "~/.config"`).
-                let empty = std::fs::read_dir(path)
-                    .map(|mut entries| entries.next().is_none())
-                    .unwrap_or(false);
-                if !empty {
-                    bail!(
-                        "store {} is not an epicenter store (missing {}); use the global store or an empty directory",
-                        path.display(),
-                        crate::vault::STORE_MARKER
-                    );
-                }
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+    if let Some(meta) = crate::util::probe(path, "store")? {
+        if !meta.is_dir() {
             bail!("store {} is not a real directory", path.display());
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
+        if !crate::util::owned_by_us(path, &meta) {
+            bail!(
+                "store {} is owned by an untrusted principal",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.mode() & 0o077 != 0 {
+                bail!(
+                    "project store {} is accessible by other users (mode {:o}); a project-selected store must be 0700",
+                    path.display(),
+                    meta.mode() & 0o777
+                );
+            }
+        }
+        #[cfg(windows)]
+        if crate::util::windows_acl_is_private(path) != Some(true) {
+            bail!(
+                "project store {} DACL grants write access to an untrusted principal",
+                path.display()
+            );
+        }
+        let marker = path.join(crate::vault::STORE_MARKER);
+        if !marker.is_file() {
+            // An empty directory is a fresh store: the writer creates and
+            // marks it. A non-empty unmarked directory is the dangerous
+            // case (`store = "~/.cargo"`, `store = "~/.config"`).
+            let empty = std::fs::read_dir(path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                bail!(
+                    "store {} is not an epicenter store (missing {}); use the global store or an empty directory",
+                    path.display(),
+                    crate::vault::STORE_MARKER
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -734,40 +718,13 @@ fn validate_store_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("store path {} must be absolute", path.display());
     }
-    if path.parent().is_none() {
-        bail!(
-            "store path {} must not be a filesystem root",
-            path.display()
-        );
-    }
-    if let Ok(home) = crate::paths::home() {
-        if path == home || home.starts_with(path) {
-            bail!(
-                "store path {} must not be the home directory or its ancestor",
-                path.display()
-            );
-        }
-    }
-    let temp = std::env::temp_dir();
-    if path == temp || temp.starts_with(path) {
-        bail!(
-            "store path {} must not be the temporary directory or its ancestor",
-            path.display()
-        );
-    }
+    crate::util::reject_protected_path(path, "store path")?;
     // Reject a symlinked final component even when the target is benign: the
     // store is a deletion root, so its identity must be the directory itself.
-    match crate::util::metadata_nofollow(path) {
-        Ok(meta) => {
-            if !meta.is_dir() {
-                bail!("store path {} is not a real directory", path.display());
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            bail!("store path {} is not a real directory", path.display());
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
+    if let Some(meta) = crate::util::probe(path, "store path")?
+        && !meta.is_dir()
+    {
+        bail!("store path {} is not a real directory", path.display());
     }
     Ok(())
 }
@@ -784,16 +741,7 @@ fn resolve_policy_path(raw: &str, base: &Path, what: &str) -> Result<PathBuf> {
     {
         bail!("`{what}` must not contain `..`; use an absolute or home-relative path");
     }
-    if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-        let rest = raw[1..].trim_start_matches(['/', '\\']);
-        return Ok(crate::paths::home()?.join(rest));
-    }
-    let path = PathBuf::from(raw);
-    Ok(normalize(if path.is_absolute() {
-        path
-    } else {
-        base.join(path)
-    }))
+    Ok(normalize(crate::util::resolve_from(raw, base)?))
 }
 
 fn resolve_path(raw: &str, base: &Path) -> Result<PathBuf> {
@@ -825,17 +773,7 @@ pub fn resolve_cargo_home(raw: &str) -> Result<PathBuf> {
     {
         bail!("`cargo_home` must not contain `..`; use a normalized absolute path");
     }
-    if path.parent().is_none() {
-        bail!("`cargo_home` must not be a filesystem root");
-    }
-    if let Ok(home) = crate::paths::home() {
-        if path == home || home.starts_with(&path) {
-            bail!(
-                "`cargo_home` {} must not be the home directory or its ancestor",
-                path.display()
-            );
-        }
-    }
+    crate::util::reject_protected_path(&path, "`cargo_home`")?;
     Ok(normalize(path))
 }
 
@@ -937,16 +875,10 @@ pub fn normalize_remote_url(raw: &str) -> Result<String> {
 }
 
 fn decode_key_hex(raw: &str, what: &str) -> Result<[u8; 32]> {
-    ensure!(
-        raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "`[remote] {what}` must be 64 hex characters (an Ed25519 public key)"
-    );
-    let mut bytes = [0u8; 32];
-    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(pair).expect("validated hex is ASCII");
-        bytes[index] = u8::from_str_radix(text, 16).expect("validated hex pair");
-    }
-    Ok(bytes)
+    let bytes = crate::vault::hex_decode(raw, what)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("`[remote] {what}` must be 32 bytes (64 hex characters)"))
 }
 
 /// Whether a setup argument is a hex key rather than a file path.
@@ -997,20 +929,16 @@ fn aws_region() -> Option<String> {
 /// Create a missing Cargo home with private permissions, or validate an
 /// existing one. A dry run validates what exists but creates nothing.
 pub fn prepare_cargo_home(path: &Path, dry_run: bool) -> Result<()> {
-    match crate::util::metadata_nofollow(path) {
-        Ok(meta) if meta.is_dir() => crate::util::validate_private_dir(path, "cargo home"),
-        Ok(_) => bail!("cargo home {} is not a real directory", path.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    match crate::util::probe(path, "cargo home")? {
+        Some(meta) if meta.is_dir() => crate::util::validate_private_dir(path, "cargo home"),
+        Some(_) => bail!("cargo home {} is not a real directory", path.display()),
+        None => {
             if dry_run {
                 return Ok(());
             }
             crate::util::create_private_dir_all(path)?;
             crate::util::validate_private_dir(path, "cargo home")
         }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            bail!("cargo home {} is a symlink/reparse point", path.display());
-        }
-        Err(err) => Err(err).with_context(|| format!("inspecting {}", path.display())),
     }
 }
 

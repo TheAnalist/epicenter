@@ -17,7 +17,7 @@ use std::path::Path;
 use super::{
     MAX_BLOB_BYTES, MAX_CLOCK_SKEW_SECS, MAX_INDEX_BODY_BYTES, MAX_INDEX_FILES,
     MAX_INDEX_POINTER_BYTES, MAX_INDEX_UNITS, MAX_INDEX_VALIDITY_SECS, SCHEMA_VERSION, body_path,
-    now_secs, read_capped, sha256_hex,
+    read_capped, sha256_hex,
 };
 use crate::settings::{self, RemoteTier};
 
@@ -98,14 +98,7 @@ impl IndexPointer {
     }
 
     pub fn validate_shape(&self) -> Result<()> {
-        ensure!(
-            self.schema == SCHEMA_VERSION,
-            "remote index schema {} is not supported (expected {SCHEMA_VERSION})",
-            self.schema
-        );
-        validate_key_id(&self.key_id)?;
-        ensure!(self.sequence > 0, "remote index sequence must start at 1");
-        validate_window(self.created, self.expires)?;
+        self.meta().validate_shape()?;
         super::validate::lower_hex(&self.body_sha256, 64, "index body SHA-256")?;
         ensure!(
             (1..=MAX_INDEX_BODY_BYTES).contains(&self.body_size),
@@ -118,11 +111,49 @@ impl IndexPointer {
         Ok(())
     }
 
+    fn meta(&self) -> IndexMeta<'_> {
+        IndexMeta {
+            schema: self.schema,
+            key_id: &self.key_id,
+            sequence: self.sequence,
+            created: self.created,
+            expires: self.expires,
+        }
+    }
+
     fn validate_time(&self, now: u64) -> Result<()> {
         ensure!(
             !self.signature.is_empty(),
             "remote index pointer is not signed"
         );
+        self.meta().validate_time(now)
+    }
+}
+
+/// The metadata a pointer and its body must agree on. Borrowing the fields
+/// keeps the wire shape unchanged while sharing shape and time validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexMeta<'a> {
+    schema: u32,
+    key_id: &'a str,
+    sequence: u64,
+    created: u64,
+    expires: u64,
+}
+
+impl IndexMeta<'_> {
+    fn validate_shape(&self) -> Result<()> {
+        ensure!(
+            self.schema == SCHEMA_VERSION,
+            "remote index schema {} is not supported (expected {SCHEMA_VERSION})",
+            self.schema
+        );
+        validate_key_id(self.key_id)?;
+        ensure!(self.sequence > 0, "remote index sequence must start at 1");
+        validate_window(self.created, self.expires)
+    }
+
+    fn validate_time(&self, now: u64) -> Result<()> {
         ensure!(
             self.created <= now.saturating_add(MAX_CLOCK_SKEW_SECS),
             "remote index was created {} seconds in the future; check the clock",
@@ -177,20 +208,20 @@ impl IndexBody {
     }
 
     pub fn validate_shape(&self) -> Result<()> {
-        ensure!(
-            self.schema == SCHEMA_VERSION,
-            "remote index body schema {} is not supported (expected {SCHEMA_VERSION})",
-            self.schema
-        );
-        validate_key_id(&self.key_id)?;
-        ensure!(
-            self.sequence > 0,
-            "remote index body sequence must start at 1"
-        );
-        validate_window(self.created, self.expires)?;
+        self.meta().validate_shape()?;
         self.publisher.validate()?;
         self.compatibility.validate()?;
         self.validate_units()
+    }
+
+    fn meta(&self) -> IndexMeta<'_> {
+        IndexMeta {
+            schema: self.schema,
+            key_id: &self.key_id,
+            sequence: self.sequence,
+            created: self.created,
+            expires: self.expires,
+        }
     }
 
     fn validate_units(&self) -> Result<()> {
@@ -313,12 +344,7 @@ impl IndexBody {
     }
 
     fn validate_time(&self, now: u64) -> Result<()> {
-        validate_window(self.created, self.expires)?;
-        ensure!(
-            self.created <= now.saturating_add(MAX_CLOCK_SKEW_SECS),
-            "remote index was created {} seconds in the future; check the clock",
-            self.created.saturating_sub(now)
-        );
+        self.meta().validate_time(now)?;
         ensure!(
             self.publisher.built_at <= self.expires,
             "publisher timestamp is after the index expiry"
@@ -328,12 +354,12 @@ impl IndexBody {
             "publisher timestamp is {} seconds in the future; check the clock",
             self.publisher.built_at.saturating_sub(now)
         );
-        ensure!(
-            self.expires >= now,
-            "remote index expired {} seconds ago; ask CI to publish a fresh index",
-            now.saturating_sub(self.expires)
-        );
         Ok(())
+    }
+
+    fn validate_self(&self, now: u64) -> Result<()> {
+        self.validate_shape()?;
+        self.validate_time(now)
     }
 }
 
@@ -564,19 +590,6 @@ pub enum FileRole {
     Extra,
 }
 
-impl FileRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FileRole::Memo => "memo",
-            FileRole::Fingerprint => "fingerprint",
-            FileRole::DepInfo => "dep-info",
-            FileRole::Artifact => "artifact",
-            FileRole::BuildTree => "build-tree",
-            FileRole::Extra => "extra",
-        }
-    }
-}
-
 impl TryFrom<&str> for FileRole {
     type Error = anyhow::Error;
 
@@ -685,34 +698,57 @@ pub struct PublisherReport {
     pub compatibility: super::Compatibility,
 }
 
-pub fn publisher_report(pointer: &IndexPointer, body: &IndexBody) -> Result<Vec<u8>> {
+pub fn publisher_report(index: &SignedIndex) -> Result<Vec<u8>> {
     let report = PublisherReport {
-        schema: pointer.schema,
-        key_id: pointer.key_id.clone(),
-        sequence: pointer.sequence,
-        body_sha256: pointer.body_sha256.clone(),
-        tier: body.tier,
-        publisher: body.publisher.clone(),
-        compatibility: body.compatibility.clone(),
+        schema: index.pointer.schema,
+        key_id: index.pointer.key_id.clone(),
+        sequence: index.pointer.sequence,
+        body_sha256: index.pointer.body_sha256.clone(),
+        tier: index.body.tier,
+        publisher: index.body.publisher.clone(),
+        compatibility: index.body.compatibility.clone(),
     };
     let mut bytes = serde_json::to_vec_pretty(&report)?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
-/// The result of verifying a pointer and its body.
+/// A signed index: the pointer, its canonical body and the exact body bytes.
+/// The constructors are [`make_index`] and the reader verifiers, so carrying
+/// one means the pointer and body have already been checked.
 #[derive(Debug, Clone)]
-pub struct VerifiedIndex {
-    pub pointer: IndexPointer,
-    pub body: IndexBody,
-    pub body_bytes: Vec<u8>,
+pub struct SignedIndex {
+    pointer: IndexPointer,
+    body: IndexBody,
+    body_bytes: Vec<u8>,
+}
+
+/// Reader-facing name for a [`SignedIndex`] produced by verification.
+pub type VerifiedIndex = SignedIndex;
+
+impl SignedIndex {
+    pub fn pointer(&self) -> &IndexPointer {
+        &self.pointer
+    }
+
+    pub fn body(&self) -> &IndexBody {
+        &self.body
+    }
+
+    pub fn body_bytes(&self) -> &[u8] {
+        &self.body_bytes
+    }
+
+    pub(crate) fn pointer_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&self.pointer)?)
+    }
 }
 
 /// Build and sign an index body. The body carries the creation/expiry window
 /// that the pointer repeats and signs.
-pub fn make_index(body: &IndexBody, key: &SigningKey, now: u64) -> Result<(IndexPointer, Vec<u8>)> {
-    body.validate_for(body.tier)?;
-    body.validate_time(now)?;
+pub fn make_index(body: IndexBody, key: &SigningKey, now: u64) -> Result<SignedIndex> {
+    body.validate_self(now)?;
+    body.validate_reader(body.tier)?;
     let expected =
         settings::remote_key_id(&crate::vault::hex_encode(&key.verifying_key().to_bytes()))?;
     ensure!(
@@ -721,28 +757,33 @@ pub fn make_index(body: &IndexBody, key: &SigningKey, now: u64) -> Result<(Index
         body.key_id,
         expected
     );
-    let bytes = body.canonical_bytes()?;
+    let body_bytes = body.canonical_bytes()?;
     ensure!(
-        bytes.len() as u64 <= MAX_INDEX_BODY_BYTES,
+        body_bytes.len() as u64 <= MAX_INDEX_BODY_BYTES,
         "remote index body is {} bytes (cap {MAX_INDEX_BODY_BYTES})",
-        bytes.len()
+        body_bytes.len()
     );
+    let meta = body.meta();
     let mut pointer = IndexPointer {
-        schema: body.schema,
-        key_id: body.key_id.clone(),
-        sequence: body.sequence,
-        created: body.created,
-        expires: body.expires,
-        body_sha256: sha256_hex(&bytes),
-        body_size: bytes.len() as u64,
+        schema: meta.schema,
+        key_id: meta.key_id.to_string(),
+        sequence: meta.sequence,
+        created: meta.created,
+        expires: meta.expires,
+        body_sha256: sha256_hex(&body_bytes),
+        body_size: body_bytes.len() as u64,
         signature: String::new(),
     };
     pointer.sign(key)?;
-    Ok((pointer, bytes))
+    Ok(SignedIndex {
+        pointer,
+        body,
+        body_bytes,
+    })
 }
 
-/// Verify the pointer signature and the body hash/size. The body is checked
-/// for canonical encoding before it is returned.
+/// Verify the pointer and the body hash/size. The body is checked for
+/// canonical encoding before it is returned.
 pub fn verify_body(pointer: &IndexPointer, bytes: &[u8], now: u64) -> Result<IndexBody> {
     ensure!(
         bytes.len() as u64 == pointer.body_size,
@@ -764,22 +805,33 @@ pub fn verify_body(pointer: &IndexPointer, bytes: &[u8], now: u64) -> Result<Ind
         body.canonical_bytes()? == bytes,
         "remote index body is not in canonical form"
     );
-    body.validate_for(body.tier)?;
-    body.validate_time(now)?;
+    body.validate_self(now)?;
+    body.validate_reader(body.tier)?;
     ensure_metadata_matches(pointer, &body)?;
     Ok(body)
 }
 
 fn ensure_metadata_matches(pointer: &IndexPointer, body: &IndexBody) -> Result<()> {
     ensure!(
-        body.schema == pointer.schema
-            && body.key_id == pointer.key_id
-            && body.sequence == pointer.sequence
-            && body.created == pointer.created
-            && body.expires == pointer.expires,
+        pointer.meta() == body.meta(),
         "remote index body metadata does not match the signed pointer"
     );
     Ok(())
+}
+
+fn finish_index(
+    pointer: IndexPointer,
+    body_bytes: &[u8],
+    reader: RemoteTier,
+    now: u64,
+) -> Result<SignedIndex> {
+    let body = verify_body(&pointer, body_bytes, now)?;
+    body.validate_reader(reader)?;
+    Ok(SignedIndex {
+        pointer,
+        body,
+        body_bytes: body_bytes.to_vec(),
+    })
 }
 
 /// Parse and fully verify `index.json` + `indexes/<sha256>.json`.
@@ -797,51 +849,32 @@ pub fn verify_index(
     let pointer: IndexPointer =
         serde_json::from_slice(pointer_bytes).context("parsing the remote index pointer")?;
     pointer.verify(pinned_public_key, now)?;
-    let body = verify_body(&pointer, body_bytes, now)?;
-    body.validate_reader(reader)?;
-    Ok(VerifiedIndex {
-        pointer,
-        body,
-        body_bytes: body_bytes.to_vec(),
-    })
+    finish_index(pointer, body_bytes, reader, now)
 }
 
-/// Write a verified pointer/body pair into a local staging tree.
+/// Write a signed pointer/body pair into a local staging tree.
 ///
 /// The body and blobs are put-if-absent (an existing object must have the same
 /// bytes); `publisher.json` and `index.json` are replaced last.
-pub fn write_index_tree(root: &Path, pointer: &IndexPointer, body_bytes: &[u8]) -> Result<()> {
-    let body = verify_body(pointer, body_bytes, now_secs())?;
-    let body_file = body_path(root, &pointer.body_sha256)?;
-    match crate::util::metadata_nofollow(&body_file) {
-        Ok(meta) if meta.is_file() => {
+pub fn write_index_tree(root: &Path, index: &SignedIndex) -> Result<()> {
+    let body_file = body_path(root, &index.pointer.body_sha256)?;
+    match crate::util::probe(&body_file, "index body")? {
+        Some(meta) if meta.is_file() => {
             let existing = read_capped(&body_file, MAX_INDEX_BODY_BYTES, "index body")?;
             ensure!(
-                existing == body_bytes,
+                existing == index.body_bytes,
                 "index body {} already exists with different bytes",
                 body_file.display()
             );
         }
-        Ok(_) => bail!("index body {} is not a regular file", body_file.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            crate::util::write_atomic_private(&body_file, body_bytes)?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            bail!(
-                "index body {} is a symlink/reparse point",
-                body_file.display()
-            );
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", body_file.display()));
-        }
+        Some(_) => bail!("index body {} is not a regular file", body_file.display()),
+        None => crate::util::write_atomic_private(&body_file, &index.body_bytes)?,
     }
-    let report = publisher_report(pointer, &body)?;
+    let report = publisher_report(index)?;
     let report_path = root.join(super::PUBLISHER_FILE);
     crate::util::write_atomic_private(&report_path, &report)?;
     let pointer_path = root.join(super::INDEX_FILE);
-    let pointer_bytes = serde_json::to_vec(pointer)?;
-    crate::util::write_atomic_private(&pointer_path, &pointer_bytes)?;
+    crate::util::write_atomic_private(&pointer_path, &index.pointer_bytes()?)?;
     Ok(())
 }
 
@@ -867,7 +900,7 @@ pub fn read_index_tree(
         MAX_INDEX_BODY_BYTES,
         "index body",
     )?;
-    verify_index(&pointer_bytes, &body_bytes, pinned_public_key, reader, now)
+    finish_index(pointer, &body_bytes, reader, now)
 }
 
 fn signing_message(unsigned: &[u8]) -> Vec<u8> {

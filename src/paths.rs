@@ -42,6 +42,70 @@ pub fn home() -> Result<PathBuf> {
         .with_context(|| "could not determine the user home directory")
 }
 
+#[derive(Clone, Copy)]
+enum UserDir {
+    Config,
+    State,
+    Cache,
+}
+
+fn absolute_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// One XDG/APPDATA/LOCALAPPDATA branch for epicenter's config, state and
+/// cache roots. The environment value is used only when it is absolute, as
+/// the XDG base-directory spec requires.
+fn user_dir(kind: UserDir) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let (name, fallback) = match kind {
+            UserDir::Config => ("APPDATA", &["AppData", "Roaming"][..]),
+            UserDir::State | UserDir::Cache => ("LOCALAPPDATA", &["AppData", "Local"][..]),
+        };
+        if let Some(base) = absolute_env(name) {
+            return Ok(base.join("epicenter"));
+        }
+        let mut path = home()?;
+        for part in fallback {
+            path.push(part);
+        }
+        Ok(path.join("epicenter"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let leaf = match kind {
+            UserDir::Config | UserDir::State => "Application Support",
+            UserDir::Cache => "Caches",
+        };
+        return Ok(home()?.join("Library").join(leaf).join("epicenter"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let (name, fallback) = match kind {
+            UserDir::Config => ("XDG_CONFIG_HOME", &[".config"][..]),
+            UserDir::State => ("XDG_STATE_HOME", &[".local", "state"][..]),
+            UserDir::Cache => ("XDG_CACHE_HOME", &[".cache"][..]),
+        };
+        if let Some(base) = absolute_env(name) {
+            return Ok(base.join("epicenter"));
+        }
+        let mut path = home()?;
+        for part in fallback {
+            path.push(part);
+        }
+        return Ok(path.join("epicenter"));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = kind;
+        anyhow::bail!("no supported user directory on this platform")
+    }
+}
+
 /// Process-wide effective Cargo home, installed once the policy is loaded.
 static CARGO_HOME_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
@@ -87,77 +151,16 @@ pub fn ambient_cargo_home() -> Result<PathBuf> {
 /// Per-user state (vault keys, last-build diagnostics), independent of both
 /// `CARGO_HOME` and the policy config path.
 pub fn state_dir() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-            let base = PathBuf::from(base);
-            if base.is_absolute() {
-                return Ok(base.join("epicenter"));
-            }
-        }
-        return Ok(home()?.join("AppData").join("Local").join("epicenter"));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(home()?
-            .join("Library")
-            .join("Application Support")
-            .join("epicenter"));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(base) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-            let base = PathBuf::from(base);
-            if base.is_absolute() {
-                return Ok(base.join("epicenter"));
-            }
-        }
-        return Ok(home()?.join(".local").join("state").join("epicenter"));
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        anyhow::bail!("no supported state directory on this platform")
-    }
+    user_dir(UserDir::State)
 }
 
 /// The per-user directory that holds epicenter's machine-level policy.
 ///
 /// This is intentionally independent of `CARGO_HOME`: the global
 /// `epicenter.toml` can set `cargo_home`, so it must be readable before the
-/// effective Cargo home is known. A relative `XDG_CONFIG_HOME`/`APPDATA` is
-/// ignored, as the XDG base-directory spec requires.
+/// effective Cargo home is known.
 pub fn global_config_dir() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(base) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
-            let base = PathBuf::from(base);
-            if base.is_absolute() {
-                return Ok(base.join("epicenter"));
-            }
-        }
-        return Ok(home()?.join("AppData").join("Roaming").join("epicenter"));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(home()?
-            .join("Library")
-            .join("Application Support")
-            .join("epicenter"));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-            let base = PathBuf::from(base);
-            if base.is_absolute() {
-                return Ok(base.join("epicenter"));
-            }
-        }
-        return Ok(home()?.join(".config").join("epicenter"));
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        anyhow::bail!("no supported global config directory on this platform")
-    }
+    user_dir(UserDir::Config)
 }
 
 /// The one machine-level policy file.
@@ -190,35 +193,7 @@ pub fn cargo_build_dir() -> Result<Option<String>> {
 /// derived from the shared build root: a shared build dir must not imply a
 /// shared, attacker-seedable work directory.
 pub fn default_work_root() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
-            return Ok(PathBuf::from(base).join("epicenter").join("work"));
-        }
-        return Ok(home()?
-            .join("AppData")
-            .join("Local")
-            .join("epicenter")
-            .join("work"));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(home()?
-            .join("Library")
-            .join("Caches")
-            .join("epicenter")
-            .join("work"));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-            let base = PathBuf::from(base);
-            if base.is_absolute() {
-                return Ok(base.join("epicenter").join("work"));
-            }
-        }
-        return Ok(home()?.join(".cache").join("epicenter").join("work"));
-    }
+    Ok(user_dir(UserDir::Cache)?.join("work"))
 }
 
 /// Default local cache for verified remote imports. Never the shared vault:

@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 /// How the bundled LLD is invoked on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,32 +210,8 @@ pub fn detect_wild() -> Result<FastLinker> {
 }
 
 fn rustc_host_and_sysroot() -> Result<(String, PathBuf)> {
-    let mut rustc = crate::util::command_for("rustc")?;
-    let output = rustc
-        .arg("-vV")
-        .output()
-        .context("running `rustc -vV` to find the host triple")?;
-    if !output.status.success() {
-        bail!("`rustc -vV` failed — is a toolchain installed?");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let host = text
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("`rustc -vV` did not report a host triple"))?
-        .to_string();
-
-    let mut rustc = crate::util::command_for("rustc")?;
-    let output = rustc
-        .args(["--print", "sysroot"])
-        .output()
-        .context("running `rustc --print sysroot`")?;
-    if !output.status.success() {
-        bail!("`rustc --print sysroot` failed — is a toolchain installed?");
-    }
-    let sysroot = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let host = crate::toolchain::rustc_info(None)?.host;
+    let sysroot = crate::toolchain::sysroot(None)?;
     Ok((host, sysroot))
 }
 

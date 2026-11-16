@@ -5,7 +5,7 @@
 //! cargo-home, registry source path, flags) so `doctor`/`exec` can explain a
 //! likely miss before Cargo recompiles.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::Path;
@@ -389,59 +389,17 @@ pub fn compare_compatibility(
 }
 
 fn local_rustc(selector: Option<&str>) -> Result<RustcIdentity> {
-    let mut command = crate::util::command_for("rustc")?;
-    if let Some(selector) = selector {
-        command.arg(format!("+{selector}"));
-    }
-    let output = command.arg("-vV").output().context("running `rustc -vV`")?;
-    if !output.status.success() {
-        bail!("`rustc -vV` failed — is a toolchain installed?");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut release = String::new();
-    let mut commit = String::new();
-    let mut host = String::new();
-    let mut llvm = String::new();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("rustc ") {
-            let mut parts = rest.split_whitespace();
-            if let Some(version) = parts.next() {
-                release = version.to_string();
-            }
-            if let Some(value) = parts.next() {
-                commit = value.trim_start_matches('(').to_string();
-            }
-        } else if let Some(value) = line.strip_prefix("host: ") {
-            host = value.trim().to_string();
-        } else if let Some(value) = line.strip_prefix("LLVM version: ") {
-            llvm = value.trim().to_string();
-        }
-    }
-    if release.is_empty() || commit.is_empty() || host.is_empty() {
-        bail!("`rustc -vV` did not report a complete toolchain identity");
-    }
+    let info = crate::toolchain::rustc_info(selector)?;
     Ok(RustcIdentity {
-        release,
-        commit,
-        host,
-        llvm,
+        release: info.release,
+        commit: info.commit,
+        host: info.host,
+        llvm: info.llvm,
     })
 }
 
 fn local_cargo(selector: Option<&str>) -> Result<String> {
-    let mut command = crate::util::command_for("cargo")?;
-    if let Some(selector) = selector {
-        command.arg(format!("+{selector}"));
-    }
-    let output = command.arg("-V").output().context("running `cargo -V`")?;
-    if !output.status.success() {
-        bail!("`cargo -V` failed — is Cargo installed?");
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        bail!("`cargo -V` returned an empty version");
-    }
-    Ok(text)
+    crate::toolchain::cargo_version(selector)
 }
 
 /// Registry identity from Cargo's config, defaulting to crates.io.
@@ -480,34 +438,27 @@ fn local_registry(cargo_home: &Path) -> RegistryIdentity {
 /// SHA-256 of the normalized absolute `$CARGO_HOME/registry/src` path.
 pub fn source_path_hash(cargo_home: &Path) -> String {
     let path = cargo_home.join("registry").join("src");
-    let mut text = path.to_string_lossy().replace('\\', "/");
-    while text.len() > 1 && text.ends_with('/') {
-        text.pop();
-    }
-    if cfg!(windows) {
-        text.make_ascii_lowercase();
-    }
-    sha256_hex(text.as_bytes())
+    sha256_hex(path_key(&path.to_string_lossy()).as_bytes())
 }
 
 fn compare(out: &mut Vec<Mismatch>, field: &str, expected: &str, actual: &str) {
     if expected != actual {
-        out.push(Mismatch {
-            field: field.to_string(),
-            expected: expected.to_string(),
-            actual: actual.to_string(),
-        });
+        push_mismatch(out, field, expected, actual);
     }
 }
 
 fn compare_path(out: &mut Vec<Mismatch>, field: &str, expected: &str, actual: &str) {
     if path_key(expected) != path_key(actual) {
-        out.push(Mismatch {
-            field: field.to_string(),
-            expected: expected.to_string(),
-            actual: actual.to_string(),
-        });
+        push_mismatch(out, field, expected, actual);
     }
+}
+
+fn push_mismatch(out: &mut Vec<Mismatch>, field: &str, expected: &str, actual: &str) {
+    out.push(Mismatch {
+        field: field.to_string(),
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    });
 }
 
 fn path_key(value: &str) -> String {

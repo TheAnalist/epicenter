@@ -15,6 +15,7 @@ pub mod prune;
 pub mod remote;
 pub mod settings;
 pub mod status;
+pub mod toolchain;
 pub mod util;
 pub mod vault;
 pub mod who;

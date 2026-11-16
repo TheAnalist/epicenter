@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::{
-    Compatibility, IndexPointer, PublisherMetadata, SCHEMA_VERSION, ensure_sha256, read_capped,
-    sha256_hex,
+    Compatibility, IndexPointer, PublisherMetadata, SCHEMA_VERSION, SignedIndex, ensure_sha256,
+    read_capped, sha256_hex,
 };
 use crate::settings::RemotePolicy;
 
@@ -73,16 +73,10 @@ pub fn load_state(remote: &RemotePolicy) -> Result<Option<RemoteState>> {
 
 pub(crate) fn load_state_at(root: &Path, remote: &RemotePolicy) -> Result<Option<RemoteState>> {
     let path = state_file(root, remote)?;
-    match crate::util::metadata_nofollow(&path) {
-        Ok(meta) => {
-            if !meta.is_file() {
-                bail!("remote state {} is not a regular file", path.display());
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", path.display()));
-        }
+    match crate::util::probe(&path, "remote state")? {
+        Some(meta) if meta.is_file() => {}
+        Some(_) => bail!("remote state {} is not a regular file", path.display()),
+        None => return Ok(None),
     }
     let bytes = read_capped(&path, MAX_STATE_BYTES, "remote state")?;
     let state: RemoteState =
@@ -126,33 +120,20 @@ impl RemoteState {
     }
 }
 
-/// Check the signed pointer against the persisted sequence and, when the body
-/// is new, persist it atomically. `body` must already be verified.
-pub fn record_state(
-    remote: &RemotePolicy,
-    pointer: &IndexPointer,
-    body: &super::IndexBody,
-    now: u64,
-) -> Result<()> {
-    record_state_at(&crate::paths::state_dir()?, remote, pointer, body, now)
+/// Check a verified index against the persisted sequence and, when it is new,
+/// persist it atomically.
+pub fn record_state(remote: &RemotePolicy, index: &SignedIndex, now: u64) -> Result<()> {
+    record_state_at(&crate::paths::state_dir()?, remote, index, now)
 }
 
 pub(crate) fn record_state_at(
     root: &Path,
     remote: &RemotePolicy,
-    pointer: &IndexPointer,
-    body: &super::IndexBody,
+    index: &SignedIndex,
     now: u64,
 ) -> Result<()> {
-    let pinned = remote
-        .publisher_key
-        .as_deref()
-        .context("remote has no publisher key")?;
-    pointer.verify(pinned, now)?;
-    let canonical = body.canonical_bytes()?;
-    let body = super::verify_body(pointer, &canonical, now)?;
-    body.validate_reader(remote.tier)?;
-    ensure_metadata_matches(pointer, &body)?;
+    let pointer = index.pointer();
+    let body = index.body();
     // Serialize the load-check-write per endpoint/key. Without this, two
     // concurrent fetches can both read the old sequence and accept different
     // bodies at the same sequence, or write a lower sequence after a higher
@@ -181,18 +162,6 @@ pub(crate) fn record_state_at(
     state.validate(remote)?;
     let bytes = serde_json::to_vec_pretty(&state)?;
     crate::util::write_atomic_private(&path, &bytes)?;
-    Ok(())
-}
-
-fn ensure_metadata_matches(pointer: &IndexPointer, body: &super::IndexBody) -> Result<()> {
-    ensure!(
-        body.schema == pointer.schema
-            && body.key_id == pointer.key_id
-            && body.sequence == pointer.sequence
-            && body.created == pointer.created
-            && body.expires == pointer.expires,
-        "remote index body does not match the signed pointer"
-    );
     Ok(())
 }
 

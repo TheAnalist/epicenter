@@ -58,41 +58,33 @@ pub fn cargo_config_path() -> Result<PathBuf> {
     // group/world-writable $CARGO_HOME lets another user swap the file after
     // any path-only check. Check the directory, then the file; the actual
     // read uses fstat on the opened descriptor (util::read_trusted_config).
-    match metadata_nofollow(&cargo_home) {
-        Ok(meta) => {
-            if !meta.is_dir() {
-                anyhow::bail!("CARGO_HOME {} is not a directory", cargo_home.display());
-            }
-            if !crate::util::owned_by_us(&cargo_home, &meta) {
+    if let Some(meta) = crate::util::probe(&cargo_home, "CARGO_HOME")? {
+        if !meta.is_dir() {
+            anyhow::bail!("CARGO_HOME {} is not a directory", cargo_home.display());
+        }
+        if !crate::util::owned_by_us(&cargo_home, &meta) {
+            anyhow::bail!(
+                "CARGO_HOME {} is owned by an untrusted principal",
+                cargo_home.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.mode() & 0o022 != 0 {
                 anyhow::bail!(
-                    "CARGO_HOME {} is owned by an untrusted principal",
-                    cargo_home.display()
-                );
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.mode() & 0o022 != 0 {
-                    anyhow::bail!(
-                        "CARGO_HOME {} is group/world-writable (mode {:o})",
-                        cargo_home.display(),
-                        meta.mode() & 0o777
-                    );
-                }
-            }
-            #[cfg(windows)]
-            if crate::util::windows_acl_is_private(&cargo_home) != Some(true) {
-                anyhow::bail!(
-                    "CARGO_HOME {} DACL grants write access to an untrusted principal",
-                    cargo_home.display()
+                    "CARGO_HOME {} is group/world-writable (mode {:o})",
+                    cargo_home.display(),
+                    meta.mode() & 0o777
                 );
             }
         }
-        // A missing CARGO_HOME is allowed here: setup creates it. The caller
-        // that reads or writes a path under it will still fail explicitly.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", cargo_home.display()));
+        #[cfg(windows)]
+        if crate::util::windows_acl_is_private(&cargo_home) != Some(true) {
+            anyhow::bail!(
+                "CARGO_HOME {} DACL grants write access to an untrusted principal",
+                cargo_home.display()
+            );
         }
     }
     let path = cargo_home.join("config.toml");
@@ -103,44 +95,36 @@ pub fn cargo_config_path() -> Result<PathBuf> {
         );
     }
     crate::util::ensure_windows_user_path(&path, "global cargo config")?;
-    match metadata_nofollow(&path) {
-        Ok(meta) => {
-            if !meta.is_file() {
+    if let Some(meta) = crate::util::probe(&path, "global cargo config")? {
+        if !meta.is_file() {
+            anyhow::bail!(
+                "global cargo config {} is not a regular file",
+                path.display()
+            );
+        }
+        if !crate::util::owned_by_us(&path, &meta) {
+            anyhow::bail!(
+                "global cargo config {} is owned by an untrusted principal",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.mode() & 0o022 != 0 {
                 anyhow::bail!(
-                    "global cargo config {} is not a regular file",
-                    path.display()
-                );
-            }
-            if !crate::util::owned_by_us(&path, &meta) {
-                anyhow::bail!(
-                    "global cargo config {} is owned by an untrusted principal",
-                    path.display()
-                );
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.mode() & 0o022 != 0 {
-                    anyhow::bail!(
-                        "global cargo config {} is group/world-writable (mode {:o})",
-                        path.display(),
-                        meta.mode() & 0o777
-                    );
-                }
-            }
-            #[cfg(windows)]
-            if crate::util::windows_acl_is_private(&path) != Some(true) {
-                anyhow::bail!(
-                    "global cargo config {} DACL grants write access to an untrusted principal",
-                    path.display()
+                    "global cargo config {} is group/world-writable (mode {:o})",
+                    path.display(),
+                    meta.mode() & 0o777
                 );
             }
         }
-        // No global cargo config yet; the caller returns the path it would
-        // create, and existing read paths use `exists()` before opening it.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", path.display()));
+        #[cfg(windows)]
+        if crate::util::windows_acl_is_private(&path) != Some(true) {
+            anyhow::bail!(
+                "global cargo config {} DACL grants write access to an untrusted principal",
+                path.display()
+            );
         }
     }
     Ok(path)
@@ -485,16 +469,6 @@ pub fn cargo_configured_in(table: &str, key: &str) -> Result<Option<String>> {
     Ok(read_table_key(&text, table, key))
 }
 
-/// Look up a `[build]` key in Cargo's *global* config file on disk.
-pub fn cargo_configured(key: &str) -> Result<Option<String>> {
-    let path = cargo_config_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = crate::util::read_trusted_config(&path, 1024 * 1024)?;
-    Ok(read_build_key(&text, key))
-}
-
 /// Read a `[build]` key from ANY cargo config file — doctor uses this to scan
 /// the ancestor `.cargo/config.toml` chain for shadowing values. Read-only.
 pub fn read_build_table_key(path: &Path, key: &str) -> Option<String> {
@@ -625,12 +599,7 @@ pub fn normalize_root_input(raw: &str) -> Result<PathBuf> {
     if raw.contains('{') && raw.contains('}') {
         return Ok(PathBuf::from(raw)); // template passthrough
     }
-    let home = paths::home()?;
-    if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-        let rest = raw[1..].trim_start_matches(['/', '\\']);
-        return Ok(home.join(rest));
-    }
-    let path = PathBuf::from(raw);
+    let path = crate::util::expand_tilde(raw)?;
     if path.is_absolute() {
         return Ok(path);
     }

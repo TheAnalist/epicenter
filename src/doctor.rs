@@ -420,7 +420,9 @@ fn check_ancestor_configs() -> Vec<Check> {
                 let Some(ancestor) = crate::config::read_build_table_key(&candidate, key) else {
                     continue; // key absent there — nothing to shadow
                 };
-                let home_value = crate::config::cargo_configured(key).ok().flatten();
+                let home_value = crate::config::cargo_configured_in("build", key)
+                    .ok()
+                    .flatten();
                 if home_value.as_deref() != Some(ancestor.as_str()) {
                     out.push(check(
                         section,
@@ -480,7 +482,7 @@ fn check_rustc_wrapper() -> Vec<Check> {
         }
     }
 
-    let configured = crate::config::cargo_configured("rustc-wrapper");
+    let configured = crate::config::cargo_configured_in("build", "rustc-wrapper");
     match configured {
         Err(e) => out.push(check(section, Level::Warn, format!("could not read the cargo config: {e:#}"))),
         Ok(None) => out.push(check(section,
@@ -1089,7 +1091,7 @@ pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
     let (cargo_home, cargo_home_source) = settings.cargo_home()?;
     let remote = settings.remote()?;
     let (active_linker, _) = active_linker();
-    let wrapper = crate::config::cargo_configured("rustc-wrapper")?;
+    let wrapper = crate::config::cargo_configured_in("build", "rustc-wrapper")?;
     let build_root = crate::config::cache_root().ok();
     let store = match settings.store()? {
         Some((path, _)) => path,
@@ -1757,7 +1759,7 @@ fn effective_jobs(cores: usize, cap: usize) -> (usize, String) {
             return (jobs, "project .cargo/config.toml".to_string());
         }
     }
-    if let Ok(Some(raw)) = crate::config::cargo_configured("jobs") {
+    if let Ok(Some(raw)) = crate::config::cargo_configured_in("build", "jobs") {
         if let Some(jobs) = parse_jobs(&raw, cores) {
             return (jobs, "global cargo config".to_string());
         }
@@ -1790,18 +1792,9 @@ fn project_cargo_jobs() -> Option<String> {
 }
 
 fn host_triple() -> Option<String> {
-    let output = crate::util::command_for("rustc")
-        .ok()?
-        .arg("-vV")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .map(|host| host.trim().to_string())
+    crate::toolchain::rustc_info(None)
+        .ok()
+        .map(|info| info.host)
 }
 
 fn active_linker() -> (String, Option<String>) {

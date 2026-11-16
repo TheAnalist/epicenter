@@ -701,12 +701,16 @@ fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> 
     println!(
         "  {} sequence {} · {} blob(s) · {} upload(s)",
         label("index"),
-        outcome.sequence,
+        outcome.index.pointer().sequence,
         outcome.blobs,
         outcome.uploads.len()
     );
-    println!("  {} expires {} (unix)", label("validity"), outcome.expires);
-    println!("  {} {}", label("key id"), outcome.key_id);
+    println!(
+        "  {} expires {} (unix)",
+        label("validity"),
+        outcome.index.body().expires
+    );
+    println!("  {} {}", label("key id"), outcome.index.pointer().key_id);
     println!("  {} {}", label("public key"), outcome.public_key);
     println!("  {} {}", label("staging"), outcome.out_dir.display());
     println!(
@@ -1661,7 +1665,7 @@ fn label(text: &str) -> String {
 fn exec_incremental(settings: &settings::Settings) -> Option<bool> {
     let (preset, _) = settings.preset();
     let (effective, _, _) = settings.effective_preset();
-    let wrapper = config::cargo_configured("rustc-wrapper")
+    let wrapper = config::cargo_configured_in("build", "rustc-wrapper")
         .ok()
         .flatten()
         .is_some();
@@ -1704,19 +1708,16 @@ fn cmd_exec(
             {
                 anyhow::bail!("--work-root must not contain `..`");
             }
-            let raw = path.to_string_lossy();
-            if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-                let rest = raw[1..].trim_start_matches(['/', '\\']);
-                epicenter_cli::paths::home()?.join(rest)
-            } else if path.is_absolute() {
-                path.to_path_buf()
+            let expanded = epicenter_cli::util::expand_tilde(&path.to_string_lossy())?;
+            if expanded.is_absolute() {
+                expanded
             } else {
                 let base = match cwd.as_deref() {
                     Some(dir) if dir.is_absolute() => dir.to_path_buf(),
                     Some(dir) => std::env::current_dir()?.join(dir),
                     None => std::env::current_dir()?,
                 };
-                base.join(path)
+                base.join(expanded)
             }
         }
         None => exec::work_root(&root),

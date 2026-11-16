@@ -46,10 +46,14 @@ pub(crate) fn multiline(value: &str, what: &str, max_bytes: usize) -> Result<()>
     Ok(())
 }
 
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
 /// Exactly `length` lowercase hex characters.
 pub(crate) fn lower_hex(value: &str, length: usize, what: &str) -> Result<()> {
     ensure!(
-        value.len() == length && value.bytes().all(super::is_lower_hex),
+        value.len() == length && value.bytes().all(is_lower_hex),
         "{what} must be {length} lowercase hex characters"
     );
     Ok(())
@@ -108,14 +112,7 @@ pub(crate) fn sorted_unique(
     max_items: usize,
     max_item_bytes: usize,
 ) -> Result<()> {
-    ensure!(
-        values.len() <= max_items,
-        "{what} has {} entries (cap {max_items})",
-        values.len()
-    );
-    for value in values {
-        text(value, what, max_item_bytes)?;
-    }
+    strings(values, what, max_items, max_item_bytes)?;
     ensure!(
         values.windows(2).all(|pair| pair[0] < pair[1]),
         "{what} must be sorted and unique"

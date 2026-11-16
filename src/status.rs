@@ -3,15 +3,12 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Result;
-use walkdir::WalkDir;
 
 use crate::prune;
-use crate::util;
 
 /// Size/count of one top-level bucket (usually a profile dir: `debug`, `release`).
 pub struct DirStat {
@@ -57,35 +54,14 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
     let mut buckets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     #[cfg(any(unix, windows))]
     let mut seen_inodes = std::collections::HashSet::new();
-    let mut budget = util::ScanBudget::new("status");
-    let walker = WalkDir::new(root)
-        .min_depth(1)
-        .max_depth(util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
-        .filter_entry(|entry| util::walk_entry_is_safe(root, entry));
-    for entry in walker {
-        budget.spend()?;
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue, // locked/unreadable: skip, never crash status
-        };
-        let meta: Metadata = match util::metadata_nofollow(&entry.path()) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-
+    let groups = prune::scan_with(root, "status", |path, meta| {
         #[cfg(unix)]
         let unique = {
             use std::os::unix::fs::MetadataExt;
             seen_inodes.insert((meta.dev(), meta.ino()))
         };
         #[cfg(windows)]
-        let unique = crate::util::windows_file_identity(entry.path())
+        let unique = crate::util::windows_file_identity(path)
             .map(|(volume, index, _, _)| seen_inodes.insert((u64::from(volume), index)))
             .unwrap_or(true);
         #[cfg(not(any(unix, windows)))]
@@ -95,20 +71,19 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
             summary.total_bytes = summary.total_bytes.saturating_add(meta.len());
         }
         summary.total_files = summary.total_files.saturating_add(1);
-        if crate::vault::link_count(entry.path(), &meta) > 1 {
+        if crate::vault::link_count(path, meta) > 1 {
             summary.linked_files += 1;
         }
-        if let Ok(mtime) = meta.modified() {
-            if summary.oldest.map_or(true, |oldest| mtime < oldest) {
-                summary.oldest = Some(mtime);
-            }
+        if let Ok(mtime) = meta.modified()
+            && summary.oldest.is_none_or(|oldest| mtime < oldest)
+        {
+            summary.oldest = Some(mtime);
         }
 
         // Bucket by the FIRST component under the cache root; files that
         // live directly IN the root have no directory component and go to
         // the synthetic "(cache root)" bucket.
-        let rel: Vec<String> = entry
-            .path()
+        let rel: Vec<String> = path
             .strip_prefix(root)
             .ok()
             .map(|rel| {
@@ -127,7 +102,7 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
             bucket.0 = bucket.0.saturating_add(meta.len());
         }
         bucket.1 = bucket.1.saturating_add(1);
-    }
+    })?;
 
     summary.dirs = buckets
         .into_iter()
@@ -135,7 +110,7 @@ pub fn summarize(root: &Path) -> Result<CacheSummary> {
         .collect();
     summary.dirs.sort_by_key(|dir| Reverse(dir.bytes));
 
-    summary.top_units = prune::scan(root)?
+    summary.top_units = groups
         .into_values()
         .map(|group| (group.key, group.bytes))
         .collect();

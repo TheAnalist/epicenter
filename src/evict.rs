@@ -229,13 +229,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
     }
 
     let store_root = crate::vault::store_root(build_root);
-    match metadata_nofollow(&store_root) {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", store_root.display()));
-        }
-    }
+    crate::util::probe(&store_root, "store")?;
     let active = crate::vault::parity_key().ok();
     let age_limit = opts
         .older_than
@@ -771,14 +765,8 @@ fn resolve_work_dir(work_root: &Path, target: &str) -> Result<PathBuf> {
     } else {
         PathBuf::from(target)
     };
-    let candidate_meta = match metadata_nofollow(&candidate) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!("no job dir named {target:?} — `epicenter vault` shows the work tier")
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", candidate.display()));
-        }
+    let Some(candidate_meta) = crate::util::probe(&candidate, "job dir")? else {
+        bail!("no job dir named {target:?} — `epicenter vault` shows the work tier")
     };
     if !candidate_meta.is_dir() {
         bail!("no job dir named {target:?} — `epicenter vault` shows the work tier");

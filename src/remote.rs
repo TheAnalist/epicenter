@@ -39,8 +39,8 @@ pub use compat::{
 };
 pub use index::{
     FileRole, IndexBody, IndexPointer, PublisherMetadata, PublisherReport, RemoteFile, RemoteUnit,
-    RemoteUnitKind, SourceKind, UnitSource, VerifiedIndex, make_index, publisher_report,
-    read_index_tree, verify_body, verify_index, write_index_tree,
+    RemoteUnitKind, SignedIndex, SourceKind, UnitSource, VerifiedIndex, make_index,
+    publisher_report, read_index_tree, verify_body, verify_index, write_index_tree,
 };
 pub use publish::{PublishOutcome, PublishRequest, publish};
 pub use state::{
@@ -50,7 +50,6 @@ pub use state::{
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Version of the pointer/body schema. A reader refuses anything else.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -71,33 +70,15 @@ pub const MAX_BLOB_BYTES: u64 = crate::util::MAX_FILE_BYTES;
 pub const MAX_INDEX_VALIDITY_SECS: u64 = 90 * 24 * 60 * 60;
 pub const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
-/// Unix seconds, saturating at zero for clocks before the epoch.
-pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
+pub use crate::util::now_secs;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     crate::vault::hex_encode(&Sha256::digest(bytes))
 }
 
-/// True for exactly 64 lowercase hex characters. Lowercase-only keeps one
-/// canonical spelling on case-insensitive filesystems.
-pub fn is_sha256(text: &str) -> bool {
-    text.len() == 64 && text.bytes().all(is_lower_hex)
-}
-
-pub(crate) fn is_lower_hex(byte: u8) -> bool {
-    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-}
-
+/// Verify the one canonical SHA-256 spelling used by every remote object.
 pub fn ensure_sha256(text: &str, what: &str) -> Result<()> {
-    if !is_sha256(text) {
-        anyhow::bail!("{what} must be 64 lowercase hex characters");
-    }
-    Ok(())
+    validate::lower_hex(text, 64, what)
 }
 
 /// Object key for an immutable blob.
