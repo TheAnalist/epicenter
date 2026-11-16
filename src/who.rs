@@ -11,6 +11,15 @@ use anyhow::{Context, Result, bail};
 use crate::fingerprint::{ArtifactInfo, DepRef, Unit, UnitKind, artifacts_for, read_units};
 use crate::util::{self, human_age, human_bytes};
 
+/// Names of the unit dirs currently present in a view. Used by `store
+/// overlap` to mark variants that are still linked into the shared build dir.
+pub fn active_unit_names(build_root: &Path) -> Result<std::collections::HashSet<String>> {
+    Ok(collect(build_root)?
+        .into_iter()
+        .map(|(unit, _)| unit.dir_name)
+        .collect())
+}
+
 /// Fully attached unit list, sorted by size (largest first).
 pub(crate) fn collect(build_root: &Path) -> Result<Vec<(Unit, ArtifactInfo)>> {
     let mut rows: Vec<(Unit, ArtifactInfo)> = read_units(build_root)?

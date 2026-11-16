@@ -2006,6 +2006,7 @@ pub(crate) fn hash_reader<R: Read>(reader: &mut R) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(unix)]
 pub(crate) fn sha256_file_fd(file: &mut File) -> std::io::Result<String> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(0))?;
@@ -2292,6 +2293,61 @@ pub(crate) fn create_temp(
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow::anyhow!("could not create a temp file in {}", dir.display())))
     .with_context(|| format!("creating a temp file in {}", dir.display()))
+}
+
+/// Create a uniquely named hard link to `src` in `dir`.
+pub(crate) fn link_temp(src: &Path, dir: &Path, prefix: &str) -> Result<PathBuf> {
+    let nonce = temp_nonce();
+    for attempt in 0..100u32 {
+        let path = dir.join(format!(
+            ".{prefix}-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match fs::hard_link(src, &path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("linking {} -> {}", src.display(), path.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not create a temp hard link in {}", dir.display())
+}
+
+/// Atomically replace `dst` with `src`, which must be on the same filesystem.
+pub(crate) fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+        let src = wide(src);
+        let dst = wide(dst);
+        let rc = unsafe {
+            MoveFileExW(
+                src.as_ptr(),
+                dst.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if rc == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(src, dst)
+    }
 }
 
 /// Atomically replace a private config file. The temp is created with
@@ -2863,6 +2919,26 @@ pub(crate) fn windows_file_identity(path: &Path) -> Option<(u32, u64, u32, u64)>
         info.nNumberOfLinks,
         file.metadata().ok()?.len(),
     ))
+}
+
+/// Stable per-filesystem identity for hard-link dedupe.
+pub(crate) fn file_identity(path: &Path, meta: &Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        windows_file_identity(path).map(|(volume, index, _, _)| (u64::from(volume), index))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, meta);
+        None
+    }
 }
 
 /// Hard-link a regular owned source into a new destination while hashing it.

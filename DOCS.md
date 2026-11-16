@@ -308,7 +308,8 @@ In CI or multi-VM agent fleets, share the **read-only vault** (`store/`) across 
 3. **Keep fleet parity & check for duplicate variants:**
    Every VM in a shared fleet must use the exact same Rust toolchain, host architecture, `RUSTFLAGS`, target, and Cargo profile settings.
    * **Tip:** Set `debug = "line-tables-only"` (for shared dev+CI fleets) or `debug = 0` (for CI-only fleets) in `Cargo.toml`. Different `debug` levels produce different unit hashes and prevent sharing. (`strip` only affects the final binary, not dependency units.)
-   * **Audit profile/package duplication:** Run `epicenter store overlap` (or `--json`) to see if mismatched profiles are storing duplicate variants of the same package in the vault.
+   * **Audit profile/package duplication:** Run `epicenter store overlap` to see package/profile pools with their nominal and actual unique bytes (hard links and compression counted once), distinct variants, units sharing a fingerprint hash, and how many units are still linked in the shared build dir. Add `--detail` for one row per unit (hash, generation, age, active) or `--json` for scripts. Different hashes are feature/profile/flag variants and cannot be merged.
+   * **Share identical bytes:** `epicenter store compact` scans `units/` and `blobs/` and replaces duplicate files with hard links to one inode. It only links byte-identical content, never changes manifests, and prints a no-op when nothing matches. Run `epicenter store verify` afterward.
 4. **Vault signing (who can publish):**
    The vault manifest is signed with Ed25519. Only the writer machine keeps the private key (in the per-user state folder; `doctor` shows the exact path). Readers only need the public key, which is stored in the vault as `.epicenter-pubkey`. You never copy the private key to other machines.
 5. **Builder / Uploader job (writable vault):**
@@ -615,6 +616,7 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter store publish ...` (hidden) | CI-only: sign one store generation into a local staging tree and print the upload plan |
 | `epicenter store vault` | List vault generations, sizes, and active status |
 | `epicenter store verify` | Verify vault file sizes, timestamps, hashes, and list active `work/` dirs |
-| `epicenter store overlap [--json]` | Report duplicate package/profile variants and repeated bytes in the vault |
+| `epicenter store overlap [--json] [--detail]` | Report package/profile variants, unique bytes, and active units in the vault |
+| `epicenter store compact [--generation <Q>] [--dry-run]` | Hard-link identical files and blobs in the vault; manifests stay unchanged |
 | `epicenter store prune [--older-than 30d] [--keep-latest N] [--incremental] [--yes]` | Age/count-based cleanup of the shared build dir (dry-run without `--yes`) |
 | `epicenter store evict [SELECTOR] [--tier all\|store\|view] [--yes]` | Deliberately remove units, generations, or `work/` dirs (dry-run without `--yes`) |

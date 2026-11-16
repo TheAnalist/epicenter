@@ -243,6 +243,19 @@ struct OverlapArgs {
     /// Machine-readable report.
     #[arg(long)]
     json: bool,
+    /// One row per stored unit: hash, generation, age, and active marker.
+    #[arg(long)]
+    detail: bool,
+}
+
+#[derive(clap::Args)]
+struct CompactArgs {
+    /// Only compact generations whose key contains this string.
+    #[arg(long)]
+    generation: Option<String>,
+    /// Show what would be linked without changing the store.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -499,6 +512,8 @@ enum StoreCommand {
     Restore(RestoreArgs),
     /// Report package/profile variants that occupy the vault repeatedly.
     Overlap(OverlapArgs),
+    /// Hard-link identical files and blobs in the vault.
+    Compact(CompactArgs),
     /// CI-only: sign a local index and stage the immutable object tree.
     #[command(hide = true)]
     Publish(PublishArgs),
@@ -621,6 +636,7 @@ fn cmd_store(command: StoreCommand, settings: &settings::Settings) -> Result<()>
             )
         }
         StoreCommand::Overlap(args) => cmd_overlap(&args),
+        StoreCommand::Compact(args) => cmd_compact(&args),
         StoreCommand::Publish(args) => cmd_publish(&args, settings),
     }
 }
@@ -1541,35 +1557,59 @@ fn cmd_prune(args: &PruneArgs) -> Result<()> {
 }
 
 fn cmd_overlap(args: &OverlapArgs) -> Result<()> {
-    let store = vault::store_root(&config::cache_root()?);
+    let build = config::cache_root()?;
+    let store = vault::store_root(&build);
     metadata_nofollow(&store)?;
-    let packages = vault::overlap(&store)?;
+    let active = match epicenter_cli::who::active_unit_names(&build) {
+        Ok(active) => active,
+        Err(err) => {
+            eprintln!(
+                "  {} could not read the active build view: {err:#}",
+                util::warn(util::GLYPH_WARN)
+            );
+            Default::default()
+        }
+    };
+    let packages = vault::overlap(&store, &active)?;
+
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &packages
-                    .iter()
-                    .map(|package| {
-                        serde_json::json!({
-                            "package": package.package,
-                            "profile": package.profile,
-                            "units": package.units,
-                            "hashes": package.hashes,
-                            "bytes": package.bytes,
-                            "generations": package.generations,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            )?
-        );
+        let report: Vec<_> = packages
+            .iter()
+            .map(|package| {
+                serde_json::json!({
+                    "package": &package.package,
+                    "profile": &package.profile,
+                    "units": package.units,
+                    "hashes": package.hashes,
+                    "identical": package.identical,
+                    "active": package.active,
+                    "bytes": package.bytes,
+                    "unique_bytes": package.unique_bytes,
+                    "generations": package.generations,
+                    "unit_rows": package
+                        .unit_rows
+                        .iter()
+                        .map(|unit| serde_json::json!({
+                            "name": &unit.name,
+                            "hash": &unit.hash,
+                            "generation": &unit.generation,
+                            "stamp": unit.stamp,
+                            "bytes": unit.bytes,
+                            "active": unit.active,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+
     println!(
         "{}",
         util::heading("epicenter store overlap — package/profile variants")
     );
-    let multi: Vec<_> = packages
+    let multi: Vec<&vault::OverlapPackage> = packages
         .iter()
         .filter(|package| package.units > 1)
         .collect();
@@ -1577,31 +1617,147 @@ fn cmd_overlap(args: &OverlapArgs) -> Result<()> {
         println!("  no package has more than one stored unit variant");
         return Ok(());
     }
-    println!(
-        "  {:<38} {:<10} {:>6} {:>6} {:>10} {:>5}",
-        util::dim("package"),
-        util::dim("profile"),
-        util::dim("units"),
-        util::dim("hashes"),
-        util::dim("bytes"),
-        util::dim("gens")
+
+    let width = multi
+        .iter()
+        .map(|package| package.package.len())
+        .max()
+        .unwrap_or(12)
+        .clamp(12, 48);
+    let header = format!(
+        "{:<width$} {:<10} {:>6} {:>8} {:>9} {:>8} {:>10} {:>10} {:>5}",
+        "package",
+        "profile",
+        "units",
+        "variants",
+        "same hash",
+        "active",
+        "nominal",
+        "unique",
+        "gens"
     );
-    for package in multi {
+    println!("  {}", util::dim(&header));
+    for package in &multi {
+        let nominal = format!("{:>10}", util::human_bytes(package.bytes));
+        let unique = format!("{:>10}", util::human_bytes(package.unique_bytes));
         println!(
-            "  {:<38} {:<10} {:>6} {:>6} {:>10} {:>5}",
+            "  {:<width$} {:<10} {:>6} {:>8} {:>9} {:>8} {} {} {:>5}",
             package.package,
             package.profile,
             package.units,
             package.hashes,
-            util::green(&util::human_bytes(package.bytes)),
+            package.identical,
+            package.active,
+            util::green(&nominal),
+            unique,
             package.generations
         );
     }
+
+    if args.detail {
+        for package in &multi {
+            println!();
+            println!(
+                "  {}",
+                util::dim(&format!("{} / {}", package.package, package.profile))
+            );
+            for unit in &package.unit_rows {
+                let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unit.stamp);
+                let generation: String = unit.generation.chars().take(18).collect();
+                let marker = if unit.active {
+                    util::green("active")
+                } else {
+                    util::dim("      ")
+                };
+                println!(
+                    "    {:<42} {:<16} {:>10}  {:>10}  {:<18} {}",
+                    unit.name,
+                    unit.hash,
+                    util::human_bytes(unit.bytes),
+                    util::human_age(at),
+                    generation,
+                    marker
+                );
+            }
+        }
+    }
+
     println!();
+    let identical: usize = packages.iter().map(|package| package.identical).sum();
+    if identical > 0 {
+        println!(
+            "  {} {} unit(s) share a fingerprint hash — `epicenter store compact` links only truly identical bytes",
+            util::info(util::GLYPH_INFO),
+            identical
+        );
+    }
     println!(
         "  {}",
-        util::dim("same package/profile with multiple hashes = feature, profile, or flag variants")
+        util::dim("different hashes = feature/profile/flag variants; they cannot be merged")
     );
+    if packages
+        .iter()
+        .any(|package| package.active < package.units)
+    {
+        println!(
+            "  {}",
+            util::dim("inactive variants can be evicted by hash — --detail lists them")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_compact(args: &CompactArgs) -> Result<()> {
+    let store = vault::store_root(&config::cache_root()?);
+    let report = vault::compact(&store, args.generation.as_deref(), args.dry_run)?;
+    println!(
+        "{}",
+        util::heading("epicenter store compact — shared inodes")
+    );
+    if report.generations == 0 {
+        println!("  no vault generations to compact");
+        return Ok(());
+    }
+    if report.groups == 0 {
+        println!("  nothing to compact — no duplicate files found");
+        if report.already_shared > 0 {
+            println!("  {} file(s) already share an inode", report.already_shared);
+        }
+        if report.skipped > 0 {
+            println!(
+                "  {} file(s) skipped (mode, type, or link error)",
+                report.skipped
+            );
+        }
+        return Ok(());
+    }
+    println!(
+        "  {} group(s) · {} file(s) {} · {} saved",
+        report.groups,
+        report.linked,
+        if args.dry_run { "to link" } else { "linked" },
+        util::green(&util::human_bytes(report.bytes_saved))
+    );
+    if report.already_shared > 0 {
+        println!("  {} file(s) already share an inode", report.already_shared);
+    }
+    if report.skipped > 0 {
+        println!(
+            "  {} file(s) skipped (mode, type, or link error)",
+            report.skipped
+        );
+    }
+    if args.dry_run {
+        println!(
+            "  {}",
+            util::dim("dry run — rerun without --dry-run to link")
+        );
+    } else {
+        println!(
+            "  {}",
+            util::dim("run `epicenter store verify` to audit the result")
+        );
+    }
     Ok(())
 }
 
@@ -2389,6 +2545,43 @@ mod cli_tests {
                 assert_eq!(args.valid_for, "7d");
             }
             _ => panic!("expected store publish"),
+        }
+    }
+
+    #[test]
+    fn compact_accepts_generation_and_dry_run() {
+        let cli = Cli::try_parse_from([
+            "epicenter",
+            "store",
+            "compact",
+            "--generation",
+            "1.99",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Store {
+                command: StoreCommand::Compact(args),
+            } => {
+                assert_eq!(args.generation.as_deref(), Some("1.99"));
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected store compact"),
+        }
+    }
+
+    #[test]
+    fn overlap_accepts_detail_and_json() {
+        let cli =
+            Cli::try_parse_from(["epicenter", "store", "overlap", "--detail", "--json"]).unwrap();
+        match cli.command {
+            Command::Store {
+                command: StoreCommand::Overlap(args),
+            } => {
+                assert!(args.detail);
+                assert!(args.json);
+            }
+            _ => panic!("expected store overlap"),
         }
     }
 }

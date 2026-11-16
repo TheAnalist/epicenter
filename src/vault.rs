@@ -260,6 +260,12 @@ fn store_lock_path(store_root: &Path, parity: &str) -> PathBuf {
     store_root.join(format!(".lock-{parity}"))
 }
 
+/// Acquire the writer lock for one generation. Shared by harvest/evict and
+/// `store compact` so none of them can relink a unit mid-write.
+pub(crate) fn lock_generation(store_root: &Path, generation: &str) -> Result<FileLock> {
+    FileLock::acquire(&store_lock_path(store_root, generation))
+}
+
 /// Remove the per-generation lock file when its generation directory is
 /// gone and no live process holds the lock. A held lock is left alone.
 pub(crate) fn remove_generation_lock(store_root: &Path, generation: &str) {
@@ -2217,6 +2223,19 @@ fn store_group(
     Ok(())
 }
 
+/// Extensionless build-tree files are build-script binaries and helper
+/// executables. They are copied/decompressed (never linked), so setting 0700
+/// on the private view copy cannot mutate the read-only store. Out archives
+/// and proc-macro objects keep their normal extension and link policy.
+#[cfg(unix)]
+fn needs_exec(file: &FileEntry) -> bool {
+    if file.role != "build-tree" {
+        return false;
+    }
+    let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+    !name.contains('.')
+}
+
 /// Library outputs bypass gzip (rustc reads them directly at restore time);
 /// all other artifacts are compressed when it wins.
 #[cfg(unix)]
@@ -2471,6 +2490,7 @@ fn restore_compressed_at(
     };
     let mut tmp = parent.create_excl(dst_name, 0o600)?;
     let result = (|| -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         let mut decoder = GzDecoder::new(input);
         util::copy_verified(
             &mut decoder,
@@ -2479,6 +2499,9 @@ fn restore_compressed_at(
             &file.sha256,
             Path::new(&file.path),
         )?;
+        if needs_exec(file) {
+            tmp.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
         util::set_stamp_fd(&tmp, stamp)?;
         Ok(())
     })();
@@ -2673,7 +2696,7 @@ fn restore_file_at(
     };
     #[cfg(not(unix))]
     let foreign_immutable = false;
-    let may_link = linkable && link.may_link(foreign_immutable);
+    let may_link = linkable && !needs_exec(file) && link.may_link(foreign_immutable);
     if may_link {
         if file.sha256.is_empty() {
             anyhow::bail!("{} has no recorded SHA-256", src.display());
@@ -2713,8 +2736,15 @@ fn restore_file_at(
         }
         Err(err) => return Err(err),
     };
-    let result = util::copy_fd_verified(&mut source, &mut tmp, file.size, &file.sha256)
-        .and_then(|_| util::set_stamp_fd(&tmp, stamp).map_err(anyhow::Error::from));
+    let result = (|| -> Result<()> {
+        util::copy_fd_verified(&mut source, &mut tmp, file.size, &file.sha256)?;
+        if needs_exec(file) {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+        util::set_stamp_fd(&tmp, stamp)?;
+        Ok(())
+    })();
     if let Err(err) = result {
         let _ = parent.unlink(dst_name);
         return Err(err);
@@ -4015,6 +4045,28 @@ fn display_join(path: &Path, base: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// One unit in a package/profile pool.
+#[derive(Debug, Default)]
+pub struct OverlapUnit {
+    pub name: String,
+    pub hash: String,
+    pub generation: String,
+    pub stamp: u64,
+    pub bytes: u64,
+    pub active: bool,
+}
+
+#[derive(Default)]
+struct OverlapPool {
+    units: usize,
+    bytes: u64,
+    files: Vec<PathBuf>,
+    hashes: std::collections::BTreeSet<String>,
+    generations: std::collections::BTreeSet<String>,
+    active: usize,
+    rows: Vec<OverlapUnit>,
+}
+
 /// One package/profile pool in the vault, used by the overlap report.
 #[derive(Debug, Default)]
 pub struct OverlapPackage {
@@ -4022,61 +4074,378 @@ pub struct OverlapPackage {
     pub profile: String,
     pub units: usize,
     pub hashes: usize,
+    /// Units that share a memo hash with another unit. This is a hint, not
+    /// proof of byte identity; `store compact` checks the actual file bytes.
+    pub identical: usize,
+    pub active: usize,
+    /// Recorded decoded bytes (the old `bytes` field).
     pub bytes: u64,
+    /// Actual on-disk bytes, with hard links counted once.
+    pub unique_bytes: u64,
     pub generations: usize,
+    pub unit_rows: Vec<OverlapUnit>,
 }
 
 /// Aggregated package/profile variants across every vault generation.
-pub fn overlap(store_root: &Path) -> Result<Vec<OverlapPackage>> {
-    if store_root.exists() {
-        check_store_trust(store_root)?;
-    }
-    let mut pools: std::collections::BTreeMap<
-        (String, String),
-        (
-            usize,
-            u64,
-            std::collections::BTreeSet<String>,
-            std::collections::BTreeSet<String>,
-        ),
-    > = std::collections::BTreeMap::new();
-    for generation in generation_names(store_root)? {
-        let Some(manifest) = load_manifest(store_root, &generation)? else {
-            continue;
-        };
-        for unit in &manifest.units {
-            let package = unit_package(&unit.name)
-                .unwrap_or(unit.name.as_str())
-                .to_string();
-            let entry = pools.entry((package, unit.profile.clone())).or_default();
-            entry.0 = entry.0.saturating_add(1);
-            entry.1 = unit
-                .files
-                .iter()
-                .fold(entry.1, |total, file| total.saturating_add(file.size));
-            entry.2.insert(generation.clone());
-            entry.3.insert(unit.hash.clone());
+/// `active` names are the unit dirs currently present in the shared build
+/// view; they are used to distinguish live variants from evictable ones.
+pub fn overlap(
+    store_root: &Path,
+    active: &std::collections::HashSet<String>,
+) -> Result<Vec<OverlapPackage>> {
+    let mut pools: std::collections::BTreeMap<(String, String), OverlapPool> =
+        std::collections::BTreeMap::new();
+    for stored in stored_units(store_root)? {
+        let package = unit_package(&stored.entry.name)
+            .unwrap_or(stored.entry.name.as_str())
+            .to_string();
+        let profile = stored.entry.profile.clone();
+        let mut bytes = 0u64;
+        let mut paths = Vec::with_capacity(stored.entry.files.len());
+        for file in &stored.entry.files {
+            bytes = bytes.saturating_add(file.size);
+            paths.push(stored.dir.join(&file.path));
         }
+        let is_active = active.contains(&stored.entry.name);
+        let row = OverlapUnit {
+            name: stored.entry.name.clone(),
+            hash: stored.entry.hash.clone(),
+            generation: stored.generation.clone(),
+            stamp: stored.entry.stamp,
+            bytes,
+            active: is_active,
+        };
+        let entry = pools.entry((package, profile)).or_default();
+        entry.units += 1;
+        entry.bytes = entry.bytes.saturating_add(bytes);
+        entry.files.extend(paths);
+        entry.hashes.insert(stored.entry.hash);
+        entry.generations.insert(stored.generation);
+        entry.active += usize::from(is_active);
+        entry.rows.push(row);
     }
-    let mut out: Vec<OverlapPackage> = pools
-        .into_iter()
-        .map(
-            |((package, profile), (units, bytes, generations, hashes))| OverlapPackage {
-                package,
-                profile,
-                units,
-                hashes: hashes.len(),
-                bytes,
-                generations: generations.len(),
-            },
-        )
-        .collect();
+
+    let mut out = Vec::with_capacity(pools.len());
+    for ((package, profile), mut pool) in pools {
+        pool.rows.sort_by(|left, right| {
+            right
+                .bytes
+                .cmp(&left.bytes)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        out.push(OverlapPackage {
+            package,
+            profile,
+            units: pool.units,
+            hashes: pool.hashes.len(),
+            identical: pool.units.saturating_sub(pool.hashes.len()),
+            active: pool.active,
+            bytes: pool.bytes,
+            unique_bytes: util::account_files(&pool.files).0,
+            generations: pool.generations.len(),
+            unit_rows: pool.rows,
+        });
+    }
     out.sort_by(|a, b| {
         b.bytes
             .cmp(&a.bytes)
             .then_with(|| a.package.cmp(&b.package))
     });
     Ok(out)
+}
+
+struct CompactFile {
+    path: PathBuf,
+    size: u64,
+    hash: String,
+    id: Option<(u64, u64)>,
+    /// Canonical unit stamp when this path is a raw manifest file. `None`
+    /// means the file is a blob/compressed path whose mtime `verify` ignores.
+    stamp: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum StampConstraint {
+    Unstamped,
+    Stamped(u64),
+    Ambiguous,
+}
+
+/// Summary of one `store compact` run.
+#[derive(Debug, Default)]
+pub struct CompactReport {
+    pub dry_run: bool,
+    pub generations: usize,
+    pub groups: usize,
+    pub linked: usize,
+    pub bytes_saved: u64,
+    pub already_shared: usize,
+    pub skipped: usize,
+}
+
+/// Hard-link identical regular files under the chosen generations' `units/`
+/// and `blobs/` trees. Manifests are never touched: paths, sizes and hashes
+/// stay exactly the same, only the inode is shared.
+pub fn compact(
+    store_root: &Path,
+    generation: Option<&str>,
+    dry_run: bool,
+) -> Result<CompactReport> {
+    let mut report = CompactReport {
+        dry_run,
+        ..Default::default()
+    };
+    let mut generations = generation_names(store_root)?;
+    if let Some(query) = generation {
+        generations.retain(|name| name.contains(query));
+        anyhow::ensure!(
+            !generations.is_empty(),
+            "no vault generation matches {query:?}"
+        );
+    }
+    report.generations = generations.len();
+    if generations.is_empty() {
+        return Ok(report);
+    }
+    check_store_trust(store_root)?;
+    // A dry run is a pure audit: no lock files, no temp cleanup. The real run
+    // holds every touched generation so harvest/evict cannot swap a unit.
+    let mut locks = Vec::new();
+    if !dry_run {
+        locks.reserve(generations.len());
+        for generation in &generations {
+            locks.push(lock_generation(store_root, generation)?);
+        }
+    }
+
+    // `verify` requires every raw manifest file's mtime to equal its unit
+    // stamp. A hard link shares the inode mtime, so raw files may only be
+    // grouped when their stamps match. Compressed unit paths and blobs are
+    // not mtime-checked (`verify` follows `object`), so they are unstamped.
+    let selected: std::collections::HashSet<&str> =
+        generations.iter().map(String::as_str).collect();
+    let mut raw_stamps: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
+    for stored in stored_units(store_root)? {
+        if !selected.contains(stored.generation.as_str()) {
+            continue;
+        }
+        for file in &stored.entry.files {
+            if file.object.is_none() {
+                raw_stamps.insert(stored.dir.join(&file.path), stored.entry.stamp);
+            }
+        }
+    }
+
+    let mut budget = util::ScanBudget::new("compact");
+    let mut hashes: std::collections::HashMap<(u64, u64), (u64, String)> =
+        std::collections::HashMap::new();
+    let mut files: Vec<CompactFile> = Vec::new();
+
+    for generation in &generations {
+        for dir in ["units", "blobs"] {
+            let base = store_root.join(generation).join(dir);
+            if util::probe(&base, "compact root")?.is_none() {
+                continue;
+            }
+            let walker = WalkDir::new(&base)
+                .min_depth(1)
+                .max_depth(util::MAX_SCAN_DEPTH)
+                .follow_links(false)
+                .follow_root_links(false)
+                .into_iter()
+                .filter_entry(|entry| util::walk_entry_is_safe(&base, entry));
+            for entry in walker {
+                budget.spend()?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        report.skipped += 1;
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let name = path.file_name().map(|name| name.to_string_lossy());
+                if name.as_deref().is_some_and(|name| name.starts_with('.')) {
+                    if !dry_run
+                        && name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with(".compact-"))
+                    {
+                        let _ = fs::remove_file(path);
+                    }
+                    continue;
+                }
+                let meta = match util::metadata_nofollow(path) {
+                    Ok(meta) => meta,
+                    Err(_) => {
+                        report.skipped += 1;
+                        continue;
+                    }
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let id = util::file_identity(path, &meta);
+                let (size, hash) = if let Some(id) = id
+                    && let Some(cached) = hashes.get(&id)
+                {
+                    cached.clone()
+                } else {
+                    let hash = match util::sha256_file(path) {
+                        Ok(hash) => hash,
+                        Err(_) => {
+                            report.skipped += 1;
+                            continue;
+                        }
+                    };
+                    let key = (meta.len(), hash);
+                    if let Some(id) = id {
+                        hashes.insert(id, key.clone());
+                    }
+                    key
+                };
+                files.push(CompactFile {
+                    path: path.to_path_buf(),
+                    size,
+                    hash,
+                    id,
+                    stamp: raw_stamps.get(path).copied(),
+                });
+            }
+        }
+    }
+
+    // One inode has one mtime. If aliases disagree about their raw stamp, the
+    // manifest itself is inconsistent; leave that inode alone.
+    let mut constraints: std::collections::HashMap<(u64, u64), StampConstraint> =
+        std::collections::HashMap::new();
+    for file in &files {
+        let Some(id) = file.id else {
+            continue;
+        };
+        let entry = constraints.entry(id).or_insert(StampConstraint::Unstamped);
+        match (file.stamp, *entry) {
+            (Some(stamp), StampConstraint::Unstamped) => {
+                *entry = StampConstraint::Stamped(stamp);
+            }
+            (Some(stamp), StampConstraint::Stamped(existing)) if existing != stamp => {
+                *entry = StampConstraint::Ambiguous;
+            }
+            _ => {}
+        }
+    }
+
+    let mut groups: std::collections::HashMap<(u64, String, Option<u64>), Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for file in files {
+        let stamp = match file.id {
+            Some(id) => match constraints.get(&id) {
+                Some(StampConstraint::Ambiguous) => {
+                    report.skipped += 1;
+                    continue;
+                }
+                Some(StampConstraint::Stamped(stamp)) => Some(*stamp),
+                Some(StampConstraint::Unstamped) | None => None,
+            },
+            None => file.stamp,
+        };
+        groups
+            .entry((file.size, file.hash, stamp))
+            .or_default()
+            .push(file.path);
+    }
+
+    for (_, mut paths) in groups {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort_by(|a, b| {
+            let a_blob = is_blob_path(a);
+            let b_blob = is_blob_path(b);
+            b_blob.cmp(&a_blob).then_with(|| a.cmp(b))
+        });
+        let canonical = paths.remove(0);
+        let canonical_meta = match fs::metadata(&canonical) {
+            Ok(meta) => meta,
+            Err(_) => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let canonical_id = util::file_identity(&canonical, &canonical_meta);
+        let mut counted = false;
+        for duplicate in paths {
+            let dup_meta = match util::metadata_nofollow(&duplicate) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            if !dup_meta.is_file() {
+                report.skipped += 1;
+                continue;
+            }
+            if let (Some(canonical_id), Some(dup_id)) =
+                (canonical_id, util::file_identity(&duplicate, &dup_meta))
+                && canonical_id == dup_id
+            {
+                report.already_shared += 1;
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if canonical_meta.mode() & 0o777 != dup_meta.mode() & 0o777 {
+                    report.skipped += 1;
+                    continue;
+                }
+            }
+            if !counted {
+                report.groups += 1;
+                counted = true;
+            }
+            if dry_run {
+                report.linked += 1;
+                report.bytes_saved = report.bytes_saved.saturating_add(dup_meta.len());
+                continue;
+            }
+            match link_replace(&canonical, &duplicate) {
+                Ok(()) => {
+                    report.linked += 1;
+                    report.bytes_saved = report.bytes_saved.saturating_add(dup_meta.len());
+                }
+                Err(err) => {
+                    report.skipped += 1;
+                    eprintln!("  could not compact {}: {err:#}", duplicate.display());
+                }
+            }
+        }
+    }
+
+    drop(locks);
+    Ok(report)
+}
+
+fn is_blob_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "blobs")
+}
+
+fn link_replace(canonical: &Path, duplicate: &Path) -> Result<()> {
+    let parent = duplicate
+        .parent()
+        .with_context(|| format!("{} has no parent", duplicate.display()))?;
+    let temp = util::link_temp(canonical, parent, "compact")?;
+    match util::replace_file(&temp, duplicate) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&temp);
+            Err(err).with_context(|| {
+                format!("linking {} -> {}", canonical.display(), duplicate.display())
+            })
+        }
+    }
 }
 
 // ── status ──────────────────────────────────────────────────────────────────
@@ -4356,10 +4725,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn overlap_groups_units_by_package_and_profile() -> Result<()> {
-        let store = tempfile::tempdir()?;
-        let unit = |hash: &str, size: u64| UnitEntry {
+    fn overlap_unit(hash: &str, size: u64) -> UnitEntry {
+        UnitEntry {
             name: format!("demo-{hash}"),
             profile: "debug".into(),
             memo: "lib-demo".into(),
@@ -4375,23 +4742,250 @@ mod tests {
                 role: "artifact".into(),
                 object: None,
             }],
-        };
+        }
+    }
+
+    fn write_overlap_unit(
+        store: &Path,
+        generation: &str,
+        hash: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf> {
+        let dir = store
+            .join(generation)
+            .join("units")
+            .join(format!("demo-{hash}"));
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("lib-demo");
+        fs::write(&file, bytes)?;
+        Ok(file)
+    }
+
+    #[test]
+    fn overlap_groups_units_by_package_and_profile() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let first = write_overlap_unit(
+            store.path(),
+            "generation",
+            "aaaaaaaaaaaaaaaa",
+            b"0123456789",
+        )?;
+        write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", &[7u8; 20])?;
         let manifest = Manifest {
             parity_key: "generation".into(),
             toolchain: "test".into(),
             created: 1,
             updated: 1,
-            units: vec![unit("aaaaaaaaaaaaaaaa", 10), unit("bbbbbbbbbbbbbbbb", 20)],
+            units: vec![
+                overlap_unit("aaaaaaaaaaaaaaaa", 10),
+                overlap_unit("bbbbbbbbbbbbbbbb", 20),
+            ],
             mac: String::new(),
             signature: String::new(),
         };
         save_manifest(store.path(), "generation", &manifest)?;
-        let report = overlap(store.path())?;
+        let active = std::collections::HashSet::from(["demo-aaaaaaaaaaaaaaaa".to_string()]);
+        let report = overlap(store.path(), &active)?;
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].package, "demo");
         assert_eq!(report[0].units, 2);
         assert_eq!(report[0].hashes, 2);
+        assert_eq!(report[0].identical, 0);
+        assert_eq!(report[0].active, 1);
         assert_eq!(report[0].bytes, 30);
+        assert_eq!(report[0].unique_bytes, 30);
+        assert!(first.is_file());
+        assert!(report[0].unit_rows.iter().any(|unit| unit.active));
+        Ok(())
+    }
+
+    #[test]
+    fn overlap_counts_identical_units_and_shared_inodes_once() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let first = write_overlap_unit(
+            store.path(),
+            "generation",
+            "aaaaaaaaaaaaaaaa",
+            b"0123456789",
+        )?;
+        let second_dir = store
+            .path()
+            .join("generation2")
+            .join("units")
+            .join("demo-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&second_dir)?;
+        #[cfg(unix)]
+        fs::hard_link(&first, second_dir.join("lib-demo"))?;
+        #[cfg(not(unix))]
+        fs::copy(&first, second_dir.join("lib-demo"))?;
+
+        for (generation, created) in [("generation", 1u64), ("generation2", 2u64)] {
+            let manifest = Manifest {
+                parity_key: generation.into(),
+                toolchain: "test".into(),
+                created,
+                updated: created,
+                units: vec![overlap_unit("aaaaaaaaaaaaaaaa", 10)],
+                mac: String::new(),
+                signature: String::new(),
+            };
+            save_manifest(store.path(), generation, &manifest)?;
+        }
+
+        let report = overlap(store.path(), &Default::default())?;
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].units, 2);
+        assert_eq!(report[0].hashes, 1);
+        assert_eq!(report[0].identical, 1);
+        #[cfg(unix)]
+        assert_eq!(report[0].unique_bytes, 10, "a hard link is counted once");
+        Ok(())
+    }
+
+    fn compact_manifest(generation: &str, hashes: &[&str], size: u64) -> Manifest {
+        Manifest {
+            parity_key: generation.into(),
+            toolchain: "test".into(),
+            created: 1,
+            updated: 1,
+            units: hashes.iter().map(|hash| overlap_unit(hash, size)).collect(),
+            mac: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    #[test]
+    fn compact_links_identical_files_and_is_idempotent() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let payload = b"identical payload";
+        let first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", payload)?;
+        let second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", payload)?;
+        save_manifest(
+            store.path(),
+            "generation",
+            &compact_manifest(
+                "generation",
+                &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"],
+                payload.len() as u64,
+            ),
+        )?;
+
+        let report = compact(store.path(), None, false)?;
+        assert_eq!(report.generations, 1);
+        assert_eq!(report.groups, 1);
+        assert_eq!(report.linked, 1);
+        assert_eq!(report.bytes_saved, payload.len() as u64);
+        assert_eq!(fs::read(&first)?, payload);
+        assert_eq!(fs::read(&second)?, payload);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&first)?.ino(), fs::metadata(&second)?.ino());
+        }
+
+        let again = compact(store.path(), None, false)?;
+        assert_eq!(again.groups, 0);
+        assert_eq!(again.linked, 0);
+        assert!(again.already_shared >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_dry_run_does_not_link() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let payload = b"dry-run payload";
+        let _first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", payload)?;
+        let _second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", payload)?;
+        save_manifest(
+            store.path(),
+            "generation",
+            &compact_manifest(
+                "generation",
+                &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"],
+                payload.len() as u64,
+            ),
+        )?;
+
+        let report = compact(store.path(), None, true)?;
+        assert_eq!(report.groups, 1);
+        assert_eq!(report.linked, 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(fs::metadata(&_first)?.ino(), fs::metadata(&_second)?.ino());
+        }
+        let applied = compact(store.path(), None, false)?;
+        assert_eq!(applied.linked, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_respects_raw_unit_stamps() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let _first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", b"same")?;
+        let _second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", b"same")?;
+        let mut one = overlap_unit("aaaaaaaaaaaaaaaa", 4);
+        one.stamp = 1;
+        let mut two = overlap_unit("bbbbbbbbbbbbbbbb", 4);
+        two.stamp = 2;
+        let manifest = Manifest {
+            parity_key: "generation".into(),
+            toolchain: "test".into(),
+            created: 1,
+            updated: 1,
+            units: vec![one, two],
+            mac: String::new(),
+            signature: String::new(),
+        };
+        save_manifest(store.path(), "generation", &manifest)?;
+
+        let report = compact(store.path(), None, false)?;
+        assert_eq!(report.groups, 0);
+        assert_eq!(report.linked, 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(fs::metadata(&_first)?.ino(), fs::metadata(&_second)?.ino());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_leaves_different_files_alone() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", b"one")?;
+        write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", b"two")?;
+        save_manifest(
+            store.path(),
+            "generation",
+            &compact_manifest("generation", &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], 3),
+        )?;
+        let report = compact(store.path(), None, false)?;
+        assert_eq!(report.groups, 0);
+        assert_eq!(report.linked, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_counts_already_hardlinked_files() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", b"shared")?;
+        let second_dir = store
+            .path()
+            .join("generation")
+            .join("units")
+            .join("demo-bbbbbbbbbbbbbbbb");
+        fs::create_dir_all(&second_dir)?;
+        fs::hard_link(&first, second_dir.join("lib-demo"))?;
+        save_manifest(
+            store.path(),
+            "generation",
+            &compact_manifest("generation", &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], 6),
+        )?;
+        let report = compact(store.path(), None, false)?;
+        assert_eq!(report.groups, 0);
+        assert_eq!(report.linked, 0);
+        assert!(report.already_shared >= 1);
         Ok(())
     }
 
@@ -4949,6 +5543,47 @@ mod tests {
         assert_eq!(again.units_already, 3);
         assert_eq!(again.files_linked, 0);
         assert_eq!(again.files_copied, 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_marks_build_script_binaries_executable() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        harvest(build.path(), store.path(), None, false)?;
+        let report = restore(view.path(), store.path(), None, None, false)?;
+        assert_eq!(report.errors, 0);
+
+        let path = view
+            .path()
+            .join("debug/build/x-1122334455667788/build_script_build-1122334455667788");
+        let mode = fs::metadata(&path)?.permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "a restored build-script binary must be executable: {mode:o}"
+        );
+
+        let stored = stored_units(store.path())?
+            .into_iter()
+            .find(|unit| unit.entry.name == "x-1122334455667788")
+            .and_then(|unit| {
+                unit.entry
+                    .files
+                    .iter()
+                    .find(|file| file.role == "build-tree")
+                    .map(|file| unit.dir.join(&file.path))
+            })
+            .expect("stored build-tree file");
+        assert_eq!(
+            fs::metadata(&stored)?.permissions().mode() & 0o777,
+            0o444,
+            "the store itself stays read-only"
+        );
         Ok(())
     }
 
