@@ -852,12 +852,9 @@ pub fn create_private_dir_all(path: &Path) -> Result<()> {
             .mode(0o700)
             .create(path)
             .with_context(|| format!("creating private directory {}", path.display()))?;
-        let Some(meta) = probe(path, "private directory")? else {
+        let Some(meta) = probe_dir(path, "private directory")? else {
             anyhow::bail!("{} is not a real directory", path.display());
         };
-        if !meta.is_dir() {
-            anyhow::bail!("{} is not a real directory", path.display());
-        }
         if !owned_by_us(path, &meta) {
             anyhow::bail!(
                 "{} is owned by uid {} — refusing to use a cache directory not owned by uid {}",
@@ -900,12 +897,9 @@ pub fn check_private_dir(path: &Path, privacy: Privacy) -> Result<()> {
     #[cfg(not(unix))]
     let _ = privacy;
     refuse_destructive_chmod(path)?;
-    let Some(meta) = probe(path, "private directory")? else {
+    let Some(meta) = probe_dir(path, "private directory")? else {
         anyhow::bail!("{} is not a real directory", path.display());
     };
-    if !meta.is_dir() {
-        anyhow::bail!("{} is not a real directory", path.display());
-    }
     if !owned_by_us(path, &meta) {
         anyhow::bail!(
             "{} is owned by an untrusted principal — refusing a shared/untrusted directory",
@@ -944,12 +938,9 @@ pub fn check_private_dir(path: &Path, privacy: Privacy) -> Result<()> {
 /// the current user, writable, and not group/world-writable (owner-only DACL
 /// on Windows).
 pub fn validate_private_dir(path: &Path, what: &str) -> Result<()> {
-    let Some(meta) = probe(path, what)? else {
+    let Some(meta) = probe_dir(path, what)? else {
         anyhow::bail!("{} {} does not exist", what, path.display());
     };
-    if !meta.is_dir() {
-        anyhow::bail!("{} {} is not a real directory", what, path.display());
-    }
     if !owned_by_us(path, &meta) {
         anyhow::bail!("{} {} is owned by another user", what, path.display());
     }
@@ -2295,6 +2286,62 @@ pub(crate) fn create_temp(
     .with_context(|| format!("creating a temp file in {}", dir.display()))
 }
 
+/// Run `write` on a fresh `O_EXCL` temp file in `dir`. The file is closed and
+/// its path returned on success; any error (including an error raised by
+/// `write`) unlinks the temp so a failed write leaves no debris.
+pub(crate) fn with_temp_file<R>(
+    dir: &Path,
+    prefix: &str,
+    suffix: &str,
+    mode: u32,
+    write: impl FnOnce(&mut File) -> Result<R>,
+) -> Result<(PathBuf, R)> {
+    let (path, mut file) = create_temp(dir, prefix, suffix, mode)?;
+    match write(&mut file) {
+        Ok(value) => {
+            drop(file);
+            Ok((path, value))
+        }
+        Err(err) => {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            Err(err)
+        }
+    }
+}
+
+/// Create a uniquely named staging directory in `dir`. `O_EXCL` semantics:
+/// a pre-planted name is never reused, and the result is private on Unix.
+pub(crate) fn create_temp_dir(dir: &Path, prefix: &str) -> Result<PathBuf> {
+    let nonce = temp_nonce();
+    for attempt in 0..100u32 {
+        let path = dir.join(format!(
+            ".{prefix}-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    {
+                        let _ = fs::remove_dir(&path);
+                        return Err(err).with_context(|| format!("securing {}", path.display()));
+                    }
+                }
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("creating staging dir {}", path.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not create a unique staging dir in {}", dir.display())
+}
+
 /// Create a uniquely named hard link to `src` in `dir`.
 pub(crate) fn link_temp(src: &Path, dir: &Path, prefix: &str) -> Result<PathBuf> {
     let nonce = temp_nonce();
@@ -2363,39 +2410,14 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
+    let (tmp, ()) = with_temp_file(parent, &format!("{base}.tmp"), "", 0o600, |file| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })
+    .with_context(|| format!("writing {}", path.display()))?;
     let mut last_error = None;
-    let nonce = temp_nonce();
     for attempt in 0..100u32 {
-        let tmp = parent.join(format!(
-            ".{base}.tmp-{}-{nonce}-{attempt}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&tmp) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("creating {}", tmp.display()));
-            }
-        };
-        if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("writing {}", tmp.display()));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Use the held fd, never a path that could be swapped.
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("securing {}", tmp.display()))?;
-        }
-        drop(file);
         match fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
             #[cfg(windows)]
@@ -2417,13 +2439,13 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
             }
             Err(err) => {
                 last_error = Some(err);
-                let _ = fs::remove_file(&tmp);
                 if attempt < 99 {
                     continue;
                 }
             }
         }
     }
+    let _ = fs::remove_file(&tmp);
     Err(last_error
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow::anyhow!("could not atomically write {}", path.display())))
@@ -2438,18 +2460,12 @@ pub fn copy_file_hashed(src: &Path, dst: &Path) -> Result<(u64, String)> {
 }
 
 fn copy_file_hashed_mode(src: &Path, dst: &Path, require_owner: bool) -> Result<(u64, String)> {
-    let Some(meta) = probe(src, "source")? else {
+    let Some(meta) = probe_file(src, "source")? else {
         anyhow::bail!(
             "{} is not a regular file (symlink/special file refused)",
             src.display()
         );
     };
-    if !meta.is_file() {
-        anyhow::bail!(
-            "{} is not a regular file (symlink/special file refused)",
-            src.display()
-        );
-    }
     if require_owner && !owned_by_us(src, &meta) {
         anyhow::bail!(
             "{} is owned by another user — refusing to copy it into the vault",
@@ -2584,18 +2600,12 @@ pub(crate) fn compress_file_hashed(
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
-    let Some(meta) = probe(src, "source")? else {
+    let Some(meta) = probe_file(src, "source")? else {
         anyhow::bail!(
             "{} is not a regular file (symlink/special file refused)",
             src.display()
         );
     };
-    if !meta.is_file() {
-        anyhow::bail!(
-            "{} is not a regular file (symlink/special file refused)",
-            src.display()
-        );
-    }
     if !owned_by_us(src, &meta) {
         anyhow::bail!(
             "{} is owned by another user — refusing to compress it into the vault",
@@ -2619,13 +2629,11 @@ pub(crate) fn compress_file_hashed(
 
     let blobs = generation_root.join("blobs");
     create_private_dir_all(&blobs)?;
-    let (tmp_path, tmp_file) = create_temp(&blobs, "tmp", ".gz", 0o600)?;
-
-    let mut encoder = GzEncoder::new(tmp_file, Compression::fast());
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut size = 0u64;
-    let result = (|| -> Result<()> {
+    let (tmp_path, (sha, size)) = with_temp_file(&blobs, "tmp", ".gz", 0o600, |file| {
+        let mut encoder = GzEncoder::new(&mut *file, Compression::fast());
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut size = 0u64;
         loop {
             let n = input.read(&mut buf)?;
             if n == 0 {
@@ -2635,14 +2643,11 @@ pub(crate) fn compress_file_hashed(
             encoder.write_all(&buf[..n])?;
             size += n as u64;
         }
-        encoder.finish()?.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err).with_context(|| format!("compressing {}", src.display()));
-    }
-    let sha = format!("{:x}", hasher.finalize());
+        encoder.finish()?;
+        file.sync_all()?;
+        Ok((format!("{:x}", hasher.finalize()), size))
+    })
+    .with_context(|| format!("compressing {}", src.display()))?;
     let compressed_size = fs::metadata(&tmp_path)?.len();
     if compressed_size >= size {
         let _ = fs::remove_file(&tmp_path);
@@ -2657,8 +2662,15 @@ pub(crate) fn compress_file_hashed(
     // The blob name is its content hash. Never follow or replace a planted
     // symlink, and never silently accept bytes that do not match the name.
     let mut install = true;
-    match metadata_nofollow(&final_path) {
-        Ok(meta) => {
+    let existing = match probe_kind(&final_path) {
+        Ok(probed) => probed,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    };
+    match existing {
+        Probed::Real(meta) => {
             if !meta.is_file() {
                 let _ = fs::remove_file(&tmp_path);
                 anyhow::bail!(
@@ -2681,18 +2693,14 @@ pub(crate) fn compress_file_hashed(
             install = false;
             let _ = fs::remove_file(&tmp_path);
         }
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+        Probed::Reparse => {
             let _ = fs::remove_file(&tmp_path);
             anyhow::bail!(
                 "blob path {} is a symlink/reparse or not a regular file",
                 final_path.display()
             );
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err).with_context(|| format!("inspecting {}", final_path.display()));
-        }
+        Probed::Missing => {}
     }
     if install {
         match fs::rename(&tmp_path, &final_path) {
@@ -2951,18 +2959,12 @@ pub(crate) fn file_identity(path: &Path, meta: &Metadata) -> Option<(u64, u64)> 
 pub fn try_link_file_hashed(src: &Path, dst: &Path) -> Result<Option<(u64, String)>> {
     use std::os::unix::fs::MetadataExt;
 
-    let Some(before) = probe(src, "source")? else {
+    let Some(before) = probe_file(src, "source")? else {
         anyhow::bail!(
             "{} is not a regular file (symlink/special file refused)",
             src.display()
         );
     };
-    if !before.is_file() {
-        anyhow::bail!(
-            "{} is not a regular file (symlink/special file refused)",
-            src.display()
-        );
-    }
     if !owned_by_us(src, &before) {
         anyhow::bail!(
             "{} is owned by another user — refusing to link it into the vault",
@@ -3280,6 +3282,175 @@ pub fn probe(path: &Path, what: &str) -> Result<Option<Metadata>> {
     }
 }
 
+/// What a no-follow probe found, keeping reparse points distinct from absence.
+pub(crate) enum Probed {
+    /// The path does not exist.
+    Missing,
+    /// The entry is a symlink or reparse point.
+    Reparse,
+    /// A real entry (directory, file, or special file).
+    Real(Metadata),
+}
+
+/// Probe without collapsing absence and a link: callers that must handle a
+/// reparse entry differently from a missing one match on [`Probed`].
+pub(crate) fn probe_kind(path: &Path) -> Result<Probed> {
+    match metadata_nofollow(path) {
+        Ok(meta) => Ok(Probed::Real(meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Probed::Missing),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(Probed::Reparse),
+        Err(err) => Err(err).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+/// Probe for scan loops: absent and link/reparse entries both read as `None`,
+/// so an unreadable or swapped entry is skipped instead of aborting the walk.
+pub(crate) fn probe_lenient(path: &Path) -> Result<Option<Metadata>> {
+    match metadata_nofollow(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+/// Probe an optional directory: absent reads as `None`, any other non-directory
+/// entry is rejected.
+pub(crate) fn probe_dir(path: &Path, what: &str) -> Result<Option<Metadata>> {
+    let Some(meta) = probe(path, what)? else {
+        return Ok(None);
+    };
+    if !meta.is_dir() {
+        anyhow::bail!("{what} {} is not a real directory", path.display());
+    }
+    Ok(Some(meta))
+}
+
+/// Probe an optional regular file: absent reads as `None`; a directory,
+/// symlink, or special file is rejected.
+pub(crate) fn probe_file(path: &Path, what: &str) -> Result<Option<Metadata>> {
+    let Some(meta) = probe(path, what)? else {
+        return Ok(None);
+    };
+    if !meta.is_file() {
+        anyhow::bail!(
+            "{what} {} is not a regular file (symlink/special file refused)",
+            path.display()
+        );
+    }
+    Ok(Some(meta))
+}
+
+/// Verify that `path` is a regular file of exactly `size` bytes whose SHA-256
+/// is `sha256`. `what` names the object in errors (e.g. "CAS object").
+pub(crate) fn verify_file_hash(path: &Path, size: u64, sha256: &str, what: &str) -> Result<()> {
+    let meta =
+        metadata_nofollow(path).with_context(|| format!("inspecting {what} {}", path.display()))?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "{what} {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        meta.len() == size,
+        "{what} {} has the wrong size (expected {size}, found {})",
+        path.display(),
+        meta.len()
+    );
+    anyhow::ensure!(
+        sha256_file(path)? == sha256,
+        "{what} {} failed its SHA-256 check",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The entry type a trust check expects.
+#[derive(Clone, Copy)]
+pub(crate) enum PathKind {
+    Dir,
+    File,
+}
+
+/// Which permission policy a trusted path must satisfy.
+#[derive(Clone, Copy)]
+pub(crate) enum TrustPolicy {
+    /// Group/world may read, but never write (config files, CARGO_HOME).
+    NoForeignWrite,
+    /// Only the owner may access it at all (stores and caches).
+    OwnerOnly,
+}
+
+/// Verify an existing path is trusted: expected type, owned by us, and not
+/// writable by another principal. `Ok(None)` means the path is absent; the
+/// caller decides whether absence is acceptable. The returned no-follow
+/// metadata lets callers apply further checks without a second stat.
+pub(crate) fn check_trusted_path(
+    path: &Path,
+    kind: PathKind,
+    policy: TrustPolicy,
+    what: &str,
+) -> Result<Option<Metadata>> {
+    // Windows has one policy: owner/SYSTEM/Administrators may write.
+    #[cfg(not(unix))]
+    let _ = policy;
+    let Some(meta) = probe(path, what)? else {
+        return Ok(None);
+    };
+    match kind {
+        PathKind::Dir => {
+            anyhow::ensure!(
+                meta.is_dir(),
+                "{what} {} is not a real directory",
+                path.display()
+            );
+        }
+        PathKind::File => {
+            anyhow::ensure!(
+                meta.is_file(),
+                "{what} {} is not a regular file",
+                path.display()
+            );
+        }
+    }
+    if !owned_by_us(path, &meta) {
+        anyhow::bail!(
+            "{what} {} is owned by an untrusted principal",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode() & 0o777;
+        match policy {
+            TrustPolicy::NoForeignWrite if mode & 0o022 != 0 => anyhow::bail!(
+                "{what} {} is group/world-writable (mode {mode:o})",
+                path.display()
+            ),
+            TrustPolicy::OwnerOnly if mode & 0o077 != 0 => anyhow::bail!(
+                "{what} {} is accessible by other users (mode {mode:o}); it must be 0700",
+                path.display()
+            ),
+            _ => {}
+        }
+    }
+    #[cfg(windows)]
+    if windows_acl_is_private(path) != Some(true) {
+        anyhow::bail!(
+            "{what} {} DACL grants write access to an untrusted principal",
+            path.display()
+        );
+    }
+    Ok(Some(meta))
+}
+
 /// The I/O error at the root of an `anyhow` chain, if the chain ends in one.
 pub fn io_error(err: &anyhow::Error) -> Option<&std::io::Error> {
     err.root_cause().downcast_ref::<std::io::Error>()
@@ -3315,20 +3486,67 @@ pub(crate) fn has_reparse_component(base: &Path, target: &Path) -> bool {
     false
 }
 
-/// `WalkDir::filter_entry` predicate: regular files pass; a directory or link
-/// is checked for a reparse component so a junction subtree is skipped before
-/// it is traversed.
+/// `WalkDir::filter_entry` predicate: regular files pass; a symlink is
+/// rejected; a directory is accepted only when it is not itself a reparse
+/// point. Ancestors were already vetted when they were yielded (the walker
+/// prunes a rejected subtree), so this is one entry check instead of a
+/// component walk per entry.
 ///
 /// The walker must also use `follow_links(false)` and
 /// `follow_root_links(false)`: WalkDir follows a symlinked **root** by default
 /// even when `follow_links(false)` is set, and the root entry is not yielded
 /// when `min_depth(1)` is used, so this predicate never sees it.
-pub(crate) fn walk_entry_is_safe(base: &Path, entry: &walkdir::DirEntry) -> bool {
+pub(crate) fn walk_entry_is_safe(entry: &walkdir::DirEntry) -> bool {
     let kind = entry.file_type();
-    if !(kind.is_dir() || kind.is_symlink()) {
+    if kind.is_symlink() {
+        return false;
+    }
+    if !kind.is_dir() {
         return true;
     }
-    !has_reparse_component(base, entry.path())
+    // A Windows junction reports `is_dir()` without `is_symlink()`; only the
+    // reparse attribute distinguishes it. On Unix a directory entry is real.
+    #[cfg(windows)]
+    {
+        metadata_nofollow(entry.path()).is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// A bounded, junction-safe tree walk. The safety predicate is part of the
+/// constructor so every scan skips a reparse subtree instead of traversing it.
+pub(crate) struct SafeWalk<'a> {
+    base: &'a Path,
+    contents_first: bool,
+}
+
+impl<'a> SafeWalk<'a> {
+    pub(crate) fn new(base: &'a Path) -> Self {
+        Self {
+            base,
+            contents_first: false,
+        }
+    }
+
+    /// Visit children before their parent — required before removing a tree.
+    pub(crate) fn bottom_up(mut self) -> Self {
+        self.contents_first = true;
+        self
+    }
+
+    pub(crate) fn walk(self) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + 'a {
+        WalkDir::new(self.base)
+            .min_depth(1)
+            .max_depth(MAX_SCAN_DEPTH)
+            .follow_links(false)
+            .follow_root_links(false)
+            .contents_first(self.contents_first)
+            .into_iter()
+            .filter_entry(walk_entry_is_safe)
+    }
 }
 
 #[cfg(test)]
@@ -3445,6 +3663,93 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn with_temp_file_unlinks_on_failure_and_returns_the_path_on_success() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let err = with_temp_file(dir.path(), "probe", ".tmp", 0o600, |file| -> Result<()> {
+            file.write_all(b"partial")?;
+            anyhow::bail!("stop")
+        });
+        assert!(err.is_err());
+        assert_eq!(fs::read_dir(dir.path())?.count(), 0, "no temp debris");
+
+        let (path, written) = with_temp_file(dir.path(), "probe", ".tmp", 0o600, |file| {
+            file.write_all(b"complete")?;
+            file.sync_all()?;
+            Ok(7u8)
+        })?;
+        assert_eq!(written, 7);
+        assert_eq!(fs::read(&path)?, b"complete");
+        assert_eq!(path.parent(), Some(dir.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn create_temp_dir_names_are_unique() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = create_temp_dir(dir.path(), "stage")?;
+        let second = create_temp_dir(dir.path(), "stage")?;
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_kind_separates_missing_reparse_and_real() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(matches!(
+            probe_kind(&dir.path().join("missing"))?,
+            Probed::Missing
+        ));
+        let file = dir.path().join("file");
+        fs::write(&file, b"x")?;
+        assert!(matches!(probe_kind(&file)?, Probed::Real(_)));
+        assert!(probe_lenient(&file)?.is_some());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&file, &link)?;
+            assert!(matches!(probe_kind(&link)?, Probed::Reparse));
+            assert!(probe_lenient(&link)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn verify_file_hash_checks_size_and_digest() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("artifact");
+        fs::write(&path, b"payload")?;
+        let hash = sha256_file(&path)?;
+        verify_file_hash(&path, 7, &hash, "test object")?;
+        assert!(verify_file_hash(&path, 8, &hash, "test object").is_err());
+        assert!(verify_file_hash(&path, 7, "deadbeef", "test object").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_path_policy_distinguishes_world_write_from_owner_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if euid() == 0 {
+            return Ok(()); // root ignores mode bits; the policy test does not apply
+        }
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750))?;
+        assert!(
+            check_trusted_path(&path, PathKind::Dir, TrustPolicy::NoForeignWrite, "store")?
+                .is_some()
+        );
+        assert!(check_trusted_path(&path, PathKind::Dir, TrustPolicy::OwnerOnly, "store").is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        assert!(
+            check_trusted_path(&path, PathKind::Dir, TrustPolicy::OwnerOnly, "store")?.is_some()
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn walk_filter_skips_a_symlinked_subtree() -> Result<()> {
@@ -3455,40 +3760,31 @@ mod tests {
         fs::write(root.path().join("real/file"), b"x")?;
         std::os::unix::fs::symlink(victim.path(), root.path().join("link"))?;
 
-        for follow in [false, true] {
-            let visited: Vec<PathBuf> = walkdir::WalkDir::new(root.path())
-                .min_depth(1)
-                .follow_links(follow)
-                .into_iter()
-                .filter_entry(|entry| walk_entry_is_safe(root.path(), entry))
-                .filter_map(Result::ok)
-                .map(|entry| entry.into_path())
-                .collect();
-            assert!(
-                visited
-                    .iter()
-                    .any(|path| path == &root.path().join("real/file")),
-                "regular files must still be visited"
-            );
-            assert!(
-                !visited
-                    .iter()
-                    .any(|path| path.starts_with(root.path().join("link"))
-                        || path.starts_with(victim.path())),
-                "a symlink subtree must be skipped (follow={follow})"
-            );
-        }
+        let visited: Vec<PathBuf> = SafeWalk::new(root.path())
+            .walk()
+            .filter_map(Result::ok)
+            .map(|entry| entry.into_path())
+            .collect();
+        assert!(
+            visited
+                .iter()
+                .any(|path| path == &root.path().join("real/file")),
+            "regular files must still be visited"
+        );
+        assert!(
+            !visited
+                .iter()
+                .any(|path| path.starts_with(root.path().join("link"))
+                    || path.starts_with(victim.path())),
+            "a symlink subtree must be skipped"
+        );
 
         // WalkDir follows a symlinked root by default even with
-        // follow_links(false); follow_root_links(false) must stop it.
+        // follow_links(false); the shared constructor must stop it.
         let linked_root = root.path().join("linked-root");
         std::os::unix::fs::symlink(victim.path(), &linked_root)?;
-        let visited: Vec<PathBuf> = walkdir::WalkDir::new(&linked_root)
-            .min_depth(1)
-            .follow_links(false)
-            .follow_root_links(false)
-            .into_iter()
-            .filter_entry(|entry| walk_entry_is_safe(&linked_root, entry))
+        let visited: Vec<PathBuf> = SafeWalk::new(&linked_root)
+            .walk()
             .filter_map(Result::ok)
             .map(|entry| entry.into_path())
             .collect();

@@ -275,20 +275,17 @@ struct Loaded {
 
 impl Loaded {
     fn read(path: &Path) -> Result<Option<Self>> {
-        let meta = match metadata_nofollow(path) {
-            Ok(meta) => meta,
+        let meta = match crate::util::probe_kind(path)? {
             // A missing project file is normal; a missing global file means
             // "no explicit policy", not an error.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            crate::util::Probed::Missing => return Ok(None),
+            crate::util::Probed::Reparse => {
                 anyhow::bail!(
                     "configuration path {} is a symlink/reparse or not a regular file",
                     path.display()
                 );
             }
-            Err(err) => {
-                return Err(err).with_context(|| format!("inspecting {}", path.display()));
-            }
+            crate::util::Probed::Real(meta) => meta,
         };
         if !meta.is_file() {
             anyhow::bail!(
@@ -665,34 +662,14 @@ fn validate_project_store(path: &Path, project_dir: &Path) -> Result<()> {
             path.display()
         );
     }
-    if let Some(meta) = crate::util::probe(path, "store")? {
-        if !meta.is_dir() {
-            bail!("store {} is not a real directory", path.display());
-        }
-        if !crate::util::owned_by_us(path, &meta) {
-            bail!(
-                "store {} is owned by an untrusted principal",
-                path.display()
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.mode() & 0o077 != 0 {
-                bail!(
-                    "project store {} is accessible by other users (mode {:o}); a project-selected store must be 0700",
-                    path.display(),
-                    meta.mode() & 0o777
-                );
-            }
-        }
-        #[cfg(windows)]
-        if crate::util::windows_acl_is_private(path) != Some(true) {
-            bail!(
-                "project store {} DACL grants write access to an untrusted principal",
-                path.display()
-            );
-        }
+    if crate::util::check_trusted_path(
+        path,
+        crate::util::PathKind::Dir,
+        crate::util::TrustPolicy::OwnerOnly,
+        "project store",
+    )?
+    .is_some()
+    {
         let marker = path.join(crate::vault::STORE_MARKER);
         if !marker.is_file() {
             // An empty directory is a fresh store: the writer creates and
@@ -721,11 +698,7 @@ fn validate_store_path(path: &Path) -> Result<()> {
     crate::util::reject_protected_path(path, "store path")?;
     // Reject a symlinked final component even when the target is benign: the
     // store is a deletion root, so its identity must be the directory itself.
-    if let Some(meta) = crate::util::probe(path, "store path")?
-        && !meta.is_dir()
-    {
-        bail!("store path {} is not a real directory", path.display());
-    }
+    crate::util::probe_dir(path, "store path")?;
     Ok(())
 }
 
@@ -929,9 +902,8 @@ fn aws_region() -> Option<String> {
 /// Create a missing Cargo home with private permissions, or validate an
 /// existing one. A dry run validates what exists but creates nothing.
 pub fn prepare_cargo_home(path: &Path, dry_run: bool) -> Result<()> {
-    match crate::util::probe(path, "cargo home")? {
-        Some(meta) if meta.is_dir() => crate::util::validate_private_dir(path, "cargo home"),
-        Some(_) => bail!("cargo home {} is not a real directory", path.display()),
+    match crate::util::probe_dir(path, "cargo home")? {
+        Some(_) => crate::util::validate_private_dir(path, "cargo home"),
         None => {
             if dry_run {
                 return Ok(());

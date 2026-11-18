@@ -89,10 +89,8 @@ pub fn load_state(remote: &RemotePolicy) -> Result<Option<RemoteState>> {
 
 pub(crate) fn load_state_at(root: &Path, remote: &RemotePolicy) -> Result<Option<RemoteState>> {
     let path = state_file(root, remote)?;
-    match crate::util::probe(&path, "remote state")? {
-        Some(meta) if meta.is_file() => {}
-        Some(_) => bail!("remote state {} is not a regular file", path.display()),
-        None => return Ok(None),
+    if crate::util::probe_file(&path, "remote state")?.is_none() {
+        return Ok(None);
     }
     let bytes = read_capped(&path, MAX_STATE_BYTES, "remote state")?;
     let state: RemoteState =

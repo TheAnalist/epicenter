@@ -21,9 +21,8 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
-use walkdir::WalkDir;
-
 use anyhow::{Context, Result, bail};
+use walkdir::WalkDir;
 
 use crate::fingerprint;
 use crate::settings::LinkPolicy;
@@ -176,14 +175,8 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
             bytes: 0,
             newest: None,
         };
-        for file in WalkDir::new(entry.path())
-            .min_depth(1)
-            .max_depth(util::MAX_SCAN_DEPTH)
-            .follow_links(false)
-            .follow_root_links(false)
-            .into_iter()
-            .flatten()
-        {
+        let job_dir = entry.path();
+        for file in util::SafeWalk::new(&job_dir).walk().flatten() {
             budget.spend()?;
             if !file.file_type().is_file() {
                 continue;
@@ -225,6 +218,10 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
     // Cargo puts the lock at `<build>/<profile>/.cargo-build-lock` or, with
     // `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
     // bounded depth and take every lock, not just direct children.
+    //
+    // This scan deliberately does not use `SafeWalk`: a planted symlink named
+    // `.cargo-build-lock` must still be seen so `open_lock_file` can reject it
+    // (fail closed). `SafeWalk` would prune the link and hide the lock.
     //
     // A profile directory without a lock file gets a sentinel: otherwise a
     // build that starts after this check is not fenced at all. Creating the
@@ -319,6 +316,7 @@ fn try_lock_now(file: &fs::File) -> bool {
 }
 
 fn existing_cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
+    // Raw walk: a symlinked lock must be seen and rejected, not pruned.
     let entries = WalkDir::new(dir)
         .min_depth(1)
         .max_depth(3)

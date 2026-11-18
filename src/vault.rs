@@ -46,7 +46,6 @@ use crate::util::{self, FileLock, metadata_nofollow, now_secs, owned_by_us};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
 use crate::fingerprint::{self, ArtifactInfo, Unit};
 
@@ -346,15 +345,7 @@ pub fn sweep_store_debris(store_root: &Path) {
 /// lock file. Returns `false` when a live harvest holds the generation lock.
 pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
     util::validate_component(parity, "generation")?;
-    if store_is_read_only(store_root) {
-        anyhow::bail!(
-            "store {} is read-only — cannot remove a generation",
-            store_root.display()
-        );
-    }
-    if store_root.exists() {
-        check_store_trust(store_root)?;
-    }
+    ensure_writable_store(store_root, "removing a generation")?;
     let dir = store_root.join(parity);
     let Some(meta) = util::probe(&dir, "generation")? else {
         return Ok(false);
@@ -414,6 +405,22 @@ pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<Stri
     Ok(names)
 }
 
+/// Refuse a store writer before it stages or deletes anything. A missing store
+/// is writable by definition; an existing one must be trusted, owned, not
+/// read-only, and pass a real write probe.
+pub(crate) fn ensure_writable_store(store_root: &Path, operation: &str) -> Result<()> {
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
+    if !store_accepts_imports(store_root) {
+        anyhow::bail!(
+            "store {} is read-only or not writable — {operation} needs a writable store",
+            store_root.display()
+        );
+    }
+    Ok(())
+}
+
 /// Create or validate the writable store root before a harvest.
 ///
 /// A missing root is created with private permissions. An existing root must
@@ -423,20 +430,10 @@ pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<Stri
 /// partially prepared directory is never mistaken for a valid store.
 fn ensure_store_root(store_root: &Path) -> Result<()> {
     util::ensure_windows_user_path(store_root, "store")?;
-    match util::probe(store_root, "store root")? {
-        Some(meta) => {
-            if !meta.is_dir() {
-                anyhow::bail!(
-                    "store root {} is not a real directory",
-                    store_root.display()
-                );
-            }
-            if store_is_read_only(store_root) {
-                anyhow::bail!(
-                    "store {} is read-only — harvest/import needs a writable store",
-                    store_root.display()
-                );
-            }
+    match util::probe_dir(store_root, "store root")? {
+        Some(_) => {
+            // Refuse a read-only store before Repair can chmod it.
+            ensure_writable_store(store_root, "harvest/import")?;
             util::check_private_dir(store_root, util::Privacy::Repair)?;
         }
         None => util::create_private_dir_all(store_root)?,
@@ -1187,12 +1184,17 @@ pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest
     let what = serde_json::to_string_pretty(&signed)?;
     // O_EXCL + a random, symlink-free temp path: never write through a
     // planted temp link.
-    let (tmp, mut file) = util::create_temp(&dir, "manifest.json.tmp", "", 0o600)?;
-    file.write_all(what.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, manifest_path(store_root, parity))?;
+    let (tmp, ()) = util::with_temp_file(&dir, "manifest.json.tmp", "", 0o600, |file| {
+        file.write_all(what.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    })?;
+    let target = manifest_path(store_root, parity);
+    if let Err(err) = fs::rename(&tmp, &target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("installing {}", target.display()));
+    }
     #[cfg(unix)]
     if let Ok(parent) = fs::File::open(&dir) {
         let _ = parent.sync_all();
@@ -1218,13 +1220,8 @@ pub fn generation_names(store_root: &Path) -> Result<Vec<String>> {
         if util::has_reparse_component(store_root, &entry.path()) {
             continue;
         }
-        let meta = match metadata_nofollow(&entry.path()) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("inspecting {}", entry.path().display()));
-            }
+        let Some(meta) = util::probe_lenient(&entry.path())? else {
+            continue;
         };
         if !meta.is_dir() {
             continue;
@@ -1309,15 +1306,7 @@ pub fn stored_unit_rustc(unit: &StoredUnit) -> Option<String> {
 /// groups were dropped; groups that could not be removed stay recorded.
 pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Result<usize> {
     util::validate_component(generation, "generation")?;
-    if store_is_read_only(store_root) {
-        anyhow::bail!(
-            "store {} is read-only — this operation needs a writable store",
-            store_root.display()
-        );
-    }
-    if store_root.exists() {
-        check_store_trust(store_root)?;
-    }
+    ensure_writable_store(store_root, "removing units")?;
     let lock = FileLock::acquire(&store_lock_path(store_root, generation))?;
     let generation_dir = store_root.join(generation);
     match util::probe(&generation_dir, "generation")? {
@@ -1427,14 +1416,7 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
     let blobs = store_root.join(generation).join("blobs");
     let generation_root = store_root.join(generation);
     let mut budget = util::ScanBudget::new("blob sweep");
-    let walker = WalkDir::new(&blobs)
-        .min_depth(1)
-        .max_depth(util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .contents_first(true)
-        .into_iter()
-        .filter_entry(|entry| util::walk_entry_is_safe(&blobs, entry));
+    let walker = util::SafeWalk::new(&blobs).bottom_up().walk();
     for entry in walker {
         if !budget.take() {
             break;
@@ -1806,19 +1788,16 @@ fn install_import_raw(dst: &Path, src: &Path, size: u64, sha256: &str, stamp: u6
     let parent = dst.parent().context("import destination has no parent")?;
     let mut input = util::open_regular(src, false)
         .with_context(|| format!("opening imported file {}", src.display()))?;
-    let (tmp, mut output) = util::create_temp(parent, "import", "", 0o600)?;
-    let result = (|| -> Result<()> {
-        util::copy_verified(&mut input, &mut output, size, sha256, src)?;
+    let (tmp, ()) = util::with_temp_file(parent, "import", "", 0o600, |output| {
+        util::copy_verified(&mut input, output, size, sha256, src)?;
         output.flush()?;
         output.sync_all()?;
         Ok(())
-    })();
-    drop(output);
-    if let Err(err) = result {
+    })?;
+    if let Err(err) = fs::rename(&tmp, dst) {
         let _ = fs::remove_file(&tmp);
-        return Err(err);
+        return Err(err).with_context(|| format!("installing {}", dst.display()));
     }
-    fs::rename(&tmp, dst).with_context(|| format!("installing {}", dst.display()))?;
     set_stamp(dst, stamp)?;
     make_read_only(dst)?;
     Ok(())
@@ -1842,18 +1821,12 @@ fn install_import_blob(
     util::create_private_dir_all(parent)?;
     let mut input = util::open_regular(src, false)
         .with_context(|| format!("opening imported blob {}", src.display()))?;
-    let (tmp, mut output) = util::create_temp(parent, "import-blob", ".gz", 0o600)?;
-    let result = (|| -> Result<()> {
-        util::copy_capped(&mut input, &mut output, util::MAX_FILE_BYTES, src)?;
+    let (tmp, ()) = util::with_temp_file(parent, "import-blob", ".gz", 0o600, |output| {
+        util::copy_capped(&mut input, output, util::MAX_FILE_BYTES, src)?;
         output.flush()?;
         output.sync_all()?;
         Ok(())
-    })();
-    drop(output);
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
+    })?;
     if let Err(err) = verify_import_blob(&tmp, size, sha256) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
@@ -2620,32 +2593,7 @@ fn store_group(
     let final_dir = units.join(name);
     // Unique staging names + O_EXCL directory creation: a pre-planted symlink
     // or temp dir can never be followed/truncated.
-    let mut tmp = None;
-    for attempt in 0..100u32 {
-        let candidate = units.join(format!(".{name}.tmp-{}-{attempt}", std::process::id()));
-        match fs::create_dir(&candidate) {
-            Ok(()) => {
-                tmp = Some(candidate);
-                break;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("creating staging dir {}", candidate.display()));
-            }
-        }
-    }
-    let Some(tmp) = tmp else {
-        anyhow::bail!(
-            "could not create a unique staging dir in {}",
-            units.display()
-        );
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700));
-    }
+    let tmp = util::create_temp_dir(&units, &format!("{name}.tmp"))?;
 
     if let Err(err) = stage_group(&tmp, files, stamp, blobs, entries) {
         // Never leave a half-written staging dir behind: it would keep a
@@ -4160,12 +4108,9 @@ pub fn store_accepts_imports(store_root: &Path) -> bool {
 /// paths never chmod or repair an operator-selected directory; the writer
 /// marks and tightens it in [`ensure_store_root`].
 pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
-    let Some(meta) = util::probe(store_root, "store")? else {
+    let Some(meta) = util::probe_dir(store_root, "store")? else {
         anyhow::bail!("store {} is not a real directory", store_root.display());
     };
-    if !meta.is_dir() {
-        anyhow::bail!("store {} is not a real directory", store_root.display());
-    }
     let mount_read_only = store_access(store_root).mount_read_only;
     // A reader may accept a foreign, read-only mount: the OS denies writes,
     // and the manifest signature is verified separately. A writable foreign
@@ -4194,11 +4139,8 @@ pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
 /// additionally requires a private DACL. Existing roots are never chmodded,
 /// so `restore --into /` or `--into ~` cannot change system/home modes.
 fn prepare_view_root(view_root: &Path) -> Result<()> {
-    match util::probe(view_root, "view")? {
+    match util::probe_dir(view_root, "view")? {
         Some(meta) => {
-            if !meta.is_dir() {
-                anyhow::bail!("view {} is not a real directory", view_root.display());
-            }
             if !util::owned_by_us(view_root, &meta) {
                 anyhow::bail!(
                     "view {} is owned by another user — refusing to write into it",
@@ -4503,13 +4445,7 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
             let unit_dir = units.join(&entry.name);
             let expected: std::collections::BTreeSet<String> =
                 entry.files.iter().map(|file| file.path.clone()).collect();
-            let walk = WalkDir::new(&unit_dir)
-                .min_depth(1)
-                .max_depth(util::MAX_SCAN_DEPTH)
-                .follow_links(false)
-                .follow_root_links(false)
-                .into_iter()
-                .filter_entry(|entry| util::walk_entry_is_safe(&unit_dir, entry));
+            let walk = util::SafeWalk::new(&unit_dir).walk();
             for file in walk {
                 if budget.spend().is_err() {
                     report
@@ -4795,11 +4731,8 @@ pub fn compact(
         dry_run,
         ..Default::default()
     };
-    if !dry_run && store_is_read_only(store_root) {
-        anyhow::bail!(
-            "store {} is read-only — compact needs a writable store",
-            store_root.display()
-        );
+    if !dry_run {
+        ensure_writable_store(store_root, "compact")?;
     }
     let mut generations = generation_names(store_root)?;
     if let Some(query) = generation {
@@ -4853,13 +4786,7 @@ pub fn compact(
             if util::probe(&base, "compact root")?.is_none() {
                 continue;
             }
-            let walker = WalkDir::new(&base)
-                .min_depth(1)
-                .max_depth(util::MAX_SCAN_DEPTH)
-                .follow_links(false)
-                .follow_root_links(false)
-                .into_iter()
-                .filter_entry(|entry| util::walk_entry_is_safe(&base, entry));
+            let walker = util::SafeWalk::new(&base).walk();
             for entry in walker {
                 budget.spend()?;
                 let entry = match entry {
@@ -5095,13 +5022,7 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
         if !util::has_reparse_component(store_root, &units) && units.is_dir() {
             #[cfg(any(unix, windows))]
             let mut seen_inodes = std::collections::HashSet::new();
-            let walker = WalkDir::new(&units)
-                .min_depth(1)
-                .max_depth(util::MAX_SCAN_DEPTH)
-                .follow_links(false)
-                .follow_root_links(false)
-                .into_iter()
-                .filter_entry(|entry| util::walk_entry_is_safe(&units, entry));
+            let walker = util::SafeWalk::new(&units).walk();
             for entry in walker {
                 let entry = entry?;
                 scanned = scanned.saturating_add(1);

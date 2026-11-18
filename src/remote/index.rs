@@ -874,8 +874,8 @@ pub fn verify_index(
 /// bytes); `publisher.json` and `index.json` are replaced last.
 pub fn write_index_tree(root: &Path, index: &SignedIndex) -> Result<()> {
     let body_file = body_path(root, &index.pointer.body_sha256)?;
-    match crate::util::probe(&body_file, "index body")? {
-        Some(meta) if meta.is_file() => {
+    match crate::util::probe_file(&body_file, "index body")? {
+        Some(_) => {
             let existing = read_capped(&body_file, MAX_INDEX_BODY_BYTES, "index body")?;
             ensure!(
                 existing == index.body_bytes,
@@ -883,7 +883,6 @@ pub fn write_index_tree(root: &Path, index: &SignedIndex) -> Result<()> {
                 body_file.display()
             );
         }
-        Some(_) => bail!("index body {} is not a regular file", body_file.display()),
         None => crate::util::write_atomic_private(&body_file, &index.body_bytes)?,
     }
     let report = publisher_report(index)?;

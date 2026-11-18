@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use walkdir::WalkDir;
 
 use crate::fingerprint::{self, ArtifactInfo, Unit};
 use crate::util::{self, human_age, human_bytes, metadata_nofollow, parse_duration};
@@ -624,8 +623,7 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
             path.display()
         ),
     };
-    let newest = dir_newest(&path);
-    let (bytes, unique, shared, files) = dir_accounting(&path);
+    let stats = tree_stats(&path);
 
     if delete {
         println!(
@@ -649,9 +647,9 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         "  {} {:<40} {:>9} · {:>4} file(s)  {:>10} old  {}",
         util::green(util::GLYPH_PASS),
         name,
-        human_bytes(bytes),
-        files,
-        newest.map(human_age).unwrap_or_else(|| "?".into()),
+        human_bytes(stats.bytes),
+        stats.files,
+        stats.newest.map(human_age).unwrap_or_else(|| "?".into()),
         util::dim("explicitly selected — age policy not applied")
     );
     println!();
@@ -659,9 +657,9 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         println!(
             "  {} {} nominal — {} would be freed · {} links released",
             util::dim("result:   "),
-            human_bytes(bytes),
-            human_bytes(unique),
-            human_bytes(shared)
+            human_bytes(stats.bytes),
+            human_bytes(stats.unique),
+            human_bytes(stats.shared)
         );
         println!("  {}", util::dim("run again with -y or --yes to remove it"));
         return Ok(());
@@ -670,20 +668,15 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     // later GC/exec can guess, and a build that races the check fails rather
     // than writing into a directory being deleted.
     let tombstone = work_root.join(format!(".{name}.deleting-{}", std::process::id()));
-    match metadata_nofollow(&tombstone) {
-        Ok(_) => {
+    match crate::util::probe_kind(&tombstone)? {
+        crate::util::Probed::Real(_) => {
             crate::util::remove_tree(&work_root, &tombstone)
                 .with_context(|| format!("clearing stale tombstone {}", tombstone.display()))?;
         }
-        // No stale tombstone to clear.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        // A link is not a tombstone we created; do not follow it. The later
-        // rename will fail safely if it still occupies the name.
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("inspecting tombstone {}", tombstone.display()));
-        }
+        // No stale tombstone to clear. A link is not a tombstone we created;
+        // do not follow it. The later rename fails safely if it still occupies
+        // the name.
+        crate::util::Probed::Missing | crate::util::Probed::Reparse => {}
     }
     // Windows refuses to rename a directory while a handle inside it is open,
     // including Cargo's lock files. Drop our guards right before the rename;
@@ -710,9 +703,9 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     println!(
         "  {} {} nominal — {} actually freed · {} links released",
         util::dim("result:   "),
-        human_bytes(bytes),
-        human_bytes(unique),
-        human_bytes(shared)
+        human_bytes(stats.bytes),
+        human_bytes(stats.unique),
+        human_bytes(stats.shared)
     );
     println!();
     println!("  {} {name} removed", util::green(util::GLYPH_PASS));
@@ -860,9 +853,9 @@ fn evict_work_dirs(
         if !meta.is_dir() {
             continue;
         }
-        let newest = dir_newest(&path);
         let locked = crate::exec::dir_locked(&path);
-        let (bytes, unique, shared, files) = dir_accounting(&path);
+        let stats = tree_stats(&path);
+        let newest = stats.newest;
         let old_enough = newest
             .map(|m| now.duration_since(m).map_or(true, |age| age > limit))
             .unwrap_or(true);
@@ -872,10 +865,10 @@ fn evict_work_dirs(
             newest,
             locked,
             old_enough,
-            bytes,
-            unique,
-            shared,
-            files,
+            bytes: stats.bytes,
+            unique: stats.unique,
+            shared: stats.shared,
+            files: stats.files,
         });
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1025,49 +1018,23 @@ fn evict_work_dirs(
     Ok(report)
 }
 
-/// Newest file mtime in the tree — a job is as fresh as its last file write
-/// (directory mtimes only move when entries are added or removed).
-fn dir_newest(dir: &Path) -> Option<SystemTime> {
-    let mut newest = None;
-    let mut budget = crate::util::ScanBudget::new("job freshness");
-    for entry in WalkDir::new(dir)
-        .min_depth(1)
-        .max_depth(crate::util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
-        .flatten()
-    {
-        if !budget.take() {
-            break;
-        }
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if let Some(modified) = entry.metadata().ok().and_then(|meta| meta.modified().ok()) {
-            if newest.map_or(true, |current| modified > current) {
-                newest = Some(modified);
-            }
-        }
-    }
-    newest
+/// Summary of one job/view tree: newest file mtime plus link-aware
+/// accounting. A job is as fresh as its last file write (directory mtimes only
+/// move when entries are added or removed), and one walk feeds both the age
+/// policy and the size report.
+#[derive(Debug, Default)]
+struct TreeStats {
+    newest: Option<SystemTime>,
+    bytes: u64,
+    unique: u64,
+    shared: u64,
+    files: u64,
 }
 
-/// (nominal bytes, unique bytes, shared bytes, file count) of one view.
-fn dir_accounting(dir: &Path) -> (u64, u64, u64, u64) {
-    let mut bytes = 0u64;
-    let mut unique = 0u64;
-    let mut shared = 0u64;
-    let mut files = 0u64;
-    let mut budget = crate::util::ScanBudget::new("work dir accounting");
-    for entry in WalkDir::new(dir)
-        .min_depth(1)
-        .max_depth(crate::util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
-        .flatten()
-    {
+fn tree_stats(dir: &Path) -> TreeStats {
+    let mut stats = TreeStats::default();
+    let mut budget = crate::util::ScanBudget::new("work dir tree");
+    for entry in crate::util::SafeWalk::new(dir).walk().flatten() {
         if !budget.take() {
             break;
         }
@@ -1076,15 +1043,20 @@ fn dir_accounting(dir: &Path) -> (u64, u64, u64, u64) {
         }
         let Ok(meta) = entry.metadata() else { continue };
         let size = meta.len();
-        bytes = bytes.saturating_add(size);
-        files = files.saturating_add(1);
+        stats.bytes = stats.bytes.saturating_add(size);
+        stats.files = stats.files.saturating_add(1);
+        if let Ok(modified) = meta.modified() {
+            if stats.newest.map_or(true, |current| modified > current) {
+                stats.newest = Some(modified);
+            }
+        }
         if crate::vault::link_count(entry.path(), &meta) > 1 {
-            shared = shared.saturating_add(size);
+            stats.shared = stats.shared.saturating_add(size);
         } else {
-            unique = unique.saturating_add(size);
+            stats.unique = stats.unique.saturating_add(size);
         }
     }
-    (bytes, unique, shared, files)
+    stats
 }
 
 /// Resolve `--work`: `build` = the shared view; a job id (with or without
@@ -1170,15 +1142,7 @@ fn view_unit_files(unit: &Unit, arts: &ArtifactInfo) -> Vec<PathBuf> {
 
 fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut budget = crate::util::ScanBudget::new("store tree");
-    for entry in WalkDir::new(dir)
-        .min_depth(1)
-        .max_depth(crate::util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
-        .filter_entry(|entry| crate::util::walk_entry_is_safe(dir, entry))
-        .flatten()
-    {
+    for entry in crate::util::SafeWalk::new(dir).walk().flatten() {
         if !budget.take() {
             return;
         }

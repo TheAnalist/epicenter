@@ -6,7 +6,7 @@
 //! and writes a private staging tree. The transport layer only consumes the
 //! returned [`Upload`] list.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use ed25519_dalek::SigningKey;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -443,17 +443,14 @@ fn write_key(path: &Path, key: &SigningKey, replace: bool) -> Result<bool> {
 
 fn read_current_pointer(out_dir: &Path) -> Result<Option<IndexPointer>> {
     let path = out_dir.join(super::INDEX_FILE);
-    match crate::util::probe(&path, "staged index")? {
-        Some(meta) if meta.is_file() => {
-            let bytes = read_capped(&path, super::MAX_INDEX_POINTER_BYTES, "index pointer")?;
-            let pointer: IndexPointer =
-                serde_json::from_slice(&bytes).context("parsing the staged index pointer")?;
-            pointer.validate_shape()?;
-            Ok(Some(pointer))
-        }
-        Some(_) => bail!("staged index {} is not a regular file", path.display()),
-        None => Ok(None),
+    if crate::util::probe_file(&path, "staged index")?.is_none() {
+        return Ok(None);
     }
+    let bytes = read_capped(&path, super::MAX_INDEX_POINTER_BYTES, "index pointer")?;
+    let pointer: IndexPointer =
+        serde_json::from_slice(&bytes).context("parsing the staged index pointer")?;
+    pointer.validate_shape()?;
+    Ok(Some(pointer))
 }
 
 fn choose_sequence(explicit: Option<u64>, current: Option<&IndexPointer>) -> Result<u64> {
@@ -660,18 +657,7 @@ fn blob_for_file(
             .join(&stored.entry.name)
             .join(&file.path);
         crate::util::check_regular_chain(store_root, &rel)?;
-        let meta = crate::util::metadata_nofollow(&source)?;
-        ensure!(
-            meta.is_file() && meta.len() == file.size,
-            "stored file {} has the wrong size",
-            source.display()
-        );
-        let hash = crate::util::sha256_file(&source)?;
-        ensure!(
-            hash == file.sha256,
-            "stored file {} failed its SHA-256 check",
-            source.display()
-        );
+        crate::util::verify_file_hash(&source, file.size, &file.sha256, "stored file")?;
         Ok((
             source,
             BlobRef {
@@ -700,10 +686,8 @@ fn stage_blobs(out_dir: &Path, units: &[PublishUnit]) -> Result<()> {
 }
 
 fn stage_object(src: &Path, dst: &Path, size: u64, hash: &str) -> Result<()> {
-    match crate::util::probe(dst, "staged blob")? {
-        Some(meta) if meta.is_file() => return verify_object(dst, size, hash),
-        Some(_) => bail!("staged blob {} is not a regular file", dst.display()),
-        None => {}
+    if crate::util::probe_file(dst, "staged blob")?.is_some() {
+        return verify_object(dst, size, hash);
     }
     if let Some(parent) = dst.parent() {
         crate::util::create_private_dir_all(parent)?;
@@ -727,18 +711,7 @@ fn stage_object(src: &Path, dst: &Path, size: u64, hash: &str) -> Result<()> {
 }
 
 fn verify_object(path: &Path, size: u64, hash: &str) -> Result<()> {
-    let meta = crate::util::metadata_nofollow(path)?;
-    ensure!(
-        meta.is_file() && meta.len() == size,
-        "staged blob {} has the wrong size",
-        path.display()
-    );
-    ensure!(
-        crate::util::sha256_file(path)? == hash,
-        "staged blob {} failed its SHA-256 check",
-        path.display()
-    );
-    Ok(())
+    crate::util::verify_file_hash(path, size, hash, "staged blob")
 }
 
 #[cfg(test)]

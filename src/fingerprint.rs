@@ -40,7 +40,6 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use walkdir::WalkDir;
 
 use crate::util::metadata_nofollow;
 
@@ -769,12 +768,7 @@ fn collect_classic_artifacts(
             if !metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
-            for entry in WalkDir::new(&candidate)
-                .min_depth(1)
-                .max_depth(crate::util::MAX_SCAN_DEPTH)
-                .follow_links(false)
-                .follow_root_links(false)
-            {
+            for entry in crate::util::SafeWalk::new(&candidate).walk() {
                 if !budget.take() {
                     return;
                 }
@@ -804,12 +798,7 @@ fn collect_new_artifacts(
         if !metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
-        for entry in WalkDir::new(&dir)
-            .min_depth(1)
-            .max_depth(crate::util::MAX_SCAN_DEPTH)
-            .follow_links(false)
-            .follow_root_links(false)
-        {
+        for entry in crate::util::SafeWalk::new(&dir).walk() {
             if !budget.take() {
                 return;
             }

@@ -17,7 +17,6 @@ use std::time::SystemTime;
 
 use crate::util;
 use anyhow::Result;
-use walkdir::WalkDir;
 
 /// One build unit: all files in the cache sharing a `name-hash` key.
 pub struct Group {
@@ -182,13 +181,7 @@ pub(crate) fn scan_with(
 ) -> Result<BTreeMap<String, Group>> {
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
     let mut budget = util::ScanBudget::new(budget_name);
-    let walker = WalkDir::new(root)
-        .min_depth(1)
-        .max_depth(util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
-        .filter_entry(|entry| util::walk_entry_is_safe(root, entry));
+    let walker = util::SafeWalk::new(root).walk();
     for entry in walker {
         budget.spend()?;
         // Unreadable entries are skipped rather than failing the whole scan.

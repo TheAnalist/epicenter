@@ -58,35 +58,12 @@ pub fn cargo_config_path() -> Result<PathBuf> {
     // group/world-writable $CARGO_HOME lets another user swap the file after
     // any path-only check. Check the directory, then the file; the actual
     // read uses fstat on the opened descriptor (util::read_trusted_config).
-    if let Some(meta) = crate::util::probe(&cargo_home, "CARGO_HOME")? {
-        if !meta.is_dir() {
-            anyhow::bail!("CARGO_HOME {} is not a directory", cargo_home.display());
-        }
-        if !crate::util::owned_by_us(&cargo_home, &meta) {
-            anyhow::bail!(
-                "CARGO_HOME {} is owned by an untrusted principal",
-                cargo_home.display()
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.mode() & 0o022 != 0 {
-                anyhow::bail!(
-                    "CARGO_HOME {} is group/world-writable (mode {:o})",
-                    cargo_home.display(),
-                    meta.mode() & 0o777
-                );
-            }
-        }
-        #[cfg(windows)]
-        if crate::util::windows_acl_is_private(&cargo_home) != Some(true) {
-            anyhow::bail!(
-                "CARGO_HOME {} DACL grants write access to an untrusted principal",
-                cargo_home.display()
-            );
-        }
-    }
+    crate::util::check_trusted_path(
+        &cargo_home,
+        crate::util::PathKind::Dir,
+        crate::util::TrustPolicy::NoForeignWrite,
+        "CARGO_HOME",
+    )?;
     let path = cargo_home.join("config.toml");
     if path.is_relative() {
         anyhow::bail!(
@@ -95,38 +72,12 @@ pub fn cargo_config_path() -> Result<PathBuf> {
         );
     }
     crate::util::ensure_windows_user_path(&path, "global cargo config")?;
-    if let Some(meta) = crate::util::probe(&path, "global cargo config")? {
-        if !meta.is_file() {
-            anyhow::bail!(
-                "global cargo config {} is not a regular file",
-                path.display()
-            );
-        }
-        if !crate::util::owned_by_us(&path, &meta) {
-            anyhow::bail!(
-                "global cargo config {} is owned by an untrusted principal",
-                path.display()
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.mode() & 0o022 != 0 {
-                anyhow::bail!(
-                    "global cargo config {} is group/world-writable (mode {:o})",
-                    path.display(),
-                    meta.mode() & 0o777
-                );
-            }
-        }
-        #[cfg(windows)]
-        if crate::util::windows_acl_is_private(&path) != Some(true) {
-            anyhow::bail!(
-                "global cargo config {} DACL grants write access to an untrusted principal",
-                path.display()
-            );
-        }
-    }
+    crate::util::check_trusted_path(
+        &path,
+        crate::util::PathKind::File,
+        crate::util::TrustPolicy::NoForeignWrite,
+        "global cargo config",
+    )?;
     Ok(path)
 }
 

@@ -92,33 +92,31 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
     use flate2::Compression as GzipLevel;
     use flate2::write::GzEncoder;
 
-    let (tmp, file) = crate::util::create_temp(blobs, "tmp", ".gz", 0o600)?;
-    let mut encoder = GzEncoder::new(file, GzipLevel::fast());
     let mut input = open_nofollow(src)?;
-    let mut decoded = Sha256Writer::new();
-    let mut buf = [0u8; 64 * 1024];
-    let result = (|| -> Result<()> {
-        loop {
-            let n = input.read(&mut buf)?;
-            if n == 0 {
-                break;
+    let (tmp, (decoded, blob_size)) =
+        crate::util::with_temp_file(blobs, "tmp", ".gz", 0o600, |file| {
+            let mut encoder = GzEncoder::new(&mut *file, GzipLevel::fast());
+            let mut decoded = Sha256Writer::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = input.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                decoded.update(&buf[..n]);
+                ensure!(
+                    decoded.size <= MAX_BLOB_BYTES,
+                    "compressed source exceeds the maximum artifact size"
+                );
+                encoder.write_all(&buf[..n])?;
             }
-            decoded.update(&buf[..n]);
-            ensure!(
-                decoded.size <= MAX_BLOB_BYTES,
-                "compressed source exceeds the maximum artifact size"
-            );
-            encoder.write_all(&buf[..n])?;
-        }
-        encoder.finish()?.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| format!("compressing {}", src.display()));
-    }
+            encoder.finish()?;
+            file.sync_all()?;
+            let blob_size = file.metadata()?.len();
+            Ok((decoded, blob_size))
+        })
+        .with_context(|| format!("compressing {}", src.display()))?;
     let (size, sha256) = decoded.finish();
-    let blob_size = fs::metadata(&tmp)?.len();
     if blob_size >= size {
         let _ = fs::remove_file(&tmp);
         return Ok(None);
@@ -136,10 +134,9 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
 
 fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
     let mut input = open_nofollow(src)?;
-    let (tmp, mut output) = crate::util::create_temp(blobs, "tmp", "", 0o600)?;
-    let mut hasher = Sha256Writer::new();
-    let mut buf = [0u8; 64 * 1024];
-    let result = (|| -> Result<()> {
+    let (tmp, (size, sha256)) = crate::util::with_temp_file(blobs, "tmp", "", 0o600, |output| {
+        let mut hasher = Sha256Writer::new();
+        let mut buf = [0u8; 64 * 1024];
         loop {
             let n = input.read(&mut buf)?;
             if n == 0 {
@@ -153,14 +150,9 @@ fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
             output.write_all(&buf[..n])?;
         }
         output.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| format!("copying {}", src.display()));
-    }
-    drop(output);
-    let (size, sha256) = hasher.finish();
+        Ok(hasher.finish())
+    })
+    .with_context(|| format!("copying {}", src.display()))?;
     let blob = crate::util::sha256_file(&tmp)?;
     Ok((tmp, blob, size, sha256, size, Compression::Raw))
 }
@@ -221,18 +213,7 @@ pub(crate) fn install_put_if_absent(
 }
 
 fn verify_blob_file(path: &Path, expected_blob: &str, expected_size: u64) -> Result<()> {
-    let meta = metadata_nofollow(path)?;
-    ensure!(
-        meta.is_file() && meta.len() == expected_size,
-        "CAS object {} has the wrong size",
-        path.display()
-    );
-    ensure!(
-        crate::util::sha256_file(path)? == expected_blob,
-        "CAS object {} failed its SHA-256 check",
-        path.display()
-    );
-    Ok(())
+    crate::util::verify_file_hash(path, expected_size, expected_blob, "CAS object")
 }
 
 /// Verify the stored object without decoding it.
@@ -357,18 +338,7 @@ fn upload_source(
     mode: UploadMode,
 ) -> Result<Upload> {
     super::validate::relative_path(&key, "upload object key", MAX_OBJECT_KEY_BYTES)?;
-    let meta =
-        metadata_nofollow(&source).with_context(|| format!("inspecting {}", source.display()))?;
-    ensure!(
-        meta.is_file() && meta.len() == expected_size,
-        "upload source {} changed size or is not a regular file",
-        source.display()
-    );
-    ensure!(
-        crate::util::sha256_file(&source)? == expected_sha256,
-        "upload source {} no longer matches its SHA-256",
-        source.display()
-    );
+    crate::util::verify_file_hash(&source, expected_size, expected_sha256, "upload source")?;
     Ok(Upload {
         key,
         source,

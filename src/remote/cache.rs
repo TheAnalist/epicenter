@@ -15,7 +15,7 @@
 //! replaced last. A corrupt cached object is removed and refetched; it is
 //! never trusted because of its name or mtime.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,6 @@ use super::{
 };
 use crate::settings::RemotePolicy;
 use crate::util::{self, FileLock};
-use walkdir::WalkDir;
 
 /// Per-endpoint cache directory (also the import-cache store parent).
 pub(crate) fn endpoint_root(remote: &RemotePolicy) -> Result<PathBuf> {
@@ -42,29 +41,10 @@ pub(crate) fn store_root(remote: &RemotePolicy) -> Result<PathBuf> {
 /// reader consults or writes through it. The final `import_units`/manifest
 /// paths repeat the check, so a swap after this point still fails closed.
 pub(crate) fn validate_layout(remote: &RemotePolicy) -> Result<()> {
-    if let Some(meta) = util::probe(&remote.cache, "remote cache root")?
-        && !meta.is_dir()
-    {
-        bail!(
-            "remote cache root {} is not a directory",
-            remote.cache.display()
-        );
-    }
     let endpoint = endpoint_root(remote)?;
-    if let Some(meta) = util::probe(&endpoint, "remote cache endpoint")?
-        && !meta.is_dir()
-    {
-        bail!(
-            "remote cache endpoint {} is not a directory",
-            endpoint.display()
-        );
-    }
-    let store = endpoint.join("store");
-    if let Some(meta) = util::probe(&store, "remote cache store")?
-        && !meta.is_dir()
-    {
-        bail!("remote cache store {} is not a directory", store.display());
-    }
+    util::probe_dir(&remote.cache, "remote cache root")?;
+    util::probe_dir(&endpoint, "remote cache endpoint")?;
+    util::probe_dir(&endpoint.join("store"), "remote cache store")?;
     Ok(())
 }
 
@@ -177,31 +157,14 @@ impl Cache {
             .context("remote blob path has no parent")?;
         util::create_private_dir_all(parent)?;
         util::check_private_dir(parent, util::Privacy::Enforce)?;
-        let (tmp, mut file) = util::create_temp(parent, "cache-blob", "", 0o600)?;
-        let result = (|| -> Result<()> {
-            source.fetch_blob(&blob.blob, blob.blob_size, &mut file)?;
+        let (tmp, ()) = util::with_temp_file(parent, "cache-blob", "", 0o600, |file| {
+            source.fetch_blob(&blob.blob, blob.blob_size, file)?;
             file.flush()?;
             file.sync_all()?;
             Ok(())
-        })();
-        drop(file);
-        if let Err(err) = result {
-            let _ = fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("fetching blob {}", blob.blob));
-        }
-        let meta = util::metadata_nofollow(&tmp)?;
-        ensure!(
-            meta.is_file() && meta.len() == blob.blob_size,
-            "remote blob {} has the wrong stored size (expected {}, found {})",
-            blob.blob,
-            blob.blob_size,
-            meta.len()
-        );
-        ensure!(
-            util::sha256_file(&tmp)? == blob.blob,
-            "remote blob {} failed its stored SHA-256 check",
-            blob.blob
-        );
+        })
+        .with_context(|| format!("fetching blob {}", blob.blob))?;
+        util::verify_file_hash(&tmp, blob.blob_size, &blob.blob, "remote blob")?;
         install_put_if_absent(&tmp, &final_path, &blob.blob, blob.blob_size)?;
         #[cfg(unix)]
         {
@@ -231,13 +194,7 @@ impl Cache {
             if !dir.is_dir() {
                 continue;
             }
-            let walker = WalkDir::new(&dir)
-                .min_depth(1)
-                .max_depth(util::MAX_SCAN_DEPTH)
-                .follow_links(false)
-                .follow_root_links(false)
-                .into_iter()
-                .filter_entry(|entry| util::walk_entry_is_safe(&dir, entry));
+            let walker = util::SafeWalk::new(&dir).walk();
             for entry in walker {
                 if !budget.take() {
                     break;
@@ -265,11 +222,10 @@ impl Cache {
 }
 
 fn read_optional(path: &Path, max_bytes: u64, what: &str) -> Result<Option<Vec<u8>>> {
-    match util::probe(path, what)? {
-        Some(meta) if meta.is_file() => Ok(Some(read_capped(path, max_bytes, what)?)),
-        Some(_) => bail!("{what} {} is not a regular file", path.display()),
-        None => Ok(None),
+    if util::probe_file(path, what)?.is_none() {
+        return Ok(None);
     }
+    Ok(Some(read_capped(path, max_bytes, what)?))
 }
 
 fn remove_cached(path: &Path, what: &str) -> Result<()> {

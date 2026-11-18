@@ -13,7 +13,6 @@ use crate::paths;
 use crate::settings::{self, Settings};
 use crate::util::{human_age, human_bytes, human_duration, metadata_nofollow};
 use crate::who;
-use walkdir::WalkDir;
 
 /// Severity of one check.
 #[derive(Debug, Clone, Copy)]
@@ -813,11 +812,8 @@ fn check_incremental_state(root: &Path, rows: &[(Unit, ArtifactInfo)]) -> Vec<Ch
 
 fn directory_bytes(root: &Path) -> u64 {
     let mut budget = crate::util::ScanBudget::new("doctor");
-    WalkDir::new(root)
-        .max_depth(crate::util::MAX_SCAN_DEPTH)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
+    crate::util::SafeWalk::new(root)
+        .walk()
         .filter_map(|entry| entry.ok())
         .take_while(|_| budget.take())
         .filter_map(|entry| entry.metadata().ok())
