@@ -2179,6 +2179,13 @@ fn cmd_restore(
     let packages = std::env::current_dir()
         .ok()
         .and_then(|cwd| lockfile::LockIndex::load(&cwd, None));
+    if packages.is_none() {
+        println!(
+            "  {} {}",
+            label("lock"),
+            util::dim("no readable Cargo.lock; seeding without a lock filter")
+        );
+    }
     let mut remote_fetch: Option<remote::FetchReport> = None;
     if dry_run {
         if remote.is_some_and(|policy| policy.enabled) {
@@ -2188,47 +2195,73 @@ fn cmd_restore(
             );
         }
     } else if let Some(policy) = remote.filter(|policy| policy.enabled) {
-        match remote::source_for(policy) {
-            Ok(source) => {
-                let request = remote::FetchRequest {
-                    remote: policy,
-                    source: source.as_ref(),
-                    store_root: &store,
-                    state_root: None,
-                    packages: packages.as_ref(),
-                    selector: None,
-                    layout: None,
-                    profile: None,
-                    unit_filter: unit,
-                    local: None,
-                    generation: None,
-                    now: util::now_secs(),
-                    dry_run: false,
-                };
-                match remote::fetch_and_import(&request) {
-                    Ok(report) => {
-                        print_remote_summary(&report);
-                        remote_fetch = Some(report);
-                    }
-                    Err(err) => println!(
-                        "  {} skipped: {err:#}",
-                        util::dim(&format!("{:<13}", "remote"))
-                    ),
-                }
-            }
-            Err(err) => println!(
-                "  {} skipped: {err:#}",
+        if packages.is_none() {
+            println!(
+                "  {} skipped: no readable Cargo.lock",
                 util::dim(&format!("{:<13}", "remote"))
-            ),
+            );
+        } else {
+            match remote::source_for(policy) {
+                Ok(source) => {
+                    let request = remote::FetchRequest {
+                        remote: policy,
+                        source: source.as_ref(),
+                        store_root: &store,
+                        state_root: None,
+                        packages: packages.as_ref(),
+                        selector: None,
+                        layout: None,
+                        profile: None,
+                        unit_filter: unit,
+                        local: None,
+                        generation: None,
+                        now: util::now_secs(),
+                        dry_run: false,
+                    };
+                    match remote::fetch_and_import(&request) {
+                        Ok(report) => {
+                            print_remote_summary(&report);
+                            remote_fetch = Some(report);
+                        }
+                        Err(err) => println!(
+                            "  {} skipped: {err:#}",
+                            util::dim(&format!("{:<13}", "remote"))
+                        ),
+                    }
+                }
+                Err(err) => println!(
+                    "  {} skipped: {err:#}",
+                    util::dim(&format!("{:<13}", "remote"))
+                ),
+            }
         }
     }
-    let mut report = vault::restore_with(&view, &store, unit, None, None, None, dry_run, link)?;
+    let mut report = vault::restore_with(
+        &view,
+        &store,
+        unit,
+        packages.as_ref(),
+        None,
+        None,
+        None,
+        dry_run,
+        link,
+    )?;
     if let Some(cache_store) = remote_fetch
         .as_ref()
         .and_then(|report| report.cache_store.as_deref())
     {
-        let overlay =
-            vault::restore_with(&view, cache_store, unit, None, None, None, dry_run, link)?;
+        let overlay = vault::restore_with(
+            &view,
+            cache_store,
+            unit,
+            packages.as_ref(),
+            None,
+            None,
+            None,
+            dry_run,
+            link,
+        )?;
         report.merge_secondary(overlay);
         report.note = None;
     }

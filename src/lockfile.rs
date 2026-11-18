@@ -108,11 +108,12 @@ impl LockIndex {
         self.packages.contains_key(name)
     }
 
-    /// Does the project resolve `name` at `version`?
+    /// Does the lock contain `name` at `version`?
     ///
-    /// `version == None` means the unit did not record one (a git checkout, a
-    /// path crate, or a build dir without a `.d` side file); keep the old
-    /// name-only match rather than dropping the unit.
+    /// This is a pure presence check; vault seeding also requires a registry
+    /// or git source via [`Self::seedable`].
+    ///
+    /// `version == None` matches any recorded version.
     pub fn matches(&self, name: &str, version: Option<&str>) -> bool {
         let Some(packages) = self.packages.get(name) else {
             return false;
@@ -129,24 +130,10 @@ impl LockIndex {
     /// Ambiguity is an error: two named packages at the same version with
     /// different sources cannot be mapped to one stored unit.
     pub fn resolve(&self, name: &str, version: Option<&str>) -> Result<Option<LockSource>> {
-        let Some(packages) = self.packages.get(name) else {
+        let Some(first) = self.unique_package(name, version)? else {
             return Ok(None);
         };
-        let candidates: Vec<&LockPackage> = packages
-            .iter()
-            .filter(|package| version.is_none_or(|wanted| package.version == wanted))
-            .collect();
-        let Some(first) = candidates.first() else {
-            return Ok(None);
-        };
-        ensure!(
-            candidates
-                .iter()
-                .all(|package| package.source == first.source && package.checksum == first.checksum),
-            "Cargo.lock resolves {name} {:?} to multiple sources; refusing an ambiguous remote unit",
-            version.unwrap_or("<unrecorded>")
-        );
-        if first.source.is_empty() {
+        if first.source.is_empty() || first.source.starts_with("path+") {
             return Ok(Some(LockSource::Path));
         }
         if let Some(index) = first
@@ -175,6 +162,52 @@ impl LockIndex {
             "Cargo.lock source {:?} for {name} is not a registry, git or path source",
             first.source
         )
+    }
+
+    /// One package entry for `name`/`version`, or an ambiguity error.
+    fn unique_package(&self, name: &str, version: Option<&str>) -> Result<Option<&LockPackage>> {
+        let Some(packages) = self.packages.get(name) else {
+            return Ok(None);
+        };
+        let mut candidates = packages
+            .iter()
+            .filter(|package| version.is_none_or(|wanted| package.version == wanted));
+        let Some(first) = candidates.next() else {
+            return Ok(None);
+        };
+        for package in candidates {
+            ensure!(
+                package.source == first.source && package.checksum == first.checksum,
+                "Cargo.lock resolves {name} {:?} to multiple sources; refusing an ambiguous unit",
+                version.unwrap_or("<unrecorded>")
+            );
+        }
+        Ok(Some(first))
+    }
+
+    /// Whether a stored unit may be seeded from the local vault.
+    ///
+    /// Only registry and git packages carry a source identity that survives a
+    /// project boundary. Path/workspace units are skipped: their name and
+    /// version do not identify the checkout, so a unit from another project
+    /// could be seeded by accident. An absent, ambiguous or malformed entry
+    /// also falls back to a local build rather than guessing.
+    ///
+    /// This is the hot path during restore, so it scans the package's entries
+    /// without allocating.
+    pub fn seedable(&self, name: &str, version: Option<&str>) -> bool {
+        let Ok(Some(package)) = self.unique_package(name, version) else {
+            return false;
+        };
+        if package.source.is_empty() || package.source.starts_with("path+") {
+            return false;
+        }
+        if package.source.starts_with("registry+") || package.source.starts_with("sparse+") {
+            return package.checksum.as_deref().is_some_and(|checksum| {
+                checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        }
+        package.source.starts_with("git+")
     }
 
     pub fn len(&self) -> usize {
@@ -267,6 +300,43 @@ mod tests {
             Some(LockSource::Path)
         );
         assert!(index.resolve("missing", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn seedable_requires_a_registry_or_git_source() {
+        let index = lock(
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n\n\
+             [[package]]\nname = \"gitdep\"\nversion = \"0.1.0\"\n\
+             source = \"git+https://github.com/example/gitdep?rev=abc#deadbeef\"\n\n\
+             [[package]]\nname = \"local\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"pathed\"\nversion = \"0.1.0\"\n\
+             source = \"path+file:///work/pathed\"\n",
+        )
+        .expect("lock parses");
+        assert!(index.seedable("serde", Some("1.0.219")));
+        assert!(index.seedable("gitdep", Some("0.1.0")));
+        assert!(!index.seedable("local", Some("0.1.0")));
+        assert!(!index.seedable("pathed", Some("0.1.0")));
+        assert!(!index.seedable("missing", None));
+        assert!(!index.seedable("serde", Some("9.9.9")));
+    }
+
+    #[test]
+    fn seedable_skips_an_ambiguous_or_malformed_entry() {
+        let index = lock(
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"registry+https://one.example/index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"git+https://example/git?rev=abc\"\n\n\
+             [[package]]\nname = \"broken\"\nversion = \"0.1.0\"\n\
+             source = \"registry+https://two.example/index\"\n",
+        )
+        .expect("lock parses");
+        assert!(!index.seedable("serde", Some("1.0.219")));
+        assert!(!index.seedable("broken", Some("0.1.0")));
     }
 
     #[test]

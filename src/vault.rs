@@ -3600,8 +3600,10 @@ fn store_is_shared_mount(_store_root: &Path) -> bool {
 /// `unit_filter` narrows by substring (`restore --unit`); `packages` narrows
 /// to the project's `Cargo.lock` (`exec` passes the index it already parsed,
 /// so a job never inherits every other project's units and a unit only lands
-/// where the lock resolves its exact package version). Unit names that cannot
-/// be split into package + hash are kept rather than dropped (fail-open).
+/// where the lock resolves its exact package version). `profile` narrows to
+/// one build-dir profile (`exec` passes the child's profile so a debug job
+/// never seeds release units). Unit names that cannot be split into package +
+/// hash are kept rather than dropped (fail-open).
 pub fn restore(
     view_root: &Path,
     store_root: &Path,
@@ -3614,6 +3616,7 @@ pub fn restore(
         store_root,
         unit_filter,
         packages,
+        None,
         None,
         None,
         dry_run,
@@ -3636,6 +3639,7 @@ pub fn restore_policy(
         None,
         None,
         None,
+        None,
         dry_run,
         link,
     )
@@ -3643,13 +3647,15 @@ pub fn restore_policy(
 
 /// Restore for a specific toolchain/layout (`exec` with a `+toolchain` or a
 /// new-layout child). `layout` skips units stored in the other build-dir
-/// layout; the plain [`restore`] accepts every stored unit.
+/// layout; `profile` skips units stored for another Cargo profile; the plain
+/// [`restore`] accepts every stored unit.
 pub fn restore_with(
     view_root: &Path,
     store_root: &Path,
     unit_filter: Option<&str>,
     packages: Option<&crate::lockfile::LockIndex>,
     layout: Option<fingerprint::UnitLayout>,
+    profile: Option<&str>,
     selector: Option<&str>,
     dry_run: bool,
     link: LinkPolicy,
@@ -3699,15 +3705,21 @@ pub fn restore_with(
         }
         if let Some(packages) = packages {
             if let Some(package) = unit_package(&entry.name) {
-                // The lock must resolve this exact version; a unit without a
-                // recorded version keeps the name-only match.
-                if !packages.matches(package, entry.version.as_deref()) {
+                // The lock must resolve this exact version from a registry or
+                // git source. Path/workspace units are project-local and are
+                // never seeded from the shared vault.
+                if !packages.seedable(package, entry.version.as_deref()) {
                     continue;
                 }
             }
         }
         if let Some(layout) = layout {
             if entry.layout() != layout {
+                continue;
+            }
+        }
+        if let Some(profile) = profile {
+            if entry.profile != profile {
                 continue;
             }
         }
@@ -6229,6 +6241,92 @@ mod tests {
         Ok(())
     }
 
+    fn synthetic_profile_unit(
+        root: &Path,
+        profile: &str,
+        package: &str,
+        hash: &str,
+        byte: u8,
+    ) -> Result<()> {
+        let unit = root
+            .join(profile)
+            .join(".fingerprint")
+            .join(format!("{package}-{hash}"));
+        fs::create_dir_all(&unit)?;
+        fs::write(unit.join(format!("lib-{package}")), "5d82713a7f2d05e2")?;
+        fs::write(
+            unit.join(format!("lib-{package}.json")),
+            r#"{"rustc":1,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"config":4,"deps":[]}"#,
+        )?;
+        fs::write(unit.join(format!("dep-lib-{package}")), [0u8; 8])?;
+        fs::create_dir_all(root.join(profile).join("deps"))?;
+        fs::write(
+            root.join(profile)
+                .join("deps")
+                .join(format!("lib{package}-{hash}.rlib")),
+            [byte; 32],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_filters_by_profile() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let debug_view = tempfile::tempdir()?;
+        let release_view = tempfile::tempdir()?;
+        synthetic_profile_unit(build.path(), "debug", "debugdep", "1111111111111111", 1)?;
+        synthetic_profile_unit(build.path(), "release", "releasedep", "2222222222222222", 2)?;
+        harvest(build.path(), store.path(), None, false)?;
+
+        let debug = restore_with(
+            debug_view.path(),
+            store.path(),
+            None,
+            None,
+            None,
+            Some("debug"),
+            None,
+            false,
+            LinkPolicy::Copy,
+        )?;
+        assert_eq!(debug.units_linked, 1);
+        assert!(
+            debug_view
+                .path()
+                .join("debug/.fingerprint/debugdep-1111111111111111/lib-debugdep")
+                .is_file()
+        );
+        assert!(
+            !debug_view.path().join("release").exists(),
+            "a debug restore leaves release units out"
+        );
+
+        let release = restore_with(
+            release_view.path(),
+            store.path(),
+            None,
+            None,
+            None,
+            Some("release"),
+            None,
+            false,
+            LinkPolicy::Copy,
+        )?;
+        assert_eq!(release.units_linked, 1);
+        assert!(
+            release_view
+                .path()
+                .join("release/.fingerprint/releasedep-2222222222222222/lib-releasedep")
+                .is_file()
+        );
+        assert!(
+            !release_view.path().join("debug").exists(),
+            "a release restore leaves debug units out"
+        );
+        Ok(())
+    }
+
     #[test]
     fn restore_can_restrict_units_to_packages() -> Result<()> {
         let build = tempfile::tempdir()?;
@@ -6242,7 +6340,9 @@ mod tests {
         let lock = lock.path().join("Cargo.lock");
         fs::write(
             &lock,
-            "version = 4\n\n[[package]]\nname = \"serde_core\"\nversion = \"1.0.0\"\n",
+            "version = 4\n\n[[package]]\nname = \"serde_core\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
         )?;
         let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
         let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
@@ -6259,6 +6359,23 @@ mod tests {
                 .join("debug/.fingerprint/serde-746d173581f1a314")
                 .exists(),
             "a unit of an unselected package is not restored"
+        );
+
+        // A path/workspace package has no source identity: its name and
+        // version do not identify the checkout, so it is never seeded.
+        fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"serde_core\"\nversion = \"1.0.0\"\n",
+        )?;
+        let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
+        let path_view = tempfile::tempdir()?;
+        let report = restore(path_view.path(), store.path(), None, Some(&packages), false)?;
+        assert_eq!(report.units_linked, 0, "a path-sourced unit is not seeded");
+        assert!(
+            !path_view
+                .path()
+                .join("debug/.fingerprint/serde_core-b468be6fa8c1f936")
+                .exists()
         );
         Ok(())
     }
@@ -6306,6 +6423,7 @@ mod tests {
             None,
             None,
             Some(fingerprint::UnitLayout::New),
+            None,
             None,
             false,
             LinkPolicy::Copy,
@@ -6423,6 +6541,7 @@ mod tests {
             None,
             None,
             Some(fingerprint::UnitLayout::New),
+            None,
             None,
             false,
             LinkPolicy::Copy,
@@ -7445,7 +7564,9 @@ mod tests {
         let lock = locks.path().join("Cargo.lock");
         fs::write(
             &lock,
-            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.218\"\n",
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.218\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
         )?;
         let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
         let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
@@ -7459,7 +7580,9 @@ mod tests {
 
         fs::write(
             &lock,
-            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n",
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
         )?;
         let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
         let report = restore(view.path(), store.path(), None, Some(&packages), false)?;

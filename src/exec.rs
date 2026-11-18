@@ -677,7 +677,7 @@ fn child_cargo(command: &[String]) -> ChildCargo {
         subcommand.as_deref(),
         Some("build" | "check" | "test" | "bench" | "clippy" | "run" | "rustc" | "doc" | "fix")
     );
-    let profile = builds_units.then(|| profile_from_args(command));
+    let profile = builds_units.then(|| profile_from_args(command, subcommand.as_deref()));
     let target = target_from_args(command);
     let Ok(mut probe) = crate::util::command_for(program) else {
         return ChildCargo {
@@ -725,7 +725,7 @@ fn cargo_subcommand(command: &[String]) -> Option<String> {
     None
 }
 
-fn profile_from_args(command: &[String]) -> String {
+fn profile_from_args(command: &[String], subcommand: Option<&str>) -> String {
     let mut explicit = None;
     let mut release = false;
     let mut args = command.iter().skip(1);
@@ -733,7 +733,7 @@ fn profile_from_args(command: &[String]) -> String {
         if arg == "--" {
             break;
         }
-        if arg == "--release" {
+        if arg == "--release" || arg == "-r" {
             release = true;
         } else if let Some(profile) = arg.strip_prefix("--profile=") {
             explicit = Some(profile.to_string());
@@ -743,11 +743,12 @@ fn profile_from_args(command: &[String]) -> String {
     }
     if let Some(profile) = explicit {
         return match profile.as_str() {
-            "dev" | "test" | "bench" => "debug".to_string(),
+            "dev" | "test" => "debug".to_string(),
+            "bench" | "release" => "release".to_string(),
             other => other.to_string(),
         };
     }
-    if release {
+    if release || subcommand == Some("bench") {
         "release".to_string()
     } else {
         "debug".to_string()
@@ -973,6 +974,13 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             crate::lockfile::manifest_arg(opts.command).as_deref(),
         )
     });
+    if packages.is_none() {
+        eprintln!(
+            "  {} {}",
+            util::dim(&format!("{:<11}", "lock")),
+            util::dim("no readable Cargo.lock; seeding without a lock filter")
+        );
+    }
     // The child may select another toolchain (`cargo +nightly`), and Cargo
     // 1.99-nightly+ writes the new build-dir layout. Both decide which vault
     // generation/layout can actually be reused.
@@ -1081,6 +1089,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         None,
         packages.as_ref(),
         layout,
+        child.profile.as_deref(),
         selector.as_deref(),
         false,
         opts.link,
@@ -1095,6 +1104,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             None,
             packages.as_ref(),
             layout,
+            child.profile.as_deref(),
             selector.as_deref(),
             false,
             opts.link,
@@ -1719,6 +1729,43 @@ mod tests {
         Ok((build, store))
     }
 
+    fn synthetic_unit(
+        root: &Path,
+        profile: &str,
+        package: &str,
+        hash: &str,
+        byte: u8,
+    ) -> Result<()> {
+        let unit = root
+            .join(profile)
+            .join(".fingerprint")
+            .join(format!("{package}-{hash}"));
+        fs::create_dir_all(&unit)?;
+        fs::write(unit.join(format!("lib-{package}")), "5d82713a7f2d05e2")?;
+        fs::write(
+            unit.join(format!("lib-{package}.json")),
+            r#"{"rustc":1,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"config":4,"deps":[]}"#,
+        )?;
+        fs::write(unit.join(format!("dep-lib-{package}")), [0u8; 8])?;
+        fs::create_dir_all(root.join(profile).join("deps"))?;
+        fs::write(
+            root.join(profile)
+                .join("deps")
+                .join(format!("lib{package}-{hash}.rlib")),
+            [byte; 32],
+        )?;
+        Ok(())
+    }
+
+    fn seeded_profiles_store() -> Result<(tempfile::TempDir, tempfile::TempDir)> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_unit(build.path(), "debug", "debugdep", "1111111111111111", 1)?;
+        synthetic_unit(build.path(), "release", "releasedep", "2222222222222222", 2)?;
+        vault::harvest(build.path(), store.path(), None, false)?;
+        Ok((build, store))
+    }
+
     #[cfg(unix)]
     #[test]
     fn exec_seeds_the_job_and_propagates_the_exit_code() -> Result<()> {
@@ -1729,7 +1776,9 @@ mod tests {
         let project = tempfile::tempdir()?;
         fs::write(
             project.path().join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n",
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
         )?;
         let job_dir = work.path().join("jobtest");
         let command = vec![
@@ -1799,6 +1848,87 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exec_seeds_only_the_child_profile() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_build, store) = seeded_profiles_store()?;
+        let work = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        let checksum_a = "ab".repeat(32);
+        let checksum_b = "cd".repeat(32);
+        fs::write(
+            project.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"debugdep\"\nversion = \"1.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{checksum_a}\"\n\n\
+                 [[package]]\nname = \"releasedep\"\nversion = \"1.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{checksum_b}\"\n"
+            ),
+        )?;
+        let bin = tempfile::tempdir()?;
+        let cargo = bin.path().join("cargo");
+        fs::write(
+            &cargo,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'cargo 1.99.1 (000000000 2026-01-01)'\n  exit 0\nfi\nexit 0\n",
+        )?;
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755))?;
+        let cargo = cargo.to_string_lossy().into_owned();
+
+        let bench = vec![cargo.clone(), "bench".to_string()];
+        let mut opts = Options {
+            job_id: Some("bench"),
+            cwd: Some(project.path().to_path_buf()),
+            harvest_back: false,
+            compress: true,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            incremental: None,
+            link: LinkPolicy::Auto,
+            cargo_home: None,
+            no_remote: false,
+            remote: None,
+            command: &bench,
+        };
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+        assert!(
+            work.path()
+                .join("bench/release/.fingerprint/releasedep-2222222222222222/lib-releasedep")
+                .is_file(),
+            "cargo bench seeds release units"
+        );
+        assert!(
+            !work
+                .path()
+                .join("bench/debug/.fingerprint/debugdep-1111111111111111")
+                .exists(),
+            "cargo bench does not seed debug units"
+        );
+
+        let build = vec![cargo, "build".to_string()];
+        opts.job_id = Some("devjob");
+        opts.command = &build;
+        assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+        assert!(
+            work.path()
+                .join("devjob/debug/.fingerprint/debugdep-1111111111111111/lib-debugdep")
+                .is_file(),
+            "cargo build seeds debug units"
+        );
+        assert!(
+            !work
+                .path()
+                .join("devjob/release/.fingerprint/releasedep-2222222222222222")
+                .exists(),
+            "cargo build does not seed release units"
+        );
+        Ok(())
+    }
+
     #[test]
     fn exec_seeds_only_the_packages_in_the_project_lock() -> Result<()> {
         let (_build, store) = seeded_store()?;
@@ -1839,7 +1969,9 @@ mod tests {
         // Naming the package in the lock seeds exactly that unit.
         fs::write(
             &lock,
-            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n",
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
         )?;
         let opts = Options {
             job_id: Some("seeded"),
@@ -2403,6 +2535,31 @@ mod tests {
         ]);
         assert_eq!(child.profile.as_deref(), Some("debug"));
         assert!(child.target.is_none());
+
+        let child = child_cargo(&["cargo".to_string(), "bench".to_string()]);
+        assert_eq!(
+            child.profile.as_deref(),
+            Some("release"),
+            "the bench subcommand defaults to the release profile"
+        );
+
+        let child = child_cargo(&["cargo".to_string(), "test".to_string(), "bench".to_string()]);
+        assert_eq!(
+            child.profile.as_deref(),
+            Some("debug"),
+            "a literal bench test filter is not the bench subcommand"
+        );
+
+        let child = child_cargo(&[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--profile".to_string(),
+            "bench".to_string(),
+        ]);
+        assert_eq!(child.profile.as_deref(), Some("release"));
+
+        let child = child_cargo(&["cargo".to_string(), "build".to_string(), "-r".to_string()]);
+        assert_eq!(child.profile.as_deref(), Some("release"));
 
         let child = child_cargo(&["cargo".to_string(), "metadata".to_string()]);
         assert!(!child.builds_units);

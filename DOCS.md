@@ -239,7 +239,7 @@ epicenter store restore
 > **Important rule for multiple git worktrees & parallel agents:** If you are working on **multiple git worktrees of the same project** (or running concurrent AI agents/jobs), **use Epicenter `work` directories (`epicenter exec`)** instead of pointing concurrent builds at the shared writable `build/` directory. Cargo's build-dir lock serializes concurrent builds on the same `build/` directory—giving each git worktree or agent its own `--id` work directory eliminates lock waits while still sharing 100% of compiled dependencies from the read-only vault.
 
 How `epicenter exec` works:
-1. Reads the project's `Cargo.lock` and selects only the packages needed by this project from the read-only vault.
+1. Reads the project's `Cargo.lock` and selects only the registry/git packages needed by this project from the read-only vault, then narrows to the child's Cargo profile (`debug` for `cargo build`/`test`, `release` for `--release`, `-r`, or `bench`). Path/workspace packages are never seeded.
 2. Creates a private work directory under the per-user OS cache (`$XDG_CACHE_HOME/epicenter/work/<id>/` by default, or `--work-root`) and seeds it in milliseconds (hard-linking immutable `.rlib`/`.a` archives from a local private vault, and copying mutable metadata/fingerprints).
 3. Pins `CARGO_BUILD_BUILD_DIR` (and `CARGO_TARGET_DIR` when `--target-dir` is passed) in the child process environment.
 4. Passes through the child command's `stdout`, `stderr`, and exit code unchanged.
@@ -285,8 +285,15 @@ execution: build it in a sandbox (separate user/VM) or do not harvest it.
 Restore is bound the other way. A stored unit records the package version it
 was compiled from (read from rustc's `.d` source list at harvest), and `exec`
 seeds it only into a job whose `Cargo.lock` resolves the same
-`(package, version)`. The lock is parsed once per job and each check is a
-hash-map lookup, so the binding costs one small file read, not a per-unit scan.
+`(package, version)` from a registry or git source. Path/workspace packages are
+skipped: their name and version do not identify the checkout, so a unit from
+another project could otherwise be seeded by accident. `exec` also narrows to
+the child's Cargo profile, so a debug job never inherits release units. The lock
+is parsed once per job and each check is a hash-map lookup, so the binding costs
+one small file read, not a per-unit scan. `store restore` applies the same
+package/source rule from the cwd `Cargo.lock`. With no readable lock, `exec` and
+`store restore` warn and seed without a lock filter; remote import is skipped
+(`store fetch --all` is the explicit unfiltered import).
 
 ### Workflow 4: CI/CD & Multi-VM Fleets
 
@@ -615,7 +622,7 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter exec [FLAGS] -- <CMD>` | Run `<CMD>` in an isolated per-job build dir seeded from the vault |
 | `epicenter exec --no-remote [FLAGS] -- <CMD>` | Force a local-only job; skip remote compatible-unit fetch |
 | `epicenter store harvest [--unit <Q>] [--no-compress] [--dry-run] [--trusted]` | Save compiled units from the shared build dir into the durable vault (`--trusted` accepts a shared/network build dir) |
-| `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault |
+| `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault, filtered by the cwd `Cargo.lock` when present |
 | `epicenter store restore --no-remote ...` | Skip remote compatible-unit fetch while restoring |
 | `epicenter store fetch [--dry-run] [--unit <Q>] [--all]` (hidden) | Verify/import compatible remote units without running a build |
 | `epicenter store publish ...` (hidden) | CI-only: sign one store generation into a local staging tree and print the upload plan |
