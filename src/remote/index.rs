@@ -287,22 +287,18 @@ impl IndexBody {
         Ok(())
     }
 
-    /// Validate the content against the tier it claims and the reader tier.
+    /// Validate the content against the tier it claims.
     ///
-    /// A `libraries` reader may consume only a `libraries` index. A `full`
-    /// reader may consume either, because a libraries index is a strict
-    /// subset. `libraries` content can never contain executable units.
+    /// A `libraries` reader accepts a `full` index: the reader-side filter
+    /// imports only non-executable units, so one published index can serve
+    /// both reader tiers. A `libraries` index is still required to be free of
+    /// executable units; mislabeling it is an index error, not a miss.
     pub fn validate_for(&self, reader: RemoteTier) -> Result<()> {
         self.validate_shape()?;
         self.validate_reader(reader)
     }
 
-    pub(crate) fn validate_reader(&self, reader: RemoteTier) -> Result<()> {
-        ensure!(
-            reader == RemoteTier::Full || self.tier != RemoteTier::Full,
-            "remote index is published for the `full` tier but this machine allows only \
-             `libraries`; refusing executable units"
-        );
+    pub(crate) fn validate_reader(&self, _reader: RemoteTier) -> Result<()> {
         if self.tier == RemoteTier::Libraries
             && let Some(unit) = self.units.iter().find(|unit| unit.is_executable())
         {
@@ -428,6 +424,12 @@ pub struct RemoteUnit {
 impl RemoteUnit {
     pub fn is_executable(&self) -> bool {
         self.kind.is_executable() || self.executable_file().is_some()
+    }
+
+    /// The reader-side tier boundary. A `libraries` reader may consume a
+    /// `full` index, but it must never install an executable unit.
+    pub fn importable_for(&self, reader: RemoteTier) -> bool {
+        reader == RemoteTier::Full || !self.is_executable()
     }
 
     pub fn executable_file(&self) -> Option<&RemoteFile> {
@@ -588,6 +590,20 @@ pub enum FileRole {
     Artifact,
     BuildTree,
     Extra,
+}
+
+impl FileRole {
+    /// The manifest spelling used by the local vault.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileRole::Memo => "memo",
+            FileRole::Fingerprint => "fingerprint",
+            FileRole::DepInfo => "dep-info",
+            FileRole::Artifact => "artifact",
+            FileRole::BuildTree => "build-tree",
+            FileRole::Extra => "extra",
+        }
+    }
 }
 
 impl TryFrom<&str> for FileRole {

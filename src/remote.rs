@@ -17,12 +17,18 @@
 //! endpoint/key and refuse rollbacks, equivocation and expired indexes.
 //!
 //! The CI-only publisher turns one vault generation into that tree under a
-//! private staging root; transport uploads are a separate layer.
+//! private staging root; transport uploads are a separate layer. On the reader
+//! side, the same tree is mirrored under the per-user remote cache, verified,
+//! filtered and imported into the local vault (or the cache store when the
+//! configured vault is read-only). The network source lands in P3.6.
 
+mod cache;
 mod cas;
 mod compat;
 mod index;
 mod publish;
+mod reader;
+mod source;
 mod state;
 pub(crate) mod validate;
 
@@ -43,6 +49,8 @@ pub use index::{
     publisher_report, read_index_tree, verify_body, verify_index, write_index_tree,
 };
 pub use publish::{PublishOutcome, PublishRequest, publish};
+pub use reader::{FetchReport, FetchRequest, fetch_and_import, preview};
+pub use source::{DirSource, RemoteSource, source_for};
 pub use state::{
     IndexStatus, RemoteState, clear_state, load_state, record_state, state_path, status,
 };

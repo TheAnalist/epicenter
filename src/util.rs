@@ -2015,7 +2015,7 @@ pub(crate) fn sha256_file_fd(file: &mut File) -> std::io::Result<String> {
 
 /// Stream a decoded payload into `writer`, hashing it and refusing to grow
 /// past `max_size`. Returns the decoded size and SHA-256.
-pub(crate) fn copy_capped<R: Read, W: Write>(
+pub(crate) fn copy_capped<R: Read, W: Write + ?Sized>(
     reader: &mut R,
     writer: &mut W,
     max_size: u64,
@@ -2048,7 +2048,7 @@ pub(crate) fn copy_capped<R: Read, W: Write>(
 }
 
 /// Stream a decoded payload and require the recorded decoded size and hash.
-pub(crate) fn copy_verified<R: Read, W: Write>(
+pub(crate) fn copy_verified<R: Read, W: Write + ?Sized>(
     reader: &mut R,
     writer: &mut W,
     expected_size: u64,

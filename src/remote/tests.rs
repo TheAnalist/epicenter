@@ -376,7 +376,12 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
             .err()
             .map(|err| format!("{err:#}"))
     );
-    assert!(body.validate_for(RemoteTier::Libraries).is_err());
+    assert!(
+        body.validate_for(RemoteTier::Libraries).is_ok(),
+        "a libraries reader accepts a full index and filters at import"
+    );
+    assert!(!build_script.importable_for(RemoteTier::Libraries));
+    assert!(build_script.importable_for(RemoteTier::Full));
 
     let index = make_index(body, &key, now)?;
     let pointer_bytes = serde_json::to_vec(index.pointer())?;
@@ -389,7 +394,8 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
             RemoteTier::Libraries,
             now
         )
-        .is_err()
+        .is_ok(),
+        "the pointer/body tier gate is the index tier, not the reader filter"
     );
     assert!(
         verify_index(
@@ -724,5 +730,823 @@ fn publisher_report_mirrors_the_signed_metadata() -> Result<()> {
     assert_eq!(report.key_id, index.pointer().key_id);
     assert_eq!(report.tier, RemoteTier::Full);
     assert_eq!(report.body_sha256, index.pointer().body_sha256);
+    Ok(())
+}
+
+// ── reader / import ─────────────────────────────────────────────────────────
+
+fn policy_at(public: &str, cache: &std::path::Path) -> settings::RemotePolicy {
+    let mut policy = remote_policy(public);
+    policy.cache = cache.to_path_buf();
+    policy
+}
+
+fn body_for_local(
+    key: &SigningKey,
+    now: u64,
+    sequence: u64,
+    tier: RemoteTier,
+    units: Vec<RemoteUnit>,
+    local: &LocalEnvironment,
+) -> IndexBody {
+    IndexBody {
+        schema: SCHEMA_VERSION,
+        key_id: settings::remote_key_id(&public_key(key)).unwrap(),
+        sequence,
+        created: now.saturating_sub(60),
+        expires: now + 86_400,
+        tier,
+        publisher: publisher(now),
+        compatibility: Compatibility::from_local(local, &units).unwrap(),
+        units,
+    }
+}
+
+fn remote_file(
+    root: &std::path::Path,
+    path: &str,
+    dest: &str,
+    role: FileRole,
+    content: &[u8],
+) -> Result<RemoteFile> {
+    let source = root.join(format!(".source-{}", crate::util::temp_nonce()));
+    fs::write(&source, content)?;
+    let blob = write_blob(&source, root)?;
+    Ok(RemoteFile {
+        path: path.to_string(),
+        dest: dest.to_string(),
+        size: content.len() as u64,
+        sha256: super::sha256_hex(content),
+        role,
+        blob: blob.blob,
+        blob_size: blob.blob_size,
+        compression: blob.compression,
+    })
+}
+
+fn lib_unit(root: &std::path::Path) -> Result<RemoteUnit> {
+    lib_unit_with(root, b"artifact bytes")
+}
+
+fn lib_unit_with(root: &std::path::Path, artifact: &[u8]) -> Result<RemoteUnit> {
+    let memo = b"aabbccddeeff0011";
+    Ok(RemoteUnit {
+        name: "demo-0011223344556677".to_string(),
+        package: "demo".to_string(),
+        version: Some("0.1.0".to_string()),
+        profile: "debug".to_string(),
+        memo: "lib-demo".to_string(),
+        hash: "aabbccddeeff0011".to_string(),
+        stamp: now_secs(),
+        layout: UnitLayout::Classic,
+        kind: RemoteUnitKind::Lib,
+        source: UnitSource {
+            kind: SourceKind::Registry,
+            id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            checksum: Some("ab".repeat(32)),
+        },
+        compat: UnitCompatibility {
+            rustc: "1".to_string(),
+            target: "2".to_string(),
+            profile: "3".to_string(),
+            features: vec!["default".to_string()],
+            rustflags: Vec::new(),
+            config: "4".to_string(),
+            path: "5".to_string(),
+            compile_kind: "0".to_string(),
+        },
+        files: vec![
+            remote_file(
+                root,
+                "lib-demo",
+                ".fingerprint/demo-0011223344556677/lib-demo",
+                FileRole::Memo,
+                memo,
+            )?,
+            remote_file(
+                root,
+                "deps/libdemo.rlib",
+                "deps/libdemo.rlib",
+                FileRole::Artifact,
+                artifact,
+            )?,
+        ],
+    })
+}
+
+fn build_unit(root: &std::path::Path) -> Result<RemoteUnit> {
+    Ok(RemoteUnit {
+        name: "buildy-8899aabbccddeeff".to_string(),
+        package: "buildy".to_string(),
+        version: Some("0.1.0".to_string()),
+        profile: "debug".to_string(),
+        memo: "build-script-build".to_string(),
+        hash: "1122334455667788".to_string(),
+        stamp: now_secs(),
+        layout: UnitLayout::Classic,
+        kind: RemoteUnitKind::BuildScript,
+        source: UnitSource {
+            kind: SourceKind::Registry,
+            id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            checksum: Some("cd".repeat(32)),
+        },
+        compat: UnitCompatibility {
+            rustc: "1".to_string(),
+            target: "2".to_string(),
+            profile: "3".to_string(),
+            features: vec!["default".to_string()],
+            rustflags: Vec::new(),
+            config: "4".to_string(),
+            path: "5".to_string(),
+            compile_kind: "0".to_string(),
+        },
+        files: vec![remote_file(
+            root,
+            "build/buildy/out/build-script-build",
+            "build/buildy/out/build-script-build",
+            FileRole::BuildTree,
+            b"#!/bin/sh\nexit 0\n",
+        )?],
+    })
+}
+
+struct FailingSource;
+
+impl RemoteSource for FailingSource {
+    fn fetch_pointer(&self) -> Result<Vec<u8>> {
+        anyhow::bail!("offline")
+    }
+
+    fn fetch_body(&self, _sha256: &str, _max_bytes: u64) -> Result<Vec<u8>> {
+        anyhow::bail!("offline")
+    }
+
+    fn fetch_blob(
+        &self,
+        _sha256: &str,
+        _max_bytes: u64,
+        _out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        anyhow::bail!("offline")
+    }
+}
+
+fn prepared_source<F>(
+    key: &SigningKey,
+    now: u64,
+    tier: RemoteTier,
+    local: &LocalEnvironment,
+    build: F,
+) -> Result<(tempfile::TempDir, SignedIndex)>
+where
+    F: FnOnce(&std::path::Path) -> Result<Vec<RemoteUnit>>,
+{
+    let source = tempfile::tempdir()?;
+    let units = build(source.path())?;
+    let body = body_for_local(key, now, 1, tier, units, local);
+    let index = make_index(body, key, now)?;
+    write_index_tree(source.path(), &index)?;
+    Ok((source, index))
+}
+
+#[test]
+fn reader_imports_and_restores_verified_units() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let view = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(11);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(report.imported, 1, "{:?}", report.fallback);
+    assert!(report.fallback.is_none());
+    assert!(report.cache_store.is_none());
+
+    let reports = crate::vault::verify(store.path())?;
+    assert!(
+        reports.iter().all(|report| report.problems.is_empty()),
+        "{:?}",
+        reports
+            .iter()
+            .flat_map(|report| report.problems.iter())
+            .collect::<Vec<_>>()
+    );
+    let restore = crate::vault::restore(view.path(), store.path(), None, None, false)?;
+    assert_eq!(restore.errors, 0);
+    assert_eq!(restore.fatal_errors, 0);
+    assert_eq!(
+        fs::read(view.path().join("debug/deps/libdemo.rlib"))?,
+        b"artifact bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_tier_filter_skips_executable_units() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(12);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Full, &local, |root| {
+        Ok(vec![lib_unit(root)?, build_unit(root)?])
+    })?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(report.imported, 1);
+    let stored = crate::vault::stored_units(store.path())?;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].entry.name, "demo-0011223344556677");
+    Ok(())
+}
+
+#[test]
+fn reader_profile_filter_is_a_miss_not_an_error() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(13);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        let mut unit = lib_unit(root)?;
+        unit.profile = "release".to_string();
+        Ok(vec![unit])
+    })?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: Some("debug"),
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some("generation"),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(report.candidates, 0);
+    assert_eq!(report.imported, 0);
+    assert!(report.fallback.is_none());
+    Ok(())
+}
+
+#[test]
+fn reader_offline_reuses_a_valid_cached_index() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let first = tempfile::tempdir()?;
+    let second = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(14);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let dir_source = DirSource::new(source.path());
+    let online = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &dir_source,
+        store_root: first.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(online.imported, 1);
+    let offline = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &FailingSource,
+        store_root: second.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert!(offline.offline);
+    assert_eq!(offline.imported, 1, "{:?}", offline.fallback);
+    assert!(offline.fallback.is_none());
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_a_tampered_pointer_without_importing() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(15);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let pointer = fs::read(source.path().join(INDEX_FILE))?;
+    let mut tampered = pointer.clone();
+    let last = tampered.len() - 2;
+    tampered[last] ^= 1;
+    fs::write(source.path().join(INDEX_FILE), tampered)?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some("generation"),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(report.imported, 0);
+    assert!(report.warning.is_some());
+    assert!(report.fallback.is_some());
+    assert!(crate::vault::stored_units(store.path())?.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reader_uses_the_cache_store_when_the_main_store_is_read_only() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let view = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(16);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    fs::set_permissions(store.path(), fs::Permissions::from_mode(0o555))?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    });
+    fs::set_permissions(store.path(), fs::Permissions::from_mode(0o755))?;
+    let report = report?;
+    let cache_store = report.cache_store.expect("read-only main store uses cache");
+    assert_eq!(report.imported, 1, "{:?}", report.fallback);
+    let stored = crate::vault::stored_units(&cache_store)?;
+    assert_eq!(stored.len(), 1);
+    let restore = crate::vault::restore(view.path(), &cache_store, None, None, false)?;
+    assert_eq!(restore.errors, 0);
+    assert_eq!(
+        fs::read(view.path().join("debug/deps/libdemo.rlib"))?,
+        b"artifact bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_lock_filter_requires_the_matching_source() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(17);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let lock_path = cache.path().join("Cargo.lock");
+    fs::write(
+        &lock_path,
+        "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB\"\n",
+    )?;
+    let lock = crate::lockfile::LockIndex::parse(&lock_path).expect("lock parses");
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: Some(&lock),
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some("generation"),
+        now,
+        dry_run: true,
+    })?;
+    assert_eq!(report.candidates, 1);
+    assert!(report.fallback.is_none());
+    Ok(())
+}
+
+#[test]
+fn mixed_layout_indexes_are_accepted_and_filtered_per_unit() -> Result<()> {
+    let key = signing_key(18);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let source = tempfile::tempdir()?;
+    let unit = lib_unit(source.path())?;
+    let mut body = body_for_local(&key, now, 1, RemoteTier::Libraries, vec![unit], &local);
+    body.compatibility.layout = "mixed".to_string();
+    body.validate_for_local(RemoteTier::Libraries, &local)?;
+    Ok(())
+}
+
+#[test]
+fn reader_preserves_compressed_blobs_and_verify_is_clean() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let view = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(19);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let artifact = vec![b'x'; 64 * 1024];
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit_with(root, &artifact)?])
+    })?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(report.imported, 1, "{:?}", report.fallback);
+    let stored = crate::vault::stored_units(store.path())?;
+    let artifact = stored[0]
+        .entry
+        .files
+        .iter()
+        .find(|file| file.path == "deps/libdemo.rlib")
+        .expect("artifact");
+    assert!(artifact.object.is_some(), "large artifact is a gzip object");
+    let reports = crate::vault::verify(store.path())?;
+    assert!(
+        reports.iter().all(|report| report.problems.is_empty()),
+        "{:?}",
+        reports
+            .iter()
+            .flat_map(|report| report.problems.iter())
+            .collect::<Vec<_>>()
+    );
+    let restore = crate::vault::restore(view.path(), store.path(), None, None, false)?;
+    assert_eq!(restore.errors, 0);
+    assert_eq!(
+        fs::read(view.path().join("debug/deps/libdemo.rlib"))?.len(),
+        64 * 1024
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_dry_run_writes_nothing() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(20);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some("generation"),
+        now,
+        dry_run: true,
+    })?;
+    assert_eq!(report.candidates, 1);
+    assert_eq!(report.imported, 0);
+    assert!(report.fallback.is_none());
+    assert!(!super::cache::endpoint_root(&policy)?.exists());
+    assert!(crate::vault::stored_units(store.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_a_poisoned_cached_blob() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let first = tempfile::tempdir()?;
+    let second = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(21);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let dir_source = DirSource::new(source.path());
+    let online = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &dir_source,
+        store_root: first.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(online.imported, 1);
+    let blob = &index.body().units[0].files[0].blob;
+    let cached = super::cache::endpoint_root(&policy)?
+        .join(BLOBS_DIR)
+        .join(blob);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cached, fs::Permissions::from_mode(0o644))?;
+    }
+    fs::write(&cached, b"poison")?;
+    let offline = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &FailingSource,
+        store_root: second.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(offline.imported, 0);
+    assert!(offline.fallback.is_some());
+    assert!(crate::vault::stored_units(second.path())?.is_empty());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reader_copies_across_filesystems() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let shm = std::path::Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return Ok(());
+    }
+    let cache = tempfile::Builder::new()
+        .prefix("epicenter-remote-")
+        .tempdir_in(shm)?;
+    let store = tempfile::tempdir()?;
+    if fs::metadata(cache.path())?.dev() == fs::metadata(store.path())?.dev() {
+        return Ok(());
+    }
+    let state = tempfile::tempdir()?;
+    let key = signing_key(22);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(report.imported, 1, "{:?}", report.fallback);
+    assert_eq!(crate::vault::stored_units(store.path())?.len(), 1);
+    Ok(())
+}
+
+struct NoBlobSource<'a> {
+    inner: &'a DirSource,
+}
+
+impl RemoteSource for NoBlobSource<'_> {
+    fn fetch_pointer(&self) -> Result<Vec<u8>> {
+        self.inner.fetch_pointer()
+    }
+
+    fn fetch_body(&self, sha256: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        self.inner.fetch_body(sha256, max_bytes)
+    }
+
+    fn fetch_blob(
+        &self,
+        _sha256: &str,
+        _max_bytes: u64,
+        _out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        anyhow::bail!("a warm generation must not fetch blobs")
+    }
+}
+
+#[test]
+fn reader_skips_blobs_when_the_generation_is_already_present() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(23);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+    let dir_source = DirSource::new(source.path());
+    assert_eq!(
+        fetch_and_import(&FetchRequest {
+            remote: &policy,
+            source: &dir_source,
+            store_root: store.path(),
+            state_root: Some(state.path()),
+            packages: None,
+            selector: None,
+            layout: None,
+            profile: None,
+            unit_filter: None,
+            local: Some(&local),
+            generation: Some(&generation),
+            now,
+            dry_run: false,
+        })?
+        .imported,
+        1
+    );
+    let warm = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &NoBlobSource { inner: &dir_source },
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+    assert_eq!(warm.imported, 0);
+    assert_eq!(warm.skipped, 1);
+    assert!(warm.fallback.is_none(), "{:?}", warm.fallback);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reader_rejects_symlinked_cache_roots() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let key = signing_key(24);
+    let public = public_key(&key);
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let now = now_secs();
+
+    let case = |policy: &settings::RemotePolicy| {
+        fetch_and_import(&FetchRequest {
+            remote: policy,
+            source: &FailingSource,
+            store_root: store.path(),
+            state_root: Some(state.path()),
+            packages: None,
+            selector: None,
+            layout: None,
+            profile: None,
+            unit_filter: None,
+            local: None,
+            generation: Some("generation"),
+            now,
+            dry_run: false,
+        })
+    };
+
+    // Symlinked cache root.
+    let base = tempfile::tempdir()?;
+    let victim = tempfile::tempdir()?;
+    let cache = base.path().join("cache");
+    symlink(victim.path(), &cache)?;
+    let policy = policy_at(&public, &cache);
+    assert!(case(&policy).is_err());
+
+    // Symlinked endpoint.
+    let cache = tempfile::tempdir()?;
+    let policy = policy_at(&public, cache.path());
+    let endpoint = super::cache::endpoint_root(&policy)?;
+    fs::create_dir_all(cache.path())?;
+    symlink(victim.path(), &endpoint)?;
+    assert!(case(&policy).is_err());
+
+    // Symlinked cache store.
+    let cache = tempfile::tempdir()?;
+    let policy = policy_at(&public, cache.path());
+    let endpoint = super::cache::endpoint_root(&policy)?;
+    fs::create_dir_all(&endpoint)?;
+    symlink(victim.path(), endpoint.join("store"))?;
+    assert!(case(&policy).is_err());
     Ok(())
 }

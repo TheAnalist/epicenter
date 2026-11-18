@@ -165,7 +165,7 @@ fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
     Ok((tmp, blob, size, sha256, size, Compression::Raw))
 }
 
-fn install_put_if_absent(
+pub(crate) fn install_put_if_absent(
     tmp: &Path,
     final_path: &Path,
     expected_blob: &str,

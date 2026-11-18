@@ -421,6 +421,8 @@ pub struct Options<'a> {
     pub cargo_home: Option<&'a Path>,
     /// Skip remote compatible-unit fetch for this job.
     pub no_remote: bool,
+    /// Effective remote policy; `None` when the endpoint is unconfigured.
+    pub remote: Option<&'a crate::settings::RemotePolicy>,
     /// The command, argv-style.
     pub command: &'a [String],
 }
@@ -639,11 +641,22 @@ fn project_dir(opts: &Options<'_>) -> Option<PathBuf> {
     }
 }
 
-/// `+toolchain` and `cargo --version` of the child, when it is cargo.
-/// `(None, None)` for any other program (fail-open: the default generation).
-fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
+#[derive(Debug, Default)]
+struct ChildCargo {
+    selector: Option<String>,
+    version: Option<String>,
+    /// Profile directory Cargo will use, e.g. `debug` or `release`.
+    profile: Option<String>,
+    target: Option<String>,
+    /// Whether the subcommand produces units that a restored view can serve.
+    builds_units: bool,
+}
+
+/// `+toolchain`, version, profile and target of a cargo child. A non-cargo
+/// program returns the default (empty) value.
+fn child_cargo(command: &[String]) -> ChildCargo {
     let Some(program) = command.first() else {
-        return (None, None);
+        return ChildCargo::default();
     };
     let is_cargo = Path::new(program)
         .file_stem()
@@ -651,7 +664,7 @@ fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
         .map(|stem| stem.eq_ignore_ascii_case("cargo"))
         .unwrap_or(false);
     if !is_cargo {
-        return (None, None);
+        return ChildCargo::default();
     }
     // rustup's `+toolchain` must be the first argument after the program.
     let selector = command
@@ -659,8 +672,21 @@ fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
         .and_then(|arg| arg.strip_prefix('+'))
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let subcommand = cargo_subcommand(command);
+    let builds_units = matches!(
+        subcommand.as_deref(),
+        Some("build" | "check" | "test" | "bench" | "clippy" | "run" | "rustc" | "doc" | "fix")
+    );
+    let profile = builds_units.then(|| profile_from_args(command));
+    let target = target_from_args(command);
     let Ok(mut probe) = crate::util::command_for(program) else {
-        return (selector, None);
+        return ChildCargo {
+            selector,
+            profile,
+            target,
+            builds_units,
+            version: None,
+        };
     };
     if let Some(selector) = &selector {
         probe.arg(format!("+{selector}"));
@@ -672,7 +698,106 @@ fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|text| text.starts_with("cargo "));
-    (selector, version)
+    ChildCargo {
+        selector,
+        version,
+        profile,
+        target,
+        builds_units,
+    }
+}
+
+/// First positional cargo argument after global options.
+fn cargo_subcommand(command: &[String]) -> Option<String> {
+    let mut args = command.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg.starts_with('+') || arg.starts_with('-') {
+            if matches!(
+                arg.as_str(),
+                "--color" | "--config" | "-Z" | "--manifest-path" | "--target-dir"
+            ) {
+                args.next();
+            }
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+fn profile_from_args(command: &[String]) -> String {
+    let mut explicit = None;
+    let mut release = false;
+    let mut args = command.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--release" {
+            release = true;
+        } else if let Some(profile) = arg.strip_prefix("--profile=") {
+            explicit = Some(profile.to_string());
+        } else if arg == "--profile" {
+            explicit = args.next().cloned();
+        }
+    }
+    if let Some(profile) = explicit {
+        return match profile.as_str() {
+            "dev" | "test" | "bench" => "debug".to_string(),
+            other => other.to_string(),
+        };
+    }
+    if release {
+        "release".to_string()
+    } else {
+        "debug".to_string()
+    }
+}
+
+fn target_from_args(command: &[String]) -> Option<String> {
+    let mut args = command.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(target) = arg.strip_prefix("--target=") {
+            return Some(target.to_string());
+        }
+        if arg == "--target" {
+            return args.next().cloned();
+        }
+    }
+    None
+}
+
+fn print_remote(report: &crate::remote::FetchReport) {
+    if report.disabled {
+        return;
+    }
+    if let Some(warning) = &report.warning {
+        eprintln!("  {} {}", util::warn(util::GLYPH_WARN), util::dim(warning));
+    }
+    if let Some(reason) = &report.fallback {
+        eprintln!(
+            "  {} {}",
+            util::dim(&format!("{:<11}", "remote")),
+            util::dim(&format!("skipped: {reason}"))
+        );
+        return;
+    }
+    let suffix = if report.cache_store.is_some() {
+        "  (cache store)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "  {} {} unit(s) · {} file(s) · {}{}",
+        util::dim(&format!("{:<11}", "remote")),
+        report.imported,
+        report.files,
+        util::green(&human_bytes(report.bytes)),
+        util::dim(suffix)
+    );
 }
 
 /// Run the job; returns the command's exit code.
@@ -722,6 +847,14 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         }
     }
     let work_root = work_root.as_path();
+
+    if opts.harvest_back && !crate::vault::store_accepts_imports(store_root) {
+        bail!(
+            "store {} is read-only or not writable — `--harvest` needs a writable store; run without `--harvest`",
+            store_root.display()
+        );
+    }
+
     // A job dir must stay on this machine's disk: a network mount is a second
     // trust domain, and a harvest record written there proves nothing.
     if crate::vault::store_is_shared_mount(work_root) {
@@ -843,10 +976,73 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     // The child may select another toolchain (`cargo +nightly`), and Cargo
     // 1.99-nightly+ writes the new build-dir layout. Both decide which vault
     // generation/layout can actually be reused.
-    let (selector, cargo_version) = child_cargo(opts.command);
+    let child = child_cargo(opts.command);
+    let selector = child.selector.clone();
+    let cargo_version = child.version.clone();
     let layout = cargo_version
         .as_deref()
         .map(|version| fingerprint::layout_for_cargo(version, opts.command));
+
+    // Fetch remote units before seeding. A miss, offline source, missing lock
+    // or unsupported target is a local build, never a job failure.
+    let mut remote_fetch: Option<crate::remote::FetchReport> = None;
+    if let Some(policy) = opts.remote
+        && !opts.no_remote
+        && policy.enabled
+    {
+        let skip = if !child.builds_units {
+            Some("not a cargo unit-producing command")
+        } else if child.target.is_some() {
+            Some("child --target is not seeded remotely in 0.1.0")
+        } else if packages.is_none() {
+            Some("no readable Cargo.lock")
+        } else {
+            None
+        };
+        if let Some(reason) = skip {
+            eprintln!(
+                "  {} {}",
+                util::dim(&format!("{:<11}", "remote")),
+                util::dim(reason)
+            );
+        } else {
+            match crate::remote::source_for(policy) {
+                Ok(source) => {
+                    let request = crate::remote::FetchRequest {
+                        remote: policy,
+                        source: source.as_ref(),
+                        store_root,
+                        state_root: None,
+                        packages: packages.as_ref(),
+                        selector: selector.as_deref(),
+                        layout,
+                        profile: child.profile.as_deref(),
+                        unit_filter: None,
+                        local: None,
+                        generation: None,
+                        now: crate::util::now_secs(),
+                        dry_run: false,
+                    };
+                    match crate::remote::fetch_and_import(&request) {
+                        Ok(report) => {
+                            print_remote(&report);
+                            remote_fetch = Some(report);
+                        }
+                        Err(err) => eprintln!(
+                            "  {} {}",
+                            util::dim(&format!("{:<11}", "remote")),
+                            util::dim(&format!("skipped: {err:#}"))
+                        ),
+                    }
+                }
+                Err(err) => eprintln!(
+                    "  {} {}",
+                    util::dim(&format!("{:<11}", "remote")),
+                    util::dim(&format!("skipped: {err:#}"))
+                ),
+            }
+        }
+    }
 
     // Write the provenance record before restore, so a crash mid-restore still
     // leaves a recorded job and the next `--reuse` is allowed. It lives in the
@@ -879,7 +1075,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     };
     write_record(work_root, &job_id, &record)?;
 
-    let restore = vault::restore_with(
+    let mut restore = vault::restore_with(
         &work_dir,
         store_root,
         None,
@@ -889,6 +1085,25 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         false,
         opts.link,
     )?;
+    if let Some(cache_store) = remote_fetch
+        .as_ref()
+        .and_then(|report| report.cache_store.as_deref())
+    {
+        let overlay = vault::restore_with(
+            &work_dir,
+            cache_store,
+            None,
+            packages.as_ref(),
+            layout,
+            selector.as_deref(),
+            false,
+            opts.link,
+        )?;
+        restore.merge_secondary(overlay);
+        // The cache layer is a real overlay: the main store's "empty
+        // generation" note no longer describes what was seeded.
+        restore.note = None;
+    }
     if restore.fatal_errors > 0 {
         bail!(
             "vault restore refused {} unverified file(s) — refusing to run the command over unverified state",
@@ -1537,6 +1752,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         let code = run(store.path(), work.path(), &opts)?;
@@ -1576,6 +1792,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: Some(cargo.path()),
             no_remote: false,
+            remote: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1607,6 +1824,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1658,6 +1876,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1686,6 +1905,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &bad,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 1);
@@ -1712,6 +1932,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &kept,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -1766,6 +1987,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1811,6 +2033,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &ok,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1854,6 +2077,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &cmd,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -1945,6 +2169,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &fresh)?, 0);
@@ -1981,6 +2206,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
@@ -2013,6 +2239,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -2047,6 +2274,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -2082,6 +2310,7 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         let err = run(store.path(), work.path(), &opts).unwrap_err();
@@ -2144,9 +2373,39 @@ mod tests {
             link: LinkPolicy::Auto,
             cargo_home: None,
             no_remote: false,
+            remote: None,
             command: &command,
         };
         assert_eq!(run(store.path(), work.path(), &opts)?, 0);
         Ok(())
+    }
+
+    #[test]
+    fn child_cargo_reads_profile_target_and_subcommand() {
+        let command = vec![
+            "cargo".to_string(),
+            "+nightly".to_string(),
+            "test".to_string(),
+            "--release".to_string(),
+            "--target".to_string(),
+            "wasm32-unknown-unknown".to_string(),
+        ];
+        let child = child_cargo(&command);
+        assert!(child.builds_units);
+        assert_eq!(child.selector.as_deref(), Some("nightly"));
+        assert_eq!(child.profile.as_deref(), Some("release"));
+        assert_eq!(child.target.as_deref(), Some("wasm32-unknown-unknown"));
+
+        let child = child_cargo(&[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--profile=dev".to_string(),
+        ]);
+        assert_eq!(child.profile.as_deref(), Some("debug"));
+        assert!(child.target.is_none());
+
+        let child = child_cargo(&["cargo".to_string(), "metadata".to_string()]);
+        assert!(!child.builds_units);
+        assert!(child.profile.is_none());
     }
 }

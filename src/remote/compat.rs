@@ -208,7 +208,12 @@ impl Compatibility {
             &self.rustflags_digest,
             &local.rustflags_digest,
         );
-        compare(&mut out, "Cargo layout", &self.layout, &local.layout);
+        // A mixed index carries units for both layouts. The per-unit filter
+        // selects this reader's layout; rejecting the index outright would
+        // make a valid mixed publication unusable.
+        if self.layout != "mixed" {
+            compare(&mut out, "Cargo layout", &self.layout, &local.layout);
+        }
         compare(
             &mut out,
             "registry name",

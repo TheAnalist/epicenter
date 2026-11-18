@@ -416,7 +416,11 @@ Remote parsing is strict: fields and paths are bounded, control/bidi formatting 
 
 Readers verify the pointer signature, key id, sequence/expiry, body hash/size/canonical form and then each blob. They keep the highest accepted sequence per endpoint/key under the OS state directory and reject rollback, same-sequence equivocation and expired indexes. Rotation/revocation is a trusted-channel operation: re-pin the new key with `setup`; an old-key index fails both the key-id and signature checks. A deliberate sequence reset under the same key requires clearing the local state.
 
-`libraries` indexes contain only non-executable library/metadata units. `full` may add build-script trees and proc-macro/shared objects; a `libraries` reader refuses a `full` index. Path/workspace units are always excluded. `doctor` compares the last verified index tuple (rustc, Cargo, target, cargo home, flags, layout, registry source path) with this machine and names each mismatch; the reader will apply the same tuple when filtering units.
+`libraries` indexes contain only non-executable library/metadata units. `full` may add build-script trees and proc-macro/shared objects; a `libraries` reader accepts a `full` index but imports only non-executable units (the reader-side filter is the boundary). Path/workspace units are always excluded. `doctor` compares the last verified index tuple (rustc, Cargo, target, cargo home, flags, layout, registry source path) with this machine and names each mismatch; the reader applies the same tuple before filtering units.
+
+**Reader cache and import.** `exec` and `store restore` fetch before seeding. Verified pointer/body/blobs are cached under the per-user remote cache, and a still-valid cached index may be reused when the network is offline. The cache root, endpoint directory and cache-store directory are rejected if they are symlinks/reparse points before any read or write. Units are selected by machine tuple, tier, child profile (`--release`/`--profile`), layout and `Cargo.lock` package/version/source; only the selected units' blobs are fetched. Import stages complete unit groups, stamps raw files, keeps store files read-only, preserves gzip objects, merges the manifest once and re-signs it with the local key. A miss, incompatibility, tamper, timeout or offline falls back to a local build; `--no-remote` skips fetch and the cache overlay. Remote fetch is skipped for non-cargo commands, a missing/unreadable lock and a child `--target`.
+
+When the configured store is read-only, imported units go to `<remote.cache>/<endpoint+key-id>/store` and restore layers the main store first, then that cache store. The cache store is an ordinary signed vault: it is the seam for a host-populated **read-only** cache in the later multi-VM topology. A shared writable cache is out of scope. The hidden `store fetch [--dry-run] [--unit Q] [--all]` command verifies and imports without running a build; `--all` is required when no lock is available.
 
 ### CI Publisher (P3.4)
 
@@ -613,6 +617,7 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter store harvest [--unit <Q>] [--no-compress] [--dry-run] [--trusted]` | Save compiled units from the shared build dir into the durable vault (`--trusted` accepts a shared/network build dir) |
 | `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault |
 | `epicenter store restore --no-remote ...` | Skip remote compatible-unit fetch while restoring |
+| `epicenter store fetch [--dry-run] [--unit <Q>] [--all]` (hidden) | Verify/import compatible remote units without running a build |
 | `epicenter store publish ...` (hidden) | CI-only: sign one store generation into a local staging tree and print the upload plan |
 | `epicenter store vault` | List vault generations, sizes, and active status |
 | `epicenter store verify` | Verify vault file sizes, timestamps, hashes, and list active `work/` dirs |

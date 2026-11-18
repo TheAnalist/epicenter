@@ -230,6 +230,16 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
 
     let store_root = crate::vault::store_root(build_root);
     crate::util::probe(&store_root, "store")?;
+
+    if opts.delete && opts.tier.touches_store() && !crate::vault::store_accepts_imports(&store_root)
+    {
+        bail!(
+            "store {} is read-only or not writable — cannot evict the store tier; \
+             run with `--tier view` to clean views, or omit `--yes` for a dry run",
+            store_root.display()
+        );
+    }
+
     let active = crate::vault::parity_key().ok();
     let age_limit = opts
         .older_than
@@ -1377,6 +1387,13 @@ fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Resu
     if store_root.exists() {
         crate::vault::check_store_trust(&store_root)?;
     }
+    if opts.delete && !crate::vault::store_accepts_imports(&store_root) {
+        bail!(
+            "store {} is read-only or not writable — cannot delete generations; \
+             omit `--yes` for a dry run",
+            store_root.display()
+        );
+    }
     let generations = crate::vault::generations(&store_root)?;
     let chosen: Vec<&crate::vault::GenerationInfo> = generations
         .iter()
@@ -2374,6 +2391,42 @@ mod tests {
         let err = run(&build, &opts).unwrap_err();
         assert!(err.to_string().contains("protected"), "{err}");
         assert!(store.join(&parity).is_dir(), "nothing was deleted");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_evict_refuses_a_read_only_store() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::util::euid() == 0 {
+            return Ok(()); // root can write 0555; the mode test does not apply
+        }
+        let home = tier_home()?;
+        let build = home.path().join("build");
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o555))?;
+
+        let dry = Options {
+            generation: Some("anything"),
+            delete: false,
+            ..no_selectors()
+        };
+        let err = run(&build, &dry).unwrap_err();
+        assert!(
+            err.to_string().contains("no vault generation matches"),
+            "a dry run is allowed on a read-only store: {err}"
+        );
+
+        let opts = Options {
+            generation: Some("anything"),
+            delete: true,
+            ..no_selectors()
+        };
+        let err = run(&build, &opts).unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 

@@ -51,19 +51,35 @@ impl IndexStatus {
     }
 }
 
+/// Stable per-endpoint directory name shared by the replay state and cache.
+pub(crate) fn endpoint_id(remote: &RemotePolicy) -> Result<String> {
+    let url = remote.url.as_deref().context("remote has no endpoint")?;
+    let key_id = remote
+        .key_id
+        .as_deref()
+        .context("remote has no publisher key")?;
+    Ok(sha256_hex(format!("{url}\0{key_id}").as_bytes()))
+}
+
 /// `state_dir()/remote/<endpoint+key hash>.json`.
 pub fn state_path(remote: &RemotePolicy) -> Result<PathBuf> {
     state_file(&crate::paths::state_dir()?, remote)
 }
 
 fn state_file(root: &Path, remote: &RemotePolicy) -> Result<PathBuf> {
-    let url = remote.url.as_deref().context("remote has no endpoint")?;
-    let key_id = remote
-        .key_id
-        .as_deref()
-        .context("remote has no publisher key")?;
-    let name = sha256_hex(format!("{url}\0{key_id}").as_bytes());
-    Ok(root.join(super::STATE_DIR).join(format!("{name}.json")))
+    Ok(root
+        .join(super::STATE_DIR)
+        .join(format!("{}.json", endpoint_id(remote)?)))
+}
+
+/// Reject a rollback or same-sequence equivocation before downloading a body.
+pub(crate) fn check_pointer_at(
+    root: &Path,
+    remote: &RemotePolicy,
+    pointer: &IndexPointer,
+) -> Result<()> {
+    let existing = load_state_at(root, remote)?;
+    check_replay(existing.as_ref(), pointer)
 }
 
 /// Load and validate the last accepted state, if one exists.

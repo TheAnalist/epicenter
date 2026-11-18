@@ -42,7 +42,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::settings::LinkPolicy;
-use crate::util::{self, FileLock, metadata_nofollow, now_secs};
+use crate::util::{self, FileLock, metadata_nofollow, now_secs, owned_by_us};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -346,6 +346,12 @@ pub fn sweep_store_debris(store_root: &Path) {
 /// lock file. Returns `false` when a live harvest holds the generation lock.
 pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
     util::validate_component(parity, "generation")?;
+    if store_is_read_only(store_root) {
+        anyhow::bail!(
+            "store {} is read-only — cannot remove a generation",
+            store_root.display()
+        );
+    }
     if store_root.exists() {
         check_store_trust(store_root)?;
     }
@@ -422,6 +428,12 @@ fn ensure_store_root(store_root: &Path) -> Result<()> {
             if !meta.is_dir() {
                 anyhow::bail!(
                     "store root {} is not a real directory",
+                    store_root.display()
+                );
+            }
+            if store_is_read_only(store_root) {
+                anyhow::bail!(
+                    "store {} is read-only — harvest/import needs a writable store",
                     store_root.display()
                 );
             }
@@ -1297,6 +1309,12 @@ pub fn stored_unit_rustc(unit: &StoredUnit) -> Option<String> {
 /// groups were dropped; groups that could not be removed stay recorded.
 pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Result<usize> {
     util::validate_component(generation, "generation")?;
+    if store_is_read_only(store_root) {
+        anyhow::bail!(
+            "store {} is read-only — this operation needs a writable store",
+            store_root.display()
+        );
+    }
     if store_root.exists() {
         check_store_trust(store_root)?;
     }
@@ -1439,6 +1457,443 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
             let _ = util::remove_empty_dir(store_root, path);
         }
     }
+}
+
+// ── remote import ───────────────────────────────────────────────────────────
+
+/// Where a remote file's verified bytes live locally.
+pub enum ImportSource {
+    /// Already decoded bytes (the cache blob for a `none` compression).
+    Raw(PathBuf),
+    /// Stored gzip bytes; the decoded size/hash are in the index.
+    Gzip(PathBuf),
+}
+
+/// One verified file to install into a vault generation.
+pub struct ImportFile {
+    pub path: String,
+    pub dest: String,
+    pub size: u64,
+    pub sha256: String,
+    pub role: String,
+    pub source: ImportSource,
+}
+
+/// One verified unit group to install into a vault generation.
+pub struct ImportUnit {
+    pub name: String,
+    pub profile: String,
+    pub memo: String,
+    pub hash: String,
+    pub version: Option<String>,
+    pub stamp: u64,
+    pub layout: fingerprint::UnitLayout,
+    pub files: Vec<ImportFile>,
+}
+
+/// What one import did.
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    pub stored: usize,
+    pub skipped: usize,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Install verified remote units into one generation.
+///
+/// The caller has already verified the signed index and every file hash. This
+/// writer is the only step that touches the local vault: it stages complete
+/// unit groups under hidden names, stamps raw files to the unit stamp, keeps
+/// the store read-only, preserves gzip objects under the local decoded-hash
+/// path, merges the manifest once and re-signs it with the local key.
+///
+/// An existing identical unit is skipped. A conflicting local unit or a
+/// destination already owned by another unit keeps the local copy and is
+/// reported as skipped; import never overwrites a local unit.
+pub fn import_units(
+    store_root: &Path,
+    generation: &str,
+    toolchain: &str,
+    units: &[ImportUnit],
+) -> Result<ImportReport> {
+    util::validate_component(generation, "generation")?;
+    if units.is_empty() {
+        return Ok(ImportReport::default());
+    }
+    ensure_store_root(store_root)?;
+    let generation_root = store_root.join(generation);
+    util::create_private_dir_all(&generation_root)?;
+    write_marker(&generation_root.join(GENERATION_MARKER))?;
+    let units_root = units_dir(store_root, generation);
+    util::create_private_dir_all(&units_root)?;
+    let _lock = lock_generation(store_root, generation)?;
+    sweep_staging(&units_root)?;
+
+    let loaded = load_manifest(store_root, generation)?;
+    let had_manifest = loaded.is_some();
+    let mut manifest = loaded.unwrap_or_else(|| Manifest {
+        parity_key: generation.to_string(),
+        toolchain: toolchain.to_string(),
+        created: now_secs(),
+        updated: 0,
+        units: Vec::new(),
+        mac: String::new(),
+        signature: String::new(),
+    });
+    if manifest.toolchain.is_empty() {
+        manifest.toolchain = toolchain.to_string();
+    }
+
+    let mut index: std::collections::HashMap<String, usize> = manifest
+        .units
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| (entry.name.clone(), at))
+        .collect();
+    let mut owners: std::collections::HashMap<String, String> = manifest
+        .units
+        .iter()
+        .flat_map(|entry| {
+            entry.files.iter().map(move |file| {
+                (
+                    import_dest_key(&entry.profile, &file.dest),
+                    entry.name.clone(),
+                )
+            })
+        })
+        .collect();
+    let mut report = ImportReport::default();
+    let mut renamed: Vec<PathBuf> = Vec::new();
+
+    let result = (|| -> Result<()> {
+        for unit in units {
+            let entry = import_entry(unit)?;
+
+            if let Some(&slot) = index.get(&unit.name) {
+                if same_import_unit(&manifest.units[slot], &entry) {
+                    report.skipped += 1;
+                } else {
+                    eprintln!(
+                        "import: keeping local unit {} (remote copy differs)",
+                        unit.name
+                    );
+                    report.skipped += 1;
+                }
+                continue;
+            }
+            if entry.files.iter().any(|file| {
+                owners
+                    .get(&import_dest_key(&entry.profile, &file.dest))
+                    .is_some_and(|owner| owner != &entry.name)
+            }) {
+                eprintln!(
+                    "import: skipping unit {} (destination already owned by another unit)",
+                    unit.name
+                );
+                report.skipped += 1;
+                continue;
+            }
+
+            let stage = units_root.join(format!(
+                ".{}.import.tmp-{}-{}",
+                unit.name,
+                std::process::id(),
+                util::temp_nonce()
+            ));
+            util::create_private_dir_all(&stage)?;
+            let staged = (|| -> Result<()> {
+                for file in &unit.files {
+                    let rel = util::validate_rel(&file.path, "import file path")?;
+                    let dst = stage.join(&rel);
+                    if let Some(parent) = dst.parent() {
+                        util::create_private_dir_all(parent)?;
+                    }
+                    match &file.source {
+                        ImportSource::Raw(src) => {
+                            install_import_raw(&dst, src, file.size, &file.sha256, unit.stamp)?;
+                        }
+                        ImportSource::Gzip(src) => {
+                            let object = install_import_blob(
+                                &generation_root,
+                                &file.sha256,
+                                file.size,
+                                src,
+                            )?;
+                            let src_object = generation_root.join(&object);
+                            match fs::hard_link(&src_object, &dst) {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    fs::copy(&src_object, &dst).with_context(|| {
+                                        format!(
+                                            "linking {} -> {}",
+                                            src_object.display(),
+                                            dst.display()
+                                        )
+                                    })?;
+                                    make_read_only(&dst)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(err) = staged {
+                let _ = util::remove_tree(store_root, &stage);
+                return Err(err).with_context(|| format!("importing unit {}", unit.name));
+            }
+
+            let final_dir = units_root.join(&unit.name);
+            match metadata_nofollow(&final_dir) {
+                Ok(meta) if meta.is_dir() => util::remove_tree(store_root, &final_dir)?,
+                Ok(_) => anyhow::bail!(
+                    "import target {} is not a real directory",
+                    final_dir.display()
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("inspecting {}", final_dir.display()));
+                }
+            }
+            fs::rename(&stage, &final_dir)
+                .with_context(|| format!("installing imported unit {}", final_dir.display()))?;
+            renamed.push(final_dir);
+
+            for file in &entry.files {
+                owners.insert(
+                    import_dest_key(&entry.profile, &file.dest),
+                    entry.name.clone(),
+                );
+            }
+            report.files += entry.files.len();
+            report.bytes = report
+                .bytes
+                .saturating_add(entry.files.iter().map(|file| file.size).sum::<u64>());
+            report.stored += 1;
+            index.insert(entry.name.clone(), manifest.units.len());
+            manifest.units.push(entry);
+        }
+
+        if report.stored > 0 {
+            manifest.units.sort_by(|a, b| {
+                (a.profile.as_str(), a.name.as_str()).cmp(&(b.profile.as_str(), b.name.as_str()))
+            });
+            manifest.updated = now_secs();
+            save_manifest(store_root, generation, &manifest)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        for dir in renamed.iter().rev() {
+            let _ = util::remove_tree(store_root, dir);
+        }
+        if !had_manifest {
+            drop(_lock);
+            let _ = util::remove_tree(store_root, &generation_root);
+            remove_generation_lock(store_root, generation);
+        }
+        return Err(err);
+    }
+    if !had_manifest && report.stored == 0 {
+        drop(_lock);
+        let _ = util::remove_tree(store_root, &generation_root);
+        remove_generation_lock(store_root, generation);
+    }
+    Ok(report)
+}
+
+/// Units that are not in the target generation yet. A same-name entry counts
+/// as present even when its content differs: import keeps the local copy, so
+/// there is nothing to fetch for it.
+pub fn missing_import_units(
+    store_root: &Path,
+    generation: &str,
+    units: &[ImportUnit],
+) -> Result<Vec<usize>> {
+    if units.is_empty() || !store_root.exists() {
+        return Ok((0..units.len()).collect());
+    }
+    let Some(manifest) = load_manifest(store_root, generation)? else {
+        return Ok((0..units.len()).collect());
+    };
+    let present: std::collections::HashSet<&str> = manifest
+        .units
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    Ok(units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| !present.contains(unit.name.as_str()))
+        .map(|(at, _)| at)
+        .collect())
+}
+
+fn import_entry(unit: &ImportUnit) -> Result<UnitEntry> {
+    let mut entry = UnitEntry {
+        name: unit.name.clone(),
+        profile: unit.profile.clone(),
+        memo: unit.memo.clone(),
+        hash: unit.hash.clone(),
+        version: unit.version.clone(),
+        stamp: unit.stamp,
+        layout: Some(unit.layout),
+        files: Vec::with_capacity(unit.files.len()),
+    };
+    for file in &unit.files {
+        anyhow::ensure!(
+            file.sha256.len() == 64 && file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "import file {} has an invalid SHA-256",
+            file.path
+        );
+        entry.files.push(FileEntry {
+            path: file.path.clone(),
+            dest: file.dest.clone(),
+            size: file.size,
+            sha256: file.sha256.clone(),
+            role: file.role.clone(),
+            object: match file.source {
+                ImportSource::Gzip(_) => {
+                    Some(format!("blobs/{}/{}.gz", &file.sha256[..2], file.sha256))
+                }
+                ImportSource::Raw(_) => None,
+            },
+        });
+    }
+    entry.validate()?;
+    Ok(entry)
+}
+
+fn import_dest_key(profile: &str, dest: &str) -> String {
+    format!(
+        "{}/{}",
+        profile.to_ascii_lowercase(),
+        dest.to_ascii_lowercase()
+    )
+}
+
+fn same_import_unit(left: &UnitEntry, right: &UnitEntry) -> bool {
+    if left.hash != right.hash
+        || left.profile != right.profile
+        || left.memo != right.memo
+        || left.stamp != right.stamp
+    {
+        return false;
+    }
+    let files = |entry: &UnitEntry| {
+        let mut files: Vec<_> = entry
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    file.dest.clone(),
+                    file.size,
+                    file.sha256.clone(),
+                    file.role.clone(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    files(left) == files(right)
+}
+
+fn install_import_raw(dst: &Path, src: &Path, size: u64, sha256: &str, stamp: u64) -> Result<()> {
+    let parent = dst.parent().context("import destination has no parent")?;
+    let mut input = util::open_regular(src, false)
+        .with_context(|| format!("opening imported file {}", src.display()))?;
+    let (tmp, mut output) = util::create_temp(parent, "import", "", 0o600)?;
+    let result = (|| -> Result<()> {
+        util::copy_verified(&mut input, &mut output, size, sha256, src)?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    drop(output);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    fs::rename(&tmp, dst).with_context(|| format!("installing {}", dst.display()))?;
+    set_stamp(dst, stamp)?;
+    make_read_only(dst)?;
+    Ok(())
+}
+
+fn install_import_blob(
+    generation_root: &Path,
+    sha256: &str,
+    size: u64,
+    src: &Path,
+) -> Result<String> {
+    let object = format!("blobs/{}/{}.gz", &sha256[..2], sha256);
+    let final_path = generation_root.join(&object);
+    if metadata_nofollow(&final_path).is_ok() {
+        verify_import_blob(&final_path, size, sha256)?;
+        return Ok(object);
+    }
+    let parent = final_path
+        .parent()
+        .context("import blob path has no parent")?;
+    util::create_private_dir_all(parent)?;
+    let mut input = util::open_regular(src, false)
+        .with_context(|| format!("opening imported blob {}", src.display()))?;
+    let (tmp, mut output) = util::create_temp(parent, "import-blob", ".gz", 0o600)?;
+    let result = (|| -> Result<()> {
+        util::copy_capped(&mut input, &mut output, util::MAX_FILE_BYTES, src)?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    drop(output);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = verify_import_blob(&tmp, size, sha256) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    match fs::hard_link(&tmp, &final_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp);
+            verify_import_blob(&final_path, size, sha256)?;
+        }
+        Err(_) => {
+            if final_path.exists() {
+                let _ = fs::remove_file(&tmp);
+                verify_import_blob(&final_path, size, sha256)?;
+            } else {
+                fs::rename(&tmp, &final_path).with_context(|| {
+                    format!("installing imported blob {}", final_path.display())
+                })?;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file = util::open_regular(&final_path, false)?;
+        file.set_permissions(fs::Permissions::from_mode(0o444))?;
+    }
+    Ok(object)
+}
+
+fn verify_import_blob(path: &Path, size: u64, sha256: &str) -> Result<()> {
+    let (found_size, found_hash) = util::decompress_file_hashed(path, true, size)?;
+    anyhow::ensure!(
+        found_size == size && found_hash == sha256,
+        "imported blob {} does not match its signed size/SHA-256",
+        path.display()
+    );
+    Ok(())
 }
 
 // ── harvest ─────────────────────────────────────────────────────────────────
@@ -2453,6 +2908,23 @@ pub struct RestoreReport {
     pub note: Option<String>,
 }
 
+impl RestoreReport {
+    /// Merge an overlay store's restore into the primary report. Files the
+    /// primary store already installed are not counted as "existing" twice.
+    pub fn merge_secondary(&mut self, other: RestoreReport) {
+        self.units_linked += other.units_linked;
+        self.files_linked += other.files_linked;
+        self.files_copied += other.files_copied;
+        self.files_missing += other.files_missing;
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.errors += other.errors;
+        self.fatal_errors += other.fatal_errors;
+        if self.note.is_none() {
+            self.note = other.note;
+        }
+    }
+}
+
 enum RestoreOutcome {
     Existing,
     Missing,
@@ -2775,6 +3247,7 @@ fn is_linkable_artifact(path: &str, policy: LinkPolicy) -> bool {
 struct LinkPlan {
     policy: LinkPolicy,
     read_only: bool,
+    mount_read_only: bool,
     shared_mount: bool,
     private_store: bool,
 }
@@ -2786,7 +3259,9 @@ impl LinkPlan {
             LinkPolicy::Copy => false,
             LinkPolicy::Link => true,
             LinkPolicy::Auto => {
-                self.read_only || foreign_immutable || (self.private_store && !self.shared_mount)
+                self.mount_read_only
+                    || foreign_immutable
+                    || (self.private_store && !self.shared_mount)
             }
         }
     }
@@ -2806,7 +3281,7 @@ impl LinkPlan {
                     true
                 }
             }
-            LinkPolicy::Auto => self.read_only || (self.private_store && !self.shared_mount),
+            LinkPolicy::Auto => self.mount_read_only || (self.private_store && !self.shared_mount),
         }
     }
 
@@ -2816,35 +3291,102 @@ impl LinkPlan {
             LinkPolicy::Copy => false,
             // An immutable mount is safe to link even when it is foreign.
             LinkPolicy::Link => self.read_only || self.private_store,
-            LinkPolicy::Auto => self.read_only || (self.private_store && !self.shared_mount),
+            LinkPolicy::Auto => self.mount_read_only || (self.private_store && !self.shared_mount),
         }
     }
 }
 
-/// A store on a read-only mount cannot be mutated through a view link, so
-/// sharing its inodes is safe even across principals. A writable mount is
-/// copied from: the owner could chmod a 0444 inode and rewrite it through the
-/// view. Windows checks directory write access with FILE_FLAG_BACKUP_SEMANTICS
-/// because it has no `statvfs`; a denied open is a read-only reader mount.
-fn store_is_read_only(store_root: &Path) -> bool {
+#[cfg(unix)]
+fn parent_is_private(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(meta) = metadata_nofollow(parent) else {
+        return false;
+    };
+
+    if !meta.is_dir() {
+        return false;
+    }
+
+    meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StoreAccess {
+    /// Kernel/OS-enforced: the mount is read-only, or Windows denied a
+    /// write-open. Strong enough to share inodes (hard links).
+    mount_read_only: bool,
+    /// Reader mode: treat the store as read-only for epicenter's own behavior.
+    /// True for an OS-enforced read-only store, or a directory on a writable
+    /// mount that denies writes (0555/ACL). This does not make the inodes
+    /// immutable; hard-link decisions must use `mount_read_only`.
+    read_only: bool,
+}
+
+fn store_access(store_root: &Path) -> StoreAccess {
+    let mut access = StoreAccess {
+        mount_read_only: false,
+        read_only: false,
+    };
     #[cfg(unix)]
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        let Ok(path) = CString::new(store_root.as_os_str().as_bytes()) else {
-            return false;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::FromRawFd;
+        let Ok(cpath) = CString::new(store_root.as_os_str().as_bytes()) else {
+            return access;
         };
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
-            return false;
+
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return access;
         }
-        // `statvfs` reports the mount flags with different constant names on
-        // Linux/BSD (`ST_RDONLY`) and Apple (`MNT_RDONLY`).
-        #[cfg(target_os = "macos")]
-        const READ_ONLY: libc::c_ulong = libc::MNT_RDONLY;
-        #[cfg(not(target_os = "macos"))]
-        const READ_ONLY: libc::c_ulong = libc::ST_RDONLY;
-        stat.f_flag & READ_ONLY != 0
+        let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        let Ok(meta) = dir.metadata() else {
+            return access;
+        };
+        if !meta.is_dir() {
+            return access;
+        }
+
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // in case of mount path
+        if unsafe { libc::fstatvfs(fd, &mut stat) } == 0 {
+            #[cfg(target_os = "macos")]
+            const RO: libc::c_ulong = libc::MNT_RDONLY;
+            #[cfg(not(target_os = "macos"))]
+            const RO: libc::c_ulong = libc::ST_RDONLY;
+            if stat.f_flag & RO != 0 {
+                access.read_only = true;
+                access.mount_read_only = true;
+                return access;
+            }
+        }
+
+        // Root can always write; 0555 is not read-only for root.
+        // Or no write bits for owner/group/other.
+        if util::euid() == 0 || meta.mode() & 0o222 != 0 {
+            return access;
+        }
+
+        // ACL/capability-aware write check for this process
+        if !unsafe { libc::access(cpath.as_ptr(), libc::W_OK) != 0 } {
+            return access;
+        }
+        // The parent must not let another principal rename/replace the root.
+        if !parent_is_private(store_root) {
+            return access;
+        }
+        access.read_only = true;
+        access
     }
     #[cfg(windows)]
     {
@@ -2860,17 +3402,30 @@ fn store_is_read_only(store_root: &Path) -> bool {
         {
             Ok(file) => {
                 drop(file);
-                false
+                access
             }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => true,
-            Err(_) => false,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                access.read_only = true;
+                access.mount_read_only = true;
+                access
+            }
+            Err(_) => access,
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = store_root;
-        false
+        access
     }
+}
+
+/// A store on a read-only mount cannot be mutated through a view link, so
+/// sharing its inodes is safe even across principals. A writable mount is
+/// copied from: the owner could chmod a 0444 inode and rewrite it through the
+/// view. Windows checks directory write access with FILE_FLAG_BACKUP_SEMANTICS
+/// because it has no `statvfs`; a denied open is a read-only reader mount.
+fn store_is_read_only(store_root: &Path) -> bool {
+    store_access(store_root).read_only
 }
 
 /// An owner-only, real local directory. `auto` treats this as one trust
@@ -3108,12 +3663,14 @@ pub fn restore_with(
     // Verify store ownership/mode before parsing its manifest. A fresh store
     // is allowed to be absent (cold start); a present-but-unsafe one is not.
     // Already checked its not a symlink in main (cmd_restore)
+    let access = store_access(store_root);
     if store_root.exists() {
         check_store_trust(store_root)?;
     }
     let link_plan = LinkPlan {
         policy: link,
-        read_only: store_is_read_only(store_root),
+        mount_read_only: access.mount_read_only,
+        read_only: access.read_only,
         shared_mount: store_is_shared_mount(store_root),
         private_store: store_is_private(store_root),
     };
@@ -3552,6 +4109,37 @@ fn validate_build_root(build_root: &Path) -> Result<PathBuf> {
     Ok(build_root)
 }
 
+/// Whether a writer may install units here. This is a preflight, not a
+/// guarantee: a read-only mount, a 0555 directory, or a foreign-owned store
+/// returns false before any unit is staged. A missing store returns true
+/// because it can be created. A writable store is probed with a temporary
+/// file; the caller must still trust-check it before importing.
+pub fn store_accepts_imports(store_root: &Path) -> bool {
+    match util::probe(store_root, "store") {
+        // A missing store is writable by definition: the writer creates it.
+        Ok(None) => true,
+        Ok(Some(meta)) => {
+            if !meta.is_dir() || !owned_by_us(store_root, &meta) || store_is_read_only(store_root) {
+                return false;
+            }
+            let probe = store_root.join(format!(".import-probe-{}", util::temp_nonce()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(file) => {
+                    drop(file);
+                    let _ = fs::remove_file(&probe);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 /// Read-side trust check for an existing store.
 ///
 /// A writable store must be a real directory owned by the reader, with a
@@ -3566,21 +4154,21 @@ pub(crate) fn check_store_trust(store_root: &Path) -> Result<()> {
     if !meta.is_dir() {
         anyhow::bail!("store {} is not a real directory", store_root.display());
     }
-    let read_only = store_is_read_only(store_root);
+    let mount_read_only = store_access(store_root).mount_read_only;
     // A reader may accept a foreign, read-only mount: the OS denies writes,
     // and the manifest signature is verified separately. A writable foreign
     // store is never a reader; it is one trust domain with its writer.
-    if !read_only {
+    if !mount_read_only {
         util::ensure_windows_user_path(store_root, "store")?;
     }
-    if !util::owned_by_us(store_root, &meta) && !read_only {
+    if !util::owned_by_us(store_root, &meta) && !mount_read_only {
         anyhow::bail!(
             "store {} is owned by another user — refusing to execute its artifacts",
             store_root.display()
         );
     }
     #[cfg(windows)]
-    if !read_only {
+    if !mount_read_only {
         require_private_windows_acl(store_root, "store")?;
     }
     // Read paths must not chmod an operator-selected directory. A store that
@@ -4195,6 +4783,12 @@ pub fn compact(
         dry_run,
         ..Default::default()
     };
+    if !dry_run && store_is_read_only(store_root) {
+        anyhow::bail!(
+            "store {} is read-only — compact needs a writable store",
+            store_root.display()
+        );
+    }
     let mut generations = generation_names(store_root)?;
     if let Some(query) = generation {
         generations.retain(|name| name.contains(query));
@@ -4986,6 +5580,40 @@ mod tests {
         assert_eq!(report.groups, 0);
         assert_eq!(report.linked, 0);
         assert!(report.already_shared >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_import_leaves_no_partial_unit() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let source = tempfile::tempdir()?;
+        let file = source.path().join("lib-demo");
+        fs::write(&file, b"wrong")?;
+        let units = vec![ImportUnit {
+            name: "demo-0011223344556677".into(),
+            profile: "debug".into(),
+            memo: "lib-demo".into(),
+            hash: "aabbccddeeff0011".into(),
+            version: None,
+            stamp: now_secs(),
+            layout: fingerprint::UnitLayout::Classic,
+            files: vec![ImportFile {
+                path: "lib-demo".into(),
+                dest: ".fingerprint/demo-0011223344556677/lib-demo".into(),
+                size: 5,
+                sha256: crate::vault::hex_encode(&Sha256::digest(b"right")),
+                role: "memo".into(),
+                source: ImportSource::Raw(file),
+            }],
+        }];
+        assert!(import_units(store.path(), "generation", "test", &units).is_err());
+        assert!(stored_units(store.path())?.is_empty());
+        assert!(
+            !store
+                .path()
+                .join("generation/units/demo-0011223344556677")
+                .exists()
+        );
         Ok(())
     }
 
@@ -6836,6 +7464,56 @@ mod tests {
         let packages = crate::lockfile::LockIndex::parse(&lock).expect("lock parses");
         let report = restore(view.path(), store.path(), None, Some(&packages), false)?;
         assert!(report.units_linked > 0, "the matching version is seeded");
+        Ok(())
+    }
+
+    #[test]
+    fn store_accepts_imports_allows_a_missing_store_and_rejects_read_only() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let missing = home.path().join("missing-store");
+        assert!(!missing.exists());
+        assert!(store_accepts_imports(&missing));
+        assert!(!missing.exists(), "the preflight creates nothing");
+
+        let writable = tempfile::tempdir()?;
+        assert!(store_accepts_imports(writable.path()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if util::euid() != 0 {
+                let read_only = home.path().join("read-only-store");
+                fs::create_dir(&read_only)?;
+                fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555))?;
+                assert!(!store_accepts_imports(&read_only));
+                fs::set_permissions(&read_only, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_directory_refuses_store_writers() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if util::euid() == 0 {
+            return Ok(()); // root can write 0555; the mode test does not apply
+        }
+        let home = tempfile::tempdir()?;
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o555))?;
+
+        let err = drop_units(&store, "generation", &["unit".into()]).unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+        let err = drop_generation(&store, "generation").unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+        let err = compact(&store, None, false).unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+        // A dry run is a read-only audit and stays available.
+        assert!(compact(&store, None, true).is_ok());
+
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 }

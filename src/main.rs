@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use epicenter_cli::util::metadata_nofollow;
 use epicenter_cli::{
-    config, doctor, exec, paths, profile, prune, remote, settings, status, util, vault,
+    config, doctor, exec, lockfile, paths, profile, prune, remote, settings, status, util, vault,
 };
 
 #[derive(Parser)]
@@ -256,6 +256,19 @@ struct CompactArgs {
     /// Show what would be linked without changing the store.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(clap::Args)]
+struct FetchArgs {
+    /// Verify the pointer/body and report candidates without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Only consider units whose name contains this string.
+    #[arg(long)]
+    unit: Option<String>,
+    /// Import every compatible unit when no Cargo.lock is available.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(clap::Args)]
@@ -514,6 +527,9 @@ enum StoreCommand {
     Overlap(OverlapArgs),
     /// Hard-link identical files and blobs in the vault.
     Compact(CompactArgs),
+    /// Verify and import compatible remote units without running a build.
+    #[command(hide = true)]
+    Fetch(FetchArgs),
     /// CI-only: sign a local index and stage the immutable object tree.
     #[command(hide = true)]
     Publish(PublishArgs),
@@ -569,15 +585,14 @@ fn run() -> Result<()> {
             args.trusted,
         ),
         Command::Restore(args) => {
-            if !args.no_remote {
-                let _ = settings.remote()?;
-            }
+            let remote = configured_remote(&settings, args.no_remote);
             cmd_restore(
                 link,
                 args.into.as_deref(),
                 args.unit.as_deref(),
                 args.no_remote,
                 args.dry_run,
+                remote.as_ref(),
             )
         }
         Command::Vault => cmd_vault(),
@@ -624,19 +639,19 @@ fn cmd_store(command: StoreCommand, settings: &settings::Settings) -> Result<()>
             args.trusted,
         ),
         StoreCommand::Restore(args) => {
-            if !args.no_remote {
-                let _ = settings.remote()?;
-            }
+            let remote = configured_remote(settings, args.no_remote);
             cmd_restore(
                 link,
                 args.into.as_deref(),
                 args.unit.as_deref(),
                 args.no_remote,
                 args.dry_run,
+                remote.as_ref(),
             )
         }
         StoreCommand::Overlap(args) => cmd_overlap(&args),
         StoreCommand::Compact(args) => cmd_compact(&args),
+        StoreCommand::Fetch(args) => cmd_fetch(&args, settings),
         StoreCommand::Publish(args) => cmd_publish(&args, settings),
     }
 }
@@ -1761,6 +1776,83 @@ fn cmd_compact(args: &CompactArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_fetch(args: &FetchArgs, settings: &settings::Settings) -> Result<()> {
+    let policy = settings.remote()?;
+    anyhow::ensure!(
+        policy.enabled,
+        "no remote endpoint configured; set `[remote] url` and `publisher_key`"
+    );
+    let root = config::cache_root()?;
+    let store = vault::store_root(&root);
+    let cwd = std::env::current_dir()?;
+    let packages = lockfile::LockIndex::load(&cwd, None);
+    anyhow::ensure!(
+        packages.is_some() || args.all,
+        "no readable Cargo.lock; rerun with --all to import every compatible unit"
+    );
+    println!(
+        "{}",
+        util::heading("epicenter store fetch — verified remote units")
+    );
+    let source = remote::source_for(&policy)?;
+    let report = remote::fetch_and_import(&remote::FetchRequest {
+        remote: &policy,
+        source: source.as_ref(),
+        store_root: &store,
+        state_root: None,
+        packages: packages.as_ref(),
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: args.unit.as_deref(),
+        local: None,
+        generation: None,
+        now: util::now_secs(),
+        dry_run: args.dry_run,
+    })?;
+    println!(
+        "  {} sequence {} · {} · tier {}",
+        label("index"),
+        report.sequence,
+        report.key_id,
+        report.tier
+    );
+    if let Some(warning) = &report.warning {
+        println!("  {} {}", util::warn(util::GLYPH_WARN), warning);
+    }
+    if let Some(reason) = &report.fallback {
+        anyhow::bail!("remote fetch failed: {reason}");
+    }
+    println!(
+        "  {} {} unit(s) · {} file(s) · {}",
+        label(if args.dry_run { "found" } else { "imported" }),
+        if args.dry_run {
+            report.candidates
+        } else {
+            report.imported
+        },
+        report.files,
+        util::green(&util::human_bytes(report.bytes))
+    );
+    if report.skipped > 0 {
+        println!("  {} {} unit(s)", label("skipped"), report.skipped);
+    }
+    if let Some(cache_store) = &report.cache_store {
+        println!(
+            "  {} {} (main store is read-only)",
+            label("cache"),
+            cache_store.display()
+        );
+    }
+    if args.dry_run {
+        println!(
+            "  {}",
+            util::dim("dry run — pointer/body verified, nothing written")
+        );
+    }
+    Ok(())
+}
+
 /// `epicenter doctor` printing: group checks under their section header,
 /// icons colored by severity.
 fn cmd_doctor(args: &DoctorArgs, settings: &settings::Settings) -> Result<()> {
@@ -1848,9 +1940,20 @@ fn cmd_exec(
     rm: bool,
     command: &[String],
 ) -> Result<()> {
-    if !no_remote {
-        let _ = settings.remote()?;
-    }
+    let remote = if no_remote {
+        None
+    } else {
+        match settings.remote() {
+            Ok(policy) => Some(policy),
+            Err(err) => {
+                eprintln!(
+                    "  {} remote policy ignored: {err:#}",
+                    util::warn(util::GLYPH_WARN)
+                );
+                None
+            }
+        }
+    };
     let root = config::cache_root()?;
     let cargo_home = match settings.cargo_home()? {
         (path, settings::Source::Global) => Some(path),
@@ -1890,6 +1993,7 @@ fn cmd_exec(
         link: settings.link()?.0,
         cargo_home: cargo_home.as_deref(),
         no_remote,
+        remote: remote.as_ref(),
         command,
     };
     let code = exec::run(&vault::store_root(&root), &work_root, &opts)?;
@@ -1985,12 +2089,60 @@ fn cmd_harvest(unit: Option<&str>, dry_run: bool, no_compress: bool, trusted: bo
     Ok(())
 }
 
+fn configured_remote(
+    settings: &settings::Settings,
+    no_remote: bool,
+) -> Option<settings::RemotePolicy> {
+    if no_remote {
+        return None;
+    }
+    match settings.remote() {
+        Ok(policy) => Some(policy),
+        Err(err) => {
+            eprintln!(
+                "  {} remote policy ignored: {err:#}",
+                util::warn(util::GLYPH_WARN)
+            );
+            None
+        }
+    }
+}
+
+fn print_remote_summary(report: &remote::FetchReport) {
+    if report.disabled {
+        return;
+    }
+    if let Some(warning) = &report.warning {
+        println!("  {} {}", util::warn(util::GLYPH_WARN), warning);
+    }
+    if let Some(reason) = &report.fallback {
+        println!(
+            "  {} skipped: {reason}",
+            util::dim(&format!("{:<13}", "remote"))
+        );
+        return;
+    }
+    println!(
+        "  {} {} unit(s) · {} file(s) · {}{}",
+        label("remote"),
+        report.imported,
+        report.files,
+        util::green(&util::human_bytes(report.bytes)),
+        if report.cache_store.is_some() {
+            util::dim("  (cache store)")
+        } else {
+            String::new()
+        }
+    );
+}
+
 fn cmd_restore(
     link: settings::LinkPolicy,
     into: Option<&std::path::Path>,
     unit: Option<&str>,
     no_remote: bool,
     dry_run: bool,
+    remote: Option<&settings::RemotePolicy>,
 ) -> Result<()> {
     if no_remote {
         println!(
@@ -2024,7 +2176,62 @@ fn cmd_restore(
     let store = vault::store_root(&config::cache_root()?);
     // ensure store is not a symlink/reparse point
     metadata_nofollow(&store)?;
-    let report = vault::restore_policy(&view, &store, unit, dry_run, link)?;
+    let packages = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| lockfile::LockIndex::load(&cwd, None));
+    let mut remote_fetch: Option<remote::FetchReport> = None;
+    if dry_run {
+        if remote.is_some_and(|policy| policy.enabled) {
+            println!(
+                "  {} skipped in --dry-run (nothing is fetched)",
+                util::dim(&format!("{:<13}", "remote"))
+            );
+        }
+    } else if let Some(policy) = remote.filter(|policy| policy.enabled) {
+        match remote::source_for(policy) {
+            Ok(source) => {
+                let request = remote::FetchRequest {
+                    remote: policy,
+                    source: source.as_ref(),
+                    store_root: &store,
+                    state_root: None,
+                    packages: packages.as_ref(),
+                    selector: None,
+                    layout: None,
+                    profile: None,
+                    unit_filter: unit,
+                    local: None,
+                    generation: None,
+                    now: util::now_secs(),
+                    dry_run: false,
+                };
+                match remote::fetch_and_import(&request) {
+                    Ok(report) => {
+                        print_remote_summary(&report);
+                        remote_fetch = Some(report);
+                    }
+                    Err(err) => println!(
+                        "  {} skipped: {err:#}",
+                        util::dim(&format!("{:<13}", "remote"))
+                    ),
+                }
+            }
+            Err(err) => println!(
+                "  {} skipped: {err:#}",
+                util::dim(&format!("{:<13}", "remote"))
+            ),
+        }
+    }
+    let mut report = vault::restore_with(&view, &store, unit, None, None, None, dry_run, link)?;
+    if let Some(cache_store) = remote_fetch
+        .as_ref()
+        .and_then(|report| report.cache_store.as_deref())
+    {
+        let overlay =
+            vault::restore_with(&view, cache_store, unit, None, None, None, dry_run, link)?;
+        report.merge_secondary(overlay);
+        report.note = None;
+    }
     println!("  {} {}", label("parity"), report.parity);
     if let Some(note) = &report.note {
         println!("  {} {note}", util::info(util::GLYPH_INFO));
@@ -2582,6 +2789,30 @@ mod cli_tests {
                 assert!(args.json);
             }
             _ => panic!("expected store overlap"),
+        }
+    }
+
+    #[test]
+    fn fetch_accepts_dry_run_unit_and_all() {
+        let cli = Cli::try_parse_from([
+            "epicenter",
+            "store",
+            "fetch",
+            "--dry-run",
+            "--unit",
+            "serde",
+            "--all",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Store {
+                command: StoreCommand::Fetch(args),
+            } => {
+                assert!(args.dry_run);
+                assert_eq!(args.unit.as_deref(), Some("serde"));
+                assert!(args.all);
+            }
+            _ => panic!("expected store fetch"),
         }
     }
 }
