@@ -409,12 +409,26 @@ pub fn generation_unit_names(store_root: &Path, parity: &str) -> Result<Vec<Stri
 /// is writable by definition; an existing one must be trusted, owned, not
 /// read-only, and pass a real write probe.
 pub(crate) fn ensure_writable_store(store_root: &Path, operation: &str) -> Result<()> {
-    if store_root.exists() {
-        check_store_trust(store_root)?;
-    }
+    check_store_writable(store_root, operation)?;
     if !store_accepts_imports(store_root) {
         anyhow::bail!(
             "store {} is read-only or not writable — {operation} needs a writable store",
+            store_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// Trust and read-only refusal without touching the store. Use before a repair
+/// chmod: the create/delete probe must not run while the directory is still
+/// group/world-writable.
+fn check_store_writable(store_root: &Path, operation: &str) -> Result<()> {
+    if store_root.exists() {
+        check_store_trust(store_root)?;
+    }
+    if store_is_read_only(store_root) {
+        anyhow::bail!(
+            "store {} is read-only — {operation} needs a writable store",
             store_root.display()
         );
     }
@@ -432,8 +446,9 @@ fn ensure_store_root(store_root: &Path) -> Result<()> {
     util::ensure_windows_user_path(store_root, "store")?;
     match util::probe_dir(store_root, "store root")? {
         Some(_) => {
-            // Refuse a read-only store before Repair can chmod it.
-            ensure_writable_store(store_root, "harvest/import")?;
+            // Refuse a read-only store before Repair can chmod it. The write
+            // probe runs after the repair if a later write needs it.
+            check_store_writable(store_root, "harvest/import")?;
             util::check_private_dir(store_root, util::Privacy::Repair)?;
         }
         None => util::create_private_dir_all(store_root)?,
@@ -1416,15 +1431,21 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
     let blobs = store_root.join(generation).join("blobs");
     let generation_root = store_root.join(generation);
     let mut budget = util::ScanBudget::new("blob sweep");
-    let walker = util::SafeWalk::new(&blobs).bottom_up().walk();
-    for entry in walker {
+    // Collect top-down so `filter_entry` can prune a reparse subtree, then
+    // delete deepest-first (each directory after its children). A contents-first
+    // walk would traverse the subtree before filtering it: walkdir applies the
+    // predicate only after descending.
+    let mut entries = Vec::new();
+    for entry in util::SafeWalk::new(&blobs).walk() {
         if !budget.take() {
             break;
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
+        if let Ok(entry) = entry {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.depth()));
+    for entry in entries {
         let path = entry.path();
         if entry.file_type().is_file() {
             let rel = path
@@ -1843,10 +1864,10 @@ fn install_import_blob(
             if final_path.exists() {
                 let _ = fs::remove_file(&tmp);
                 verify_import_blob(&final_path, size, sha256)?;
-            } else {
-                fs::rename(&tmp, &final_path).with_context(|| {
-                    format!("installing imported blob {}", final_path.display())
-                })?;
+            } else if let Err(err) = fs::rename(&tmp, &final_path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(err)
+                    .with_context(|| format!("installing imported blob {}", final_path.display()));
             }
         }
     }
@@ -2012,17 +2033,7 @@ pub fn harvest_with_trust(
         util::create_private_dir_all(&root.join("blobs"))?;
     }
 
-    let workers = crate::settings::copy_workers();
-    let pool = if workers > 1 {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(workers)
-                .build()
-                .context("building the harvest copy pool")?,
-        )
-    } else {
-        None
-    };
+    let pool = (crate::settings::copy_workers() > 1).then(crate::settings::copy_pool);
 
     // Fence the writer against a live Cargo build. Acquire after the
     // toolchain probe: a forked/exec'd child must not inherit the lock fd.
@@ -2033,7 +2044,7 @@ pub fn harvest_with_trust(
             build_root.display()
         ),
     };
-    let mut rows = read_rows(&build_root, pool.as_ref())?;
+    let mut rows = read_rows(&build_root, pool)?;
 
     // A view that mixes both layouts is ambiguous: keep the layout of the
     // harvest toolchain (stable classic vs nightly new) and drop the other.
@@ -2198,12 +2209,11 @@ pub fn harvest_with_trust(
             .with_context(|| format!("storing unit {}", plan.unit.dir_name))?;
             Ok(entries)
         };
-        let stored: Vec<Result<Vec<FileEntry>>> = if pending.len() <= 1 || pool.is_none() {
-            pending.iter().map(|&at| store_one(at)).collect()
-        } else {
-            pool.as_ref()
-                .unwrap()
-                .install(|| pending.par_iter().map(|&at| store_one(at)).collect())
+        let stored: Vec<Result<Vec<FileEntry>>> = match pool {
+            Some(pool) if pending.len() > 1 => {
+                pool.install(|| pending.par_iter().map(|&at| store_one(at)).collect())
+            }
+            _ => pending.iter().map(|&at| store_one(at)).collect(),
         };
 
         for (at, entries) in pending.into_iter().zip(stored) {
@@ -2266,15 +2276,25 @@ struct UnitPlan {
     stamp: u64,
 }
 
-/// Read every unit's artifact list. The directory walk is sequential, but
-/// per-unit artifact discovery is independent and dominates the scan.
-fn read_rows(
+/// Read every unit's artifact list. One `deps/` index is built per profile
+/// and shared read-only with the per-unit scan, so artifact attach is a hash
+/// lookup instead of a directory rescan per unit.
+pub(crate) fn read_rows(
     build_root: &Path,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<Vec<(Unit, ArtifactInfo)>> {
     let units = fingerprint::read_units(build_root)?;
+    let mut deps: std::collections::HashMap<String, fingerprint::DepsIndex> =
+        std::collections::HashMap::new();
+    for unit in &units {
+        if !deps.contains_key(&unit.profile) {
+            let index = fingerprint::DepsIndex::load(&build_root.join(&unit.profile));
+            deps.insert(unit.profile.clone(), index);
+        }
+    }
     let scan = |unit: Unit| {
-        let arts = fingerprint::artifacts_for(build_root, &unit);
+        let index = &deps[&unit.profile];
+        let arts = fingerprint::artifacts_for_indexed(build_root, &unit, index);
         (unit, arts)
     };
     Ok(match pool {
@@ -2369,43 +2389,22 @@ fn plan_unit(
     }
     let mut files: Vec<PlannedFile> = Vec::new();
 
-    for entry in
-        fs::read_dir(unit_dir).with_context(|| format!("reading {}", unit_dir.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+    // The parser already read this directory once; reuse its names, roles and
+    // metadata instead of re-reading and re-classifying every file.
+    for seen in &unit.files_seen {
+        if is_volatile(&seen.name) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if is_volatile(&name) {
-            continue;
-        }
-        let role = if name.starts_with("dep-") {
-            "dep-info"
-        } else if name.ends_with(".json") {
-            "fingerprint"
-        } else if read_small_regular(&entry.path())
-            .map(|text| crate::fingerprint::looks_like_hash(text.trim()))
-            .unwrap_or(false)
-        {
-            "memo"
-        } else {
-            // Cached diagnostics (`output-*`) and other cargo state.
-            "extra"
-        };
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("inspecting {}", entry.path().display()))?;
-        let modified = meta
-            .modified()
-            .with_context(|| format!("reading mtime of {}", entry.path().display()))?;
-        let src = entry.path();
+        let src = unit_dir.join(&seen.name);
+        let modified = seen
+            .modified
+            .with_context(|| format!("reading mtime of {}", src.display()))?;
         files.push(PlannedFile {
             src,
-            path: name.clone(),
-            dest: format!("{}/{name}", unit.fingerprint_rel()),
-            role,
-            size: meta.len(),
+            path: seen.name.clone(),
+            dest: format!("{}/{}", unit.fingerprint_rel(), seen.name),
+            role: seen.role,
+            size: seen.size,
             modified,
         });
     }
@@ -3718,11 +3717,7 @@ pub fn restore_with(
             })
             .collect()
     } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .context("building the restore copy pool")?;
-        pool.install(|| {
+        crate::settings::copy_pool().install(|| {
             jobs.par_iter()
                 .map(|(at, entry)| {
                     restore_unit(
@@ -4287,158 +4282,49 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
         };
         let units = units_dir(store_root, &parity);
         let generation_root = store_root.join(&parity);
-        for entry in &manifest.units {
-            for file in &entry.files {
-                if let Some(object) = &file.object {
-                    let blob = generation_root.join(object);
-                    match util::metadata_nofollow(&blob) {
-                        Ok(meta)
-                            if meta.is_file() && (util::owned_by_us(&blob, &meta) || read_only) => {
-                        }
-                        Ok(_) => {
-                            report
-                                .problems
-                                .push(format!("unsafe/missing blob: {object}"));
-                            continue;
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-                            report
-                                .problems
-                                .push(format!("unsafe/missing blob: {object}"));
-                            continue;
-                        }
-                        Err(_) => {
-                            report.problems.push(format!("missing blob: {object}"));
-                            continue;
-                        }
-                    }
-                    report.files = report.files.saturating_add(1);
-                    report.bytes = report.bytes.saturating_add(file.size);
-                    match util::decompress_file_hashed(&blob, !read_only, file.size) {
-                        Ok((size, hash)) if size == file.size && hash == file.sha256 => {}
-                        Ok((size, hash)) => report.problems.push(format!(
-                            "blob drift: {object} (recorded {} bytes/{}, found {} bytes/{})",
-                            file.size,
-                            &file.sha256[..file.sha256.len().min(12)],
-                            size,
-                            &hash[..hash.len().min(12)]
-                        )),
-                        Err(err) => report
-                            .problems
-                            .push(format!("blob unreadable: {object}: {err:#}")),
-                    }
-                    continue;
-                }
-                let path = units.join(&entry.name).join(&file.path);
-                let rel = Path::new(&entry.name).join(&file.path);
-                if let Err(err) = util::check_regular_chain(&units, &rel) {
-                    report.problems.push(format!(
-                        "unsafe path: {} ({err:#})",
-                        display_join(&path, &units)
-                    ));
-                    continue;
-                }
-                let meta = match util::metadata_nofollow(&path) {
-                    Ok(meta) => meta,
-                    Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-                        report.problems.push(format!(
-                            "symlink/reparse in store (refused): {}",
-                            display_join(&path, &units)
-                        ));
-                        continue;
-                    }
-                    Err(_) => {
-                        report
-                            .problems
-                            .push(format!("missing: {}", display_join(&path, units.as_path())));
-                        continue;
-                    }
-                };
-                if !meta.is_file() {
-                    report.problems.push(format!(
-                        "not a regular file: {}",
-                        display_join(&path, &units)
-                    ));
-                    continue;
-                }
-                if !util::owned_by_us(&path, &meta) && !read_only {
-                    report.problems.push(format!(
-                        "foreign-owned file: {}",
-                        display_join(&path, &units)
-                    ));
-                }
-                report.files = report.files.saturating_add(1);
-                report.bytes = report.bytes.saturating_add(meta.len());
-                if meta.len() != file.size {
-                    report.problems.push(format!(
-                        "size drift: {} (recorded {}, found {})",
-                        display_join(&path, &units),
-                        file.size,
-                        meta.len()
-                    ));
-                }
-                let found_stamp = meta.modified().map(ceil_secs).unwrap_or(0);
-                if found_stamp != entry.stamp {
-                    report.problems.push(format!(
-                        "stamp drift: {} (recorded {}, found {})",
-                        display_join(&path, &units),
-                        entry.stamp,
-                        found_stamp
-                    ));
-                }
-                if file.sha256.is_empty() {
-                    report.problems.push(format!(
-                        "no recorded SHA-256: {} (re-harvest this generation)",
-                        display_join(&path, &units)
-                    ));
-                } else {
-                    match util::sha256_file(&path) {
-                        Ok(found) if found != file.sha256 => report.problems.push(format!(
-                            "content drift: {} (recorded {}, found {})",
-                            display_join(&path, &units),
-                            &file.sha256[..file.sha256.len().min(12)],
-                            &found[..found.len().min(12)]
-                        )),
-                        Ok(_) => {}
-                        Err(err) => report.problems.push(format!(
-                            "unreadable: {}: {err}",
-                            display_join(&path, &units)
-                        )),
-                    }
-                }
-                if file.role == "memo" {
-                    match read_small_regular(&path) {
-                        Some(text) if file.path == entry.memo && text.trim() != entry.hash => {
-                            let found = text.trim();
-                            let detail = if crate::fingerprint::looks_like_hash(found) {
-                                format!("found {found}")
-                            } else {
-                                "found non-hash content (not printed)".to_string()
-                            };
-                            report.problems.push(format!(
-                                "hash drift: {} (recorded {}; {detail})",
-                                display_join(&path, &units),
-                                entry.hash
-                            ));
-                        }
-                        Some(text)
-                            if file.path != entry.memo
-                                && !crate::fingerprint::looks_like_hash(text.trim()) =>
-                        {
-                            report.problems.push(format!(
-                                "malformed memo file: {} (content is not a 16-hex hash)",
-                                display_join(&path, &units)
-                            ));
-                        }
-                        Some(_) => {}
-                        None => report.problems.push(format!(
-                            "unreadable/symlinked memo file: {}",
-                            display_join(&path, &units)
-                        )),
-                    }
-                }
-            }
+
+        // Content-addressed blobs are shared between units. Verify each
+        // object once (decode cap = the largest recorded size) and compare
+        // that result against every reference below.
+        let blobs = unique_blobs(&manifest);
+        let checks: std::collections::BTreeMap<&str, BlobCheck> = crate::settings::scan_pool()
+            .install(|| {
+                blobs
+                    .par_iter()
+                    .map(|(object, max_size)| {
+                        (
+                            *object,
+                            check_blob(&generation_root, object, *max_size, read_only),
+                        )
+                    })
+                    .collect()
+            });
+
+        let ctx = AuditCtx {
+            units: &units,
+            read_only,
+        };
+        let audits: Vec<UnitAudit> = if manifest.units.len() > 1 {
+            crate::settings::scan_pool().install(|| {
+                manifest
+                    .units
+                    .par_iter()
+                    .map(|entry| ctx.audit(entry, &checks))
+                    .collect()
+            })
+        } else {
+            manifest
+                .units
+                .iter()
+                .map(|entry| ctx.audit(entry, &checks))
+                .collect()
+        };
+        for audit in audits {
+            report.files = report.files.saturating_add(audit.files);
+            report.bytes = report.bytes.saturating_add(audit.bytes);
+            report.problems.extend(audit.problems);
         }
+
         // Reject extra files in recorded unit dirs too: a manifest hash
         // list is only meaningful if the set of files is exact.
         for entry in &manifest.units {
@@ -4571,6 +4457,215 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
         reports.push(report);
     }
     Ok(reports)
+}
+
+/// One generation's read-only view of the store, used by the parallel audit.
+struct AuditCtx<'a> {
+    units: &'a Path,
+    read_only: bool,
+}
+
+#[derive(Default)]
+struct UnitAudit {
+    problems: Vec<String>,
+    files: usize,
+    bytes: u64,
+}
+
+/// The verified content of one blob, or why it could not be read.
+enum BlobCheck {
+    Verified { size: u64, hash: String },
+    Unsafe,
+    Missing,
+    Unreadable(String),
+}
+
+/// Every distinct blob object in the manifest, with the largest recorded
+/// decoded size (the decode cap for its one verification).
+fn unique_blobs(manifest: &Manifest) -> std::collections::BTreeMap<&str, u64> {
+    let mut blobs: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for entry in &manifest.units {
+        for file in &entry.files {
+            if let Some(object) = file.object.as_deref() {
+                let slot = blobs.entry(object).or_insert(0);
+                *slot = (*slot).max(file.size);
+            }
+        }
+    }
+    blobs
+}
+
+/// Probe and hash one blob without following links or trusting foreign bytes.
+fn check_blob(generation_root: &Path, object: &str, max_size: u64, read_only: bool) -> BlobCheck {
+    let blob = generation_root.join(object);
+    match util::metadata_nofollow(&blob) {
+        Ok(meta) if meta.is_file() && (util::owned_by_us(&blob, &meta) || read_only) => {}
+        Ok(_) => return BlobCheck::Unsafe,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            return BlobCheck::Unsafe;
+        }
+        Err(_) => return BlobCheck::Missing,
+    }
+    match util::decompress_file_hashed(&blob, !read_only, max_size) {
+        Ok((size, hash)) => BlobCheck::Verified { size, hash },
+        Err(err) => BlobCheck::Unreadable(format!("{err:#}")),
+    }
+}
+
+impl AuditCtx<'_> {
+    /// Audit one unit group. Pure reads: safe to run on a worker, and every
+    /// message it produces is merged in manifest order by the caller.
+    fn audit(
+        &self,
+        entry: &UnitEntry,
+        blobs: &std::collections::BTreeMap<&str, BlobCheck>,
+    ) -> UnitAudit {
+        let units = self.units;
+        let read_only = self.read_only;
+        let mut out = UnitAudit::default();
+        for file in &entry.files {
+            if let Some(object) = &file.object {
+                match blobs.get(object.as_str()) {
+                    Some(BlobCheck::Unsafe) => {
+                        out.problems.push(format!("unsafe/missing blob: {object}"))
+                    }
+                    Some(BlobCheck::Missing) | None => {
+                        out.problems.push(format!("missing blob: {object}"))
+                    }
+                    // The blob exists and is ours: it counts as a stored file
+                    // even if its bytes cannot be decoded.
+                    Some(check) => {
+                        out.files = out.files.saturating_add(1);
+                        out.bytes = out.bytes.saturating_add(file.size);
+                        match check {
+                            BlobCheck::Verified { size, hash }
+                                if *size != file.size || hash != &file.sha256 =>
+                            {
+                                out.problems.push(format!(
+                                    "blob drift: {object} (recorded {} bytes/{}, found {size} bytes/{})",
+                                    file.size,
+                                    &file.sha256[..file.sha256.len().min(12)],
+                                    &hash[..hash.len().min(12)]
+                                ));
+                            }
+                            BlobCheck::Unreadable(err) => out
+                                .problems
+                                .push(format!("blob unreadable: {object}: {err}")),
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+            let path = units.join(&entry.name).join(&file.path);
+            let rel = Path::new(&entry.name).join(&file.path);
+            if let Err(err) = util::check_regular_chain(units, &rel) {
+                out.problems.push(format!(
+                    "unsafe path: {} ({err:#})",
+                    display_join(&path, units)
+                ));
+                continue;
+            }
+            let meta = match util::metadata_nofollow(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                    out.problems.push(format!(
+                        "symlink/reparse in store (refused): {}",
+                        display_join(&path, units)
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    out.problems
+                        .push(format!("missing: {}", display_join(&path, units)));
+                    continue;
+                }
+            };
+            if !meta.is_file() {
+                out.problems.push(format!(
+                    "not a regular file: {}",
+                    display_join(&path, units)
+                ));
+                continue;
+            }
+            if !util::owned_by_us(&path, &meta) && !read_only {
+                out.problems.push(format!(
+                    "foreign-owned file: {}",
+                    display_join(&path, units)
+                ));
+            }
+            out.files = out.files.saturating_add(1);
+            out.bytes = out.bytes.saturating_add(meta.len());
+            if meta.len() != file.size {
+                out.problems.push(format!(
+                    "size drift: {} (recorded {}, found {})",
+                    display_join(&path, units),
+                    file.size,
+                    meta.len()
+                ));
+            }
+            let found_stamp = meta.modified().map(ceil_secs).unwrap_or(0);
+            if found_stamp != entry.stamp {
+                out.problems.push(format!(
+                    "stamp drift: {} (recorded {}, found {})",
+                    display_join(&path, units),
+                    entry.stamp,
+                    found_stamp
+                ));
+            }
+            if file.sha256.is_empty() {
+                out.problems.push(format!(
+                    "no recorded SHA-256: {} (re-harvest this generation)",
+                    display_join(&path, units)
+                ));
+            } else {
+                match util::sha256_file(&path) {
+                    Ok(found) if found != file.sha256 => out.problems.push(format!(
+                        "content drift: {} (recorded {}, found {})",
+                        display_join(&path, units),
+                        &file.sha256[..file.sha256.len().min(12)],
+                        &found[..found.len().min(12)]
+                    )),
+                    Ok(_) => {}
+                    Err(err) => out
+                        .problems
+                        .push(format!("unreadable: {}: {err}", display_join(&path, units))),
+                }
+            }
+            if file.role == "memo" {
+                match read_small_regular(&path) {
+                    Some(text) if file.path == entry.memo && text.trim() != entry.hash => {
+                        let found = text.trim();
+                        let detail = if crate::fingerprint::looks_like_hash(found) {
+                            format!("found {found}")
+                        } else {
+                            "found non-hash content (not printed)".to_string()
+                        };
+                        out.problems.push(format!(
+                            "hash drift: {} (recorded {}; {detail})",
+                            display_join(&path, units),
+                            entry.hash
+                        ));
+                    }
+                    Some(text)
+                        if file.path != entry.memo
+                            && !crate::fingerprint::looks_like_hash(text.trim()) =>
+                    {
+                        out.problems.push(format!(
+                            "malformed memo file: {} (content is not a 16-hex hash)",
+                            display_join(&path, units)
+                        ));
+                    }
+                    Some(_) => {}
+                    None => out.problems.push(format!(
+                        "unreadable/symlinked memo file: {}",
+                        display_join(&path, units)
+                    )),
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Path for humans: relative to `base` when possible.
@@ -4746,7 +4841,9 @@ pub fn compact(
     if generations.is_empty() {
         return Ok(report);
     }
-    check_store_trust(store_root)?;
+    if dry_run {
+        check_store_trust(store_root)?;
+    }
     // A dry run is a pure audit: no lock files, no temp cleanup. The real run
     // holds every touched generation so harvest/evict cannot swap a unit.
     let mut locks = Vec::new();
@@ -6526,6 +6623,62 @@ mod tests {
             reports[0].problems
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_shared_blob_is_checked_once_and_reported_per_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = "blobs/aa/0123456789abcdef0123456789abcdef.gz";
+        let file = |size: u64| FileEntry {
+            path: "deps/libx.rlib".into(),
+            dest: "deps/libx.rlib".into(),
+            size,
+            sha256: "a".repeat(64),
+            role: "artifact".into(),
+            object: Some(object.into()),
+        };
+        let unit = |name: &str, size: u64| UnitEntry {
+            name: name.into(),
+            profile: "debug".into(),
+            memo: "lib-x".into(),
+            hash: "0123456789abcdef".into(),
+            version: None,
+            stamp: 1,
+            layout: Some(fingerprint::UnitLayout::Classic),
+            files: vec![file(size)],
+        };
+        let manifest = Manifest {
+            units: vec![
+                unit("x-1111111111111111", 10),
+                unit("y-2222222222222222", 20),
+            ],
+            ..Default::default()
+        };
+
+        // One object, one decode cap: the largest recorded size.
+        let blobs = unique_blobs(&manifest);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[object], 20);
+
+        // A bad result is charged against every reference, in order.
+        let mut checks: std::collections::BTreeMap<&str, BlobCheck> =
+            std::collections::BTreeMap::new();
+        checks.insert(
+            object,
+            BlobCheck::Verified {
+                size: 12,
+                hash: "b".repeat(64),
+            },
+        );
+        let ctx = AuditCtx {
+            units: dir.path(),
+            read_only: true,
+        };
+        let audit = ctx.audit(&manifest.units[0], &checks);
+        assert_eq!(audit.files, 1);
+        assert_eq!(audit.bytes, 10);
+        assert_eq!(audit.problems.len(), 1, "{:?}", audit.problems);
+        assert!(audit.problems[0].contains("blob drift"));
     }
 
     #[test]

@@ -288,6 +288,15 @@ pub fn force_remove_dir(path: &Path) -> std::io::Result<()> {
         };
         let mut perms = meta.permissions();
         if perms.readonly() {
+            // Add only the owner's write bit. `set_readonly(false)` on Unix
+            // grants group/world write, which would briefly widen access in a
+            // shared parent directory.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms = fs::Permissions::from_mode(perms.mode() | 0o200);
+            }
+            #[cfg(not(unix))]
             perms.set_readonly(false);
             let _ = fs::set_permissions(entry.path(), perms);
         }
@@ -2319,15 +2328,19 @@ pub(crate) fn create_temp_dir(dir: &Path, prefix: &str) -> Result<PathBuf> {
             ".{prefix}-{}-{nonce}-{attempt}",
             std::process::id()
         ));
-        match fs::create_dir(&path) {
+        match create_private_dir_excl(&path) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Err(err) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                    {
-                        let _ = fs::remove_dir(&path);
-                        return Err(err).with_context(|| format!("securing {}", path.display()));
+                    // `mkdir` mode is masked by umask. Repair a pathological
+                    // umask that stripped owner bits, but treat chmod as best
+                    // effort: some FUSE/CIFS mounts refuse it, and the mkdir
+                    // request already excluded group/other.
+                    if let Ok(meta) = fs::symlink_metadata(&path) {
+                        if meta.permissions().mode() & 0o700 != 0o700 {
+                            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+                        }
                     }
                 }
                 return Ok(path);
@@ -2340,6 +2353,19 @@ pub(crate) fn create_temp_dir(dir: &Path, prefix: &str) -> Result<PathBuf> {
         }
     }
     anyhow::bail!("could not create a unique staging dir in {}", dir.display())
+}
+
+/// `mkdir` one directory, owner-only from the first instant on Unix.
+fn create_private_dir_excl(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
 }
 
 /// Create a uniquely named hard link to `src` in `dir`.
@@ -2416,30 +2442,26 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
         Ok(())
     })
     .with_context(|| format!("writing {}", path.display()))?;
+    // A real directory at the destination is not replaceable, and retrying
+    // cannot help. Refuse before touching anything.
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        let _ = fs::remove_file(&tmp);
+        anyhow::bail!(
+            "{} is a directory — refusing to replace it with a file",
+            path.display()
+        );
+    }
     let mut last_error = None;
     for attempt in 0..100u32 {
         match fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
-            #[cfg(windows)]
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                // Windows does not replace an existing file with rename().
-                // Removing the link itself (never following it) is safe; the
-                // subsequent rename replaces whatever appears next.
-                let _ = fs::remove_file(path);
-                if let Err(err2) = fs::rename(&tmp, path) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(err2).with_context(|| format!("installing {}", path.display()));
-                }
-                return Ok(());
-            }
             Err(err) => {
+                // Never delete the destination first: a failed replace must
+                // leave the old file intact. A directory at the destination is
+                // not replaceable, so retrying cannot help.
+                let retryable = err.kind() != std::io::ErrorKind::AlreadyExists;
                 last_error = Some(err);
-                if attempt < 99 {
+                if retryable && attempt < 99 {
                     continue;
                 }
             }
@@ -2629,26 +2651,27 @@ pub(crate) fn compress_file_hashed(
 
     let blobs = generation_root.join("blobs");
     create_private_dir_all(&blobs)?;
-    let (tmp_path, (sha, size)) = with_temp_file(&blobs, "tmp", ".gz", 0o600, |file| {
-        let mut encoder = GzEncoder::new(&mut *file, Compression::fast());
-        let mut hasher = Sha256::new();
-        let mut buf = [0u8; 64 * 1024];
-        let mut size = 0u64;
-        loop {
-            let n = input.read(&mut buf)?;
-            if n == 0 {
-                break;
+    let (tmp_path, (sha, size, compressed_size)) =
+        with_temp_file(&blobs, "tmp", ".gz", 0o600, |file| {
+            let mut encoder = GzEncoder::new(&mut *file, Compression::fast());
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut size = 0u64;
+            loop {
+                let n = input.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                encoder.write_all(&buf[..n])?;
+                size += n as u64;
             }
-            hasher.update(&buf[..n]);
-            encoder.write_all(&buf[..n])?;
-            size += n as u64;
-        }
-        encoder.finish()?;
-        file.sync_all()?;
-        Ok((format!("{:x}", hasher.finalize()), size))
-    })
-    .with_context(|| format!("compressing {}", src.display()))?;
-    let compressed_size = fs::metadata(&tmp_path)?.len();
+            encoder.finish()?;
+            file.sync_all()?;
+            let compressed_size = file.metadata()?.len();
+            Ok((format!("{:x}", hasher.finalize()), size, compressed_size))
+        })
+        .with_context(|| format!("compressing {}", src.display()))?;
     if compressed_size >= size {
         let _ = fs::remove_file(&tmp_path);
         return Ok(None);
@@ -2681,8 +2704,15 @@ pub(crate) fn compress_file_hashed(
             // The name is the hash of the *decoded* content, so hash the
             // blob after decompression; hashing the gzip bytes would reject
             // every duplicate artifact in the same harvest.
-            let (existing_size, existing_sha) = decompress_file_hashed(&final_path, true, size)
-                .with_context(|| format!("verifying existing blob {}", final_path.display()))?;
+            let verified = decompress_file_hashed(&final_path, true, size)
+                .with_context(|| format!("verifying existing blob {}", final_path.display()));
+            let (existing_size, existing_sha) = match verified {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err);
+                }
+            };
             if existing_size != size || existing_sha != sha {
                 let _ = fs::remove_file(&tmp_path);
                 anyhow::bail!(
@@ -3303,8 +3333,8 @@ pub(crate) fn probe_kind(path: &Path) -> Result<Probed> {
     }
 }
 
-/// Probe for scan loops: absent and link/reparse entries both read as `None`,
-/// so an unreadable or swapped entry is skipped instead of aborting the walk.
+/// Probe for scan loops: absent and link/reparse entries both read as `None`.
+/// Other I/O errors (for example a permission denial) are still reported.
 pub(crate) fn probe_lenient(path: &Path) -> Result<Option<Metadata>> {
     match metadata_nofollow(path) {
         Ok(meta) => Ok(Some(meta)),
@@ -3504,8 +3534,28 @@ pub(crate) fn walk_entry_is_safe(entry: &walkdir::DirEntry) -> bool {
     if !kind.is_dir() {
         return true;
     }
-    // A Windows junction reports `is_dir()` without `is_symlink()`; only the
-    // reparse attribute distinguishes it. On Unix a directory entry is real.
+    // On Windows, Rust reports a name-surrogate reparse tag (symlink or
+    // junction) as `is_symlink`, so those are already rejected. Other reparse
+    // directory tags (cloud/dedup/NFS) report `is_dir` without `is_symlink`;
+    // only a no-follow stat exposes the reparse attribute. On Unix a directory
+    // entry is real.
+    #[cfg(windows)]
+    {
+        metadata_nofollow(entry.path()).is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// `WalkDir::filter_entry` predicate that prunes only reparse **directories**.
+/// Use for scans that must still see symlinked files (a planted lock file must
+/// be rejected, not hidden) but must never descend through a junction.
+pub(crate) fn walk_dir_is_safe(entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
     #[cfg(windows)]
     {
         metadata_nofollow(entry.path()).is_ok()
@@ -3518,34 +3568,58 @@ pub(crate) fn walk_entry_is_safe(entry: &walkdir::DirEntry) -> bool {
 
 /// A bounded, junction-safe tree walk. The safety predicate is part of the
 /// constructor so every scan skips a reparse subtree instead of traversing it.
+/// Directory pruning requires top-down order; collect first, then sort by depth
+/// when a removal has to happen children-first.
 pub(crate) struct SafeWalk<'a> {
     base: &'a Path,
-    contents_first: bool,
+    depth: usize,
+    keep_links: bool,
 }
 
 impl<'a> SafeWalk<'a> {
     pub(crate) fn new(base: &'a Path) -> Self {
         Self {
             base,
-            contents_first: false,
+            depth: MAX_SCAN_DEPTH,
+            keep_links: false,
         }
     }
 
-    /// Visit children before their parent — required before removing a tree.
-    pub(crate) fn bottom_up(mut self) -> Self {
-        self.contents_first = true;
+    pub(crate) fn depth(mut self, depth: usize) -> Self {
+        debug_assert!(depth >= 1, "max_depth is clamped up to min_depth(1)");
+        self.depth = depth;
+        self
+    }
+
+    /// Yield symlinked files while still pruning reparse directories.
+    pub(crate) fn keep_links(mut self) -> Self {
+        self.keep_links = true;
         self
     }
 
     pub(crate) fn walk(self) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + 'a {
+        // `follow_root_links(false)` stops a symlinked root. A Windows junction
+        // is not a symlink for older platforms and non-surrogate reparse
+        // directories are not either, so reject any reparse root explicitly.
+        // (Do not encode "yield nothing" as `max_depth(0)`: walkdir clamps it
+        // up to `min_depth(1)` and would yield the target's direct children.)
+        let reject_root = matches!(
+            metadata_nofollow(self.base),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+        );
+        let filter: fn(&walkdir::DirEntry) -> bool = if self.keep_links {
+            walk_dir_is_safe
+        } else {
+            walk_entry_is_safe
+        };
         WalkDir::new(self.base)
             .min_depth(1)
-            .max_depth(MAX_SCAN_DEPTH)
+            .max_depth(self.depth)
             .follow_links(false)
             .follow_root_links(false)
-            .contents_first(self.contents_first)
             .into_iter()
-            .filter_entry(walk_entry_is_safe)
+            .filter_entry(filter)
+            .take(if reject_root { 0 } else { usize::MAX })
     }
 }
 
@@ -3691,6 +3765,20 @@ mod tests {
         let second = create_temp_dir(dir.path(), "stage")?;
         assert_ne!(first, second);
         assert!(first.is_dir() && second.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn write_atomic_private_leaves_a_directory_destination_intact() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("config.toml");
+        fs::create_dir(&dest)?;
+        fs::write(dest.join("keep"), b"x")?;
+        assert!(write_atomic_private(&dest, b"new bytes").is_err());
+        assert!(
+            dest.join("keep").exists(),
+            "a failed replace must not delete the destination"
+        );
         Ok(())
     }
 

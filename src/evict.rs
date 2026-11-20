@@ -856,9 +856,16 @@ fn evict_work_dirs(
         let locked = crate::exec::dir_locked(&path);
         let stats = tree_stats(&path);
         let newest = stats.newest;
-        let old_enough = newest
-            .map(|m| now.duration_since(m).map_or(true, |age| age > limit))
-            .unwrap_or(true);
+        // A filtered/reparse subtree can hide every regular file. Treat a
+        // non-empty dir without a visible file as fresh, never as infinitely
+        // old: bulk collection must not delete a job it could not inspect.
+        let empty = fs::read_dir(&path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        let old_enough = match newest {
+            Some(modified) => now.duration_since(modified).map_or(true, |age| age > limit),
+            None => empty,
+        };
         rows.push(WorkDir {
             name,
             path,
@@ -1996,6 +2003,26 @@ mod tests {
         assert_eq!(report.unique_bytes, 100);
         assert_eq!(report.shared_bytes, 200);
         assert_eq!(report.nominal_bytes, 300);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_with_only_a_symlinked_subtree_is_not_bulk_collected() -> Result<()> {
+        let home = tier_home()?;
+        let job = home.path().join("work/linked-job");
+        fs::create_dir_all(&job)?;
+        let victim = home.path().join("linked-files");
+        fs::create_dir_all(&victim)?;
+        fs::write(victim.join("fresh.rlib"), [0u8; 8])?;
+        std::os::unix::fs::symlink(&victim, job.join("files"))?;
+
+        let report = evict_work_dirs(&home.path().join("build"), Some("1s"), false)?;
+        assert_eq!(
+            report.eligible, 0,
+            "a non-empty job with no visible regular file must stay put"
+        );
+        assert_eq!(report.young, 1);
         Ok(())
     }
 

@@ -22,7 +22,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use anyhow::{Context, Result, bail};
-use walkdir::WalkDir;
 
 use crate::fingerprint;
 use crate::settings::LinkPolicy;
@@ -205,6 +204,15 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
     Ok(tier)
 }
 
+/// A reparse/symlink root cannot be inspected safely, so lock scans treat it as
+/// "in use" (fail closed) instead of returning an empty lock set.
+fn root_is_reparse(dir: &Path) -> bool {
+    matches!(
+        metadata_nofollow(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+    )
+}
+
 /// Does a live build hold this build dir? Cargo takes an exclusive advisory
 /// lock on `<build-dir>/<profile>/.cargo-build-lock` for the duration of a
 /// build; the lock file itself survives idle builds, so only lock contention
@@ -219,9 +227,10 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
     // `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
     // bounded depth and take every lock, not just direct children.
     //
-    // This scan deliberately does not use `SafeWalk`: a planted symlink named
-    // `.cargo-build-lock` must still be seen so `open_lock_file` can reject it
-    // (fail closed). `SafeWalk` would prune the link and hide the lock.
+    // Keep symlinked files visible so a planted `.cargo-build-lock` is rejected
+    // by `open_lock_file` (fail closed), but prune reparse directories so the
+    // scan cannot write a sentinel outside `dir` through a junction. A reparse
+    // root is treated as un-inspectable and fails closed.
     //
     // A profile directory without a lock file gets a sentinel: otherwise a
     // build that starts after this check is not fenced at all. Creating the
@@ -231,13 +240,14 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
     // Windows refuses to rename a directory while any file inside it is open
     // (even with FILE_SHARE_DELETE), so a caller that renames/removes `dir`
     // must drop these handles first.
+    if root_is_reparse(dir) {
+        return Ok(None);
+    }
     let mut lock_paths = std::collections::BTreeSet::new();
-    let entries = WalkDir::new(dir)
-        .min_depth(1)
-        .max_depth(3)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
+    let entries = util::SafeWalk::new(dir)
+        .depth(3)
+        .keep_links()
+        .walk()
         .collect::<Result<Vec<_>, _>>()?;
     for entry in entries {
         if entry.file_name().to_string_lossy() == ".cargo-build-lock" {
@@ -300,29 +310,39 @@ pub(crate) fn dir_locked(dir: &Path) -> bool {
 
 /// `try_lock` can be interrupted by a signal from an unrelated child process;
 /// retry that case, but treat every other error (including contention) as
-/// "in use".
+/// "in use". A lock released by a closed descriptor can take a moment to
+/// become visible again on network filesystems, so a contention result is
+/// retried briefly before the caller fails closed.
 fn try_lock_now(file: &fs::File) -> bool {
-    loop {
-        match file.try_lock() {
-            Ok(()) => return true,
-            Err(std::fs::TryLockError::Error(err))
-                if err.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                continue;
+    for attempt in 0..4 {
+        loop {
+            match file.try_lock() {
+                Ok(()) => return true,
+                Err(std::fs::TryLockError::Error(err))
+                    if err.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Err(_) => break,
             }
-            Err(_) => return false,
+        }
+        if attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    false
 }
 
 fn existing_cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
-    // Raw walk: a symlinked lock must be seen and rejected, not pruned.
-    let entries = WalkDir::new(dir)
-        .min_depth(1)
-        .max_depth(3)
-        .follow_links(false)
-        .follow_root_links(false)
-        .into_iter()
+    // Keep symlinked files visible (a planted lock must be rejected) and treat
+    // a reparse root as un-inspectable (fail closed).
+    if root_is_reparse(dir) {
+        return Ok(None);
+    }
+    let entries = util::SafeWalk::new(dir)
+        .depth(3)
+        .keep_links()
+        .walk()
         .collect::<Result<Vec<_>, _>>()?;
     let mut locks = Vec::new();
     for entry in entries {
@@ -2278,6 +2298,22 @@ mod tests {
             cargo_locks(&home.path().join("job"))?.is_none(),
             "a symlinked lock fails closed"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_root_is_treated_as_locked() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let real = home.path().join("real");
+        fs::create_dir(&real)?;
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(&real, &link)?;
+        assert!(
+            cargo_locks(&link)?.is_none(),
+            "a reparse root cannot be inspected and must fail closed"
+        );
+        assert!(dir_locked(&link), "the advisory check agrees");
         Ok(())
     }
 

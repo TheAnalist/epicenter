@@ -121,7 +121,13 @@ fn compress_blob(src: &Path, blobs: &Path) -> Result<Option<StoredBlob>> {
         let _ = fs::remove_file(&tmp);
         return Ok(None);
     }
-    let blob = crate::util::sha256_file(&tmp)?;
+    let blob = match crate::util::sha256_file(&tmp) {
+        Ok(blob) => blob,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+    };
     Ok(Some((
         tmp,
         blob,
@@ -153,7 +159,13 @@ fn raw_blob(src: &Path, blobs: &Path) -> Result<StoredBlob> {
         Ok(hasher.finish())
     })
     .with_context(|| format!("copying {}", src.display()))?;
-    let blob = crate::util::sha256_file(&tmp)?;
+    let blob = match crate::util::sha256_file(&tmp) {
+        Ok(blob) => blob,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+    };
     Ok((tmp, blob, size, sha256, size, Compression::Raw))
 }
 

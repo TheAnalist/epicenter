@@ -999,6 +999,39 @@ pub fn copy_workers() -> usize {
     available_cores().clamp(1, 8)
 }
 
+/// Workers for CPU-bound scans (decompression, hashing, parsing). Copies stay
+/// at [`copy_workers`]: scanning is compute, not disk pressure.
+pub fn scan_workers() -> usize {
+    available_cores().clamp(1, 32)
+}
+
+static COPY_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// The process-wide pool for vault file copies, sized by [`copy_workers`].
+pub fn copy_pool() -> &'static rayon::ThreadPool {
+    COPY_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(copy_workers())
+            .thread_name(|index| format!("epicenter-copy-{index}"))
+            .build()
+            .expect("building the copy thread pool")
+    })
+}
+
+static SCAN_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// The process-wide pool for CPU-bound scans. One pool keeps parallel scans
+/// from nesting or oversubscribing the machine.
+pub fn scan_pool() -> &'static rayon::ThreadPool {
+    SCAN_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(scan_workers())
+            .thread_name(|index| format!("epicenter-scan-{index}"))
+            .build()
+            .expect("building the scan thread pool")
+    })
+}
+
 /// Jobs = cores, capped by the memory budget; 2 GiB per job.
 pub fn job_cap(cores: usize, memory: Option<u64>) -> usize {
     let cores = cores.max(1);

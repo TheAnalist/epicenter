@@ -164,7 +164,11 @@ impl Cache {
             Ok(())
         })
         .with_context(|| format!("fetching blob {}", blob.blob))?;
-        util::verify_file_hash(&tmp, blob.blob_size, &blob.blob, "remote blob")?;
+        util::verify_file_hash(&tmp, blob.blob_size, &blob.blob, "remote blob").inspect_err(
+            |_| {
+                let _ = fs::remove_file(&tmp);
+            },
+        )?;
         install_put_if_absent(&tmp, &final_path, &blob.blob, blob.blob_size)?;
         #[cfg(unix)]
         {

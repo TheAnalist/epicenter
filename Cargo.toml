@@ -47,3 +47,4 @@ tempfile = "3"
 
 [profile.release]
 lto = "thin"
+incremental = true

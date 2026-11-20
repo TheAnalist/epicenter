@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::fingerprint::{ArtifactInfo, DepRef, Unit, UnitKind, artifacts_for, read_units};
+use crate::fingerprint::{ArtifactInfo, DepRef, Unit, UnitKind};
 use crate::util::{self, human_age, human_bytes};
 
 /// Names of the unit dirs currently present in a view. Used by `store
@@ -22,13 +22,7 @@ pub fn active_unit_names(build_root: &Path) -> Result<std::collections::HashSet<
 
 /// Fully attached unit list, sorted by size (largest first).
 pub(crate) fn collect(build_root: &Path) -> Result<Vec<(Unit, ArtifactInfo)>> {
-    let mut rows: Vec<(Unit, ArtifactInfo)> = read_units(build_root)?
-        .into_iter()
-        .map(|unit| {
-            let arts = artifacts_for(build_root, &unit);
-            (unit, arts)
-        })
-        .collect();
+    let mut rows = crate::vault::read_rows(build_root, None)?;
     rows.sort_by_key(|(_, arts)| std::cmp::Reverse(arts.bytes));
     Ok(rows)
 }
