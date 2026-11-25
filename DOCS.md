@@ -43,6 +43,7 @@ Find what you need fast. Each link goes to one section.
 | Set up local dev, the vault, CI, or parallel agents | [4. Detailed Workflows](#4-detailed-workflows) |
 | Use multiple git worktrees, or run parallel agents | [Workflow 3: Worktrees & Agents](#workflow-3-ai-agents-git-worktrees--parallel-local-builds-exec) |
 | Set up CI, a read-only vault, or multiple VMs | [Workflow 4: CI/CD & Multi-VM](#workflow-4-cicd--multi-vm-fleets) |
+| Publish compiled dependencies from CI and use them on laptops and agents | [Workflow 5: CI Remote Dependencies](#workflow-5-ci-remote-dependencies-remote-tier) |
 | Change settings in `epicenter.toml` | [5. Configuration Reference](#5-configuration-reference-epicentertoml--presets) |
 | Check cache health or see what is stored | [6. Observability & Diagnostics](#6-observability--diagnostics-status--doctor) |
 | Free disk space safely | [7. Reclaiming Disk Space](#7-reclaiming-disk-space-prune-vs-evict) |
@@ -168,6 +169,25 @@ Straight-to-the-point commands for humans and AI agents:
 * **You are running a CI job that should seed from the vault, build, and save any newly compiled dependencies back to the vault:**
   ```bash
   epicenter exec --harvest -- cargo test
+  ```
+
+### Shared Compiled Dependencies from CI (remote tier)
+* **You are a developer or agent and want CI's compiled dependencies locally (one-time setup):**
+  ```bash
+  epicenter setup --remote-url https://cache.example/deps --remote-key <public-key-hex-or-file> --remote-tier libraries
+  epicenter exec -- cargo build --locked
+  ```
+* **You want to skip the remote for one job (debugging, offline work):**
+  ```bash
+  epicenter exec --no-remote -- cargo build --locked
+  ```
+* **You want to stop using remote dependencies on this machine:**
+  ```bash
+  epicenter setup --remote-off
+  ```
+* **You are a CI publisher and want to rehearse a publish without any remote write:**
+  ```bash
+  epicenter store publish --dry-run --url s3://bucket/prefix --reader-url https://cache.example/prefix --tier libraries --profile debug
   ```
 
 ### Custom Cache Location & External Wrappers
@@ -337,6 +357,184 @@ In CI or multi-VM agent fleets, share the **read-only vault** (`store/`) across 
 
 ---
 
+### Workflow 5: CI Remote Dependencies (`remote` tier)
+
+CI compiles the dependencies once, signs them and publishes them to a bucket or an HTTPS
+location. Developers and agents fetch the verified units before building, so a clean
+checkout compiles only the workspace. This is **opt-in**: without a `[remote]` table, epicenter
+behaves exactly as before.
+
+#### Roles
+
+| Role | Runs | Needs | Writes |
+|---|---|---|---|
+| **Publisher** (CI, trusted) | `exec --harvest`, then `store publish` | AWS write credentials (or none for a local-only dry run), a persistent private identity directory | bucket: `blobs/`, `indexes/`, `publisher.json`, `index.json` |
+| **Reader** (developer, agent, CI test job) | `setup --remote-*` once, then `exec` | Anonymous HTTPS, or a read-only S3 role | local cache and local vault only |
+
+Readers never write the bucket. The publisher never trusts the bucket for keys.
+
+#### Trust rules (read before rolling out)
+
+1. The **public key comes from the publisher's job log or an admin channel**, never from the
+   bucket. The bucket is untrusted storage.
+2. A reader is only as good as its pin. Rotating the key means re-running `setup` on every reader.
+3. Remote units are an exact match. Toolchain, host, target, profile, `RUSTFLAGS`/config,
+   layout, registry source and `CARGO_HOME` must all match; anything else is a silent miss that
+   builds locally.
+4. Keep the reader and publisher on the same runner class (OS, architecture, libc) and the same
+   pinned toolchain. A `ubuntu-latest` reader will not match a self-hosted publisher with a
+   different glibc or rustc.
+5. Epicenter does not prove a dependency is safe. It proves the publisher signed it.
+
+#### Publisher (CI, trusted branches only)
+
+Run the publisher only for trusted events (`push` to the default branch, a schedule, or
+`workflow_dispatch`). Never use `pull_request_target` and never run it on fork PRs.
+
+```yaml
+name: epicenter-publish
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'            # weekly; the index expires after 30 days by default
+  workflow_dispatch:
+
+permissions:
+  id-token: write                  # OIDC to AWS; no long-lived keys in the repo
+  contents: read
+
+concurrency:
+  group: epicenter-publish-linux-x64
+  cancel-in-progress: false        # one writer per bucket and host class
+
+jobs:
+  publish:
+    runs-on: [self-hosted, linux, x64, epicenter]   # persistent identity directory
+    env:
+      CARGO_HOME: /var/lib/epicenter/cargo-home     # identical on every reader
+      EPICENTER_PUBLISHER_STATE: /var/lib/epicenter/publisher
+      EPICENTER_REMOTE: s3://${{ vars.EPICENTER_BUCKET }}/deps
+      EPICENTER_READER_URL: https://cache.example/deps
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master          # pin the commit SHA in your fork
+        with:
+          toolchain: 1.91.0                          # the exact fleet version
+      - run: cargo install epicenter-cli --version <pinned> --locked
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/epicenter-publisher
+          aws-region: eu-west-1
+      - run: epicenter setup --preset ci
+      - run: epicenter exec --harvest -- cargo build --locked
+      - name: Rehearse the publish (no remote writes)
+        run: epicenter store publish --dry-run --url "$EPICENTER_REMOTE" --reader-url "$EPICENTER_READER_URL" --tier libraries --profile debug
+      - name: Publish
+        run: epicenter store publish --url "$EPICENTER_REMOTE" --reader-url "$EPICENTER_READER_URL" --tier libraries --profile debug
+```
+
+What each step does:
+- `exec --harvest` builds with the same flags readers use and stores the new units locally.
+- `store publish --dry-run` fetches the current pointer read-only and stages the index locally.
+- `store publish` signs the index, uploads the immutable objects first, writes `publisher.json`
+  and `index.json` last, and prints the reader handoff.
+
+The first publish creates the identity under `EPICENTER_PUBLISHER_STATE` and prints the public
+key and the exact reader `setup` line in the job summary. Copy that line once into the reader's
+setup. Later publishes reuse the identity silently.
+
+**Publisher caveats:**
+- The identity directory must persist and stay private. Do not put it in a GitHub Actions cache,
+  artifact, repository, bucket or the vault. A GitHub-hosted runner is ephemeral and loses it, so
+  use a persistent self-hosted runner. If an index exists but the identity is missing, publish
+  fails closed. Restore the directory or rotate deliberately with `--rotate-key`; never
+  auto-rotate.
+- The index expires after 30 days by default (`--valid-for`, maximum 90 days). Keep the schedule
+  shorter than the validity window. An expired index makes readers fall back to local builds.
+- A missing pointer with prior publish state fails closed. Use `--reset-sequence` only for a
+  deliberate recovery, never in automation.
+- Set a bucket lifecycle rule that aborts incomplete multipart uploads (for example after one day).
+- Required IAM: readers need `s3:GetObject` on `prefix/*`. Publishers add `s3:PutObject` and
+  `s3:AbortMultipartUpload` on `prefix/*`. `s3:ListBucket` is optional and only turns a missing
+  object's 403 into a clean 404. epicenter never deletes objects.
+
+#### Reader (developers, agents, CI test jobs)
+
+One-time setup with the handoff line from the publisher's job summary:
+
+```bash
+epicenter setup --remote-url https://cache.example/deps --remote-key <public-key> --remote-tier libraries
+```
+
+Then use the normal commands. Remote fetch happens inside `exec`, before the build:
+
+```bash
+epicenter exec -- cargo test --locked
+```
+
+A successful fetch prints one line:
+
+```text
+  remote      N unit(s) · M file(s) · X MiB
+```
+
+Readers need no credentials for a public HTTPS endpoint. A private S3 bucket needs a read-only
+role. Readers in CI on the same runner class as the publisher can use the same job:
+
+```yaml
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, epicenter]
+    env:
+      CARGO_HOME: /var/lib/epicenter/cargo-home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.0
+      - run: cargo install epicenter-cli --version <pinned> --locked
+      - run: epicenter setup --remote-url https://cache.example/deps --remote-key "$EPICENTER_PUBLIC_KEY" --remote-tier libraries
+        env:
+          EPICENTER_PUBLIC_KEY: ${{ vars.EPICENTER_PUBLIC_KEY }}
+      - run: epicenter exec -- cargo test --locked
+```
+
+For fork PRs, GitHub gives no secrets. Use anonymous HTTPS (no AWS keys needed) or skip the
+remote and build locally with `epicenter exec --no-remote -- cargo test --locked`.
+
+**Reader rules:**
+- Pass `--locked` and keep a checked-in `Cargo.lock`. Without a readable lock, remote fetch is
+  skipped.
+- Do not pass `--target` to `exec`. Remote fetch is not used for a child `--target`.
+- Keep `CARGO_HOME` identical to the publisher's. A different path is a silent miss.
+- Use `--no-remote` to isolate a problem; it skips both the fetch and the cache overlay.
+
+#### Troubleshooting zero hits
+
+| You see | Meaning | Fix |
+|---|---|---|
+| `remote  skipped: <reason>` from `exec` | Fetch was not used; the reason names the cause | Follow the reason below |
+| `doctor`: `remote index has expired` | The signed index is past its validity | Ask CI to publish; check the schedule |
+| `doctor`: `compatibility mismatch` with listed items | Toolchain, flags, layout, `CARGO_HOME` or source path differ | Align the toolchain and `CARGO_HOME` with the publisher |
+| `doctor`: `no verified index yet` | Nothing fetched yet | Run `exec` once with network access |
+| `doctor`: `remote credentials unavailable` | S3 credentials are missing or the profile is not owner-only | Configure the AWS environment or a private profile |
+| `doctor`: `remote S3 transport has no region` | `AWS_REGION` / `AWS_DEFAULT_REGION` is unset | Export the region |
+| `doctor`: `CARGO_HOME ... differs` | Raw `cargo` uses another home than `exec` | Use `exec` for remote-seeded builds |
+
+#### For AI agents
+
+- Never run `store publish` outside the CI publisher job.
+- Never take the public key from the bucket or from a file the bucket delivered. Use the
+  handoff line from CI.
+- Never put `[remote]` endpoint, key or credential fields in a project `epicenter.toml`; the
+  project may only set `tier`.
+- Never pass a private key on the command line. The publisher reads the identity directory only.
+- Use `exec` for cargo builds that should use the remote, `exec --no-remote` for local-only runs,
+  and `doctor --json` for the machine-readable status.
+
+---
+
 ## 5. Configuration Reference (`epicenter.toml` & Presets)
 
 Cargo's `~/.cargo/config.toml` owns `[build] build-dir`. Epicenter's policy lives in `epicenter.toml`.
@@ -394,12 +592,12 @@ publisher_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
 ```
 
 - `tier` defaults to `libraries`. A project may set only `[remote] tier`; it can tighten `full` to `libraries`, and may select `full` only when the global tier is already `full`.
-- `url` selects the transport: `https://` is anonymous GET, `s3://bucket/prefix` is authenticated S3 (SigV4). TLS is mandatory for both. Credentials, region, proxy and CA come from standard environment variables, never from `epicenter.toml`.
+- `url` selects the transport: `https://` is anonymous GET, `s3://bucket/prefix` is authenticated S3 (SigV4). TLS is mandatory for both; redirects and non-identity content encodings are refused. Region and credentials come from `AWS_REGION`/`AWS_DEFAULT_REGION` and the AWS environment or a shared profile; custom S3-compatible endpoints use `AWS_ENDPOINT_URL_S3`. The credentials file must be a regular, owner-only file (`0600`/private DACL). Proxies and `SSL_CERT_FILE` are environment-only. No IMDS/ECS metadata, and no secrets in `epicenter.toml`. Unix builds use `rustls`; Windows uses the OS Schannel provider, with the same certificate-validation policy.
 - `publisher_key` is the pinned Ed25519 public key, 64 hex characters. The short key id is derived from its fingerprint (`ed25519:<16 hex>`). Obtain the key from the CI job summary or an admin-managed channel, **never from the bucket**.
 - The remote import cache defaults to the per-user OS cache (`$XDG_CACHE_HOME/epicenter/remote`, `~/Library/Caches/epicenter/remote`, or `%LOCALAPPDATA%\epicenter\remote`); it is not configurable in the policy file.
 - `epicenter setup --remote-url URL --remote-key HEX|FILE --remote-tier libraries|full` writes the global table and prints the derived key id. `--remote-off` removes it.
 - `epicenter exec --no-remote` and `epicenter store restore --no-remote` force a local-only operation.
-- `doctor` reports the effective tier/source, enabled state, endpoint, key id, transport/region and cache path; `--json` uses the same shape. It also warns when an S3 endpoint has no `AWS_REGION`/`AWS_DEFAULT_REGION`.
+- `doctor` reports the effective tier/source, enabled state, endpoint, key id, transport/region, cache path, credential source and resolved S3 endpoint; `--json` uses the same shape. It warns when an S3 endpoint has no region or credentials.
 
 **Publisher-key handoff:** CI prints the public key and its key id; a developer copies the exact `setup --remote-key ...` command or file from that trusted output. A key fetched from the bucket is only a TOFU hint, not a trust anchor, and epicenter does not use it automatically.
 
@@ -429,9 +627,9 @@ Readers verify the pointer signature, key id, sequence/expiry, body hash/size/ca
 
 When the configured store is read-only, imported units go to `<remote.cache>/<endpoint+key-id>/store` and restore layers the main store first, then that cache store. The cache store is an ordinary signed vault: it is the seam for a host-populated **read-only** cache in the later multi-VM topology. A shared writable cache is out of scope. The hidden `store fetch [--dry-run] [--unit Q] [--all]` command verifies and imports without running a build; `--all` is required when no lock is available.
 
-### CI Publisher (P3.4)
+### CI Publisher
 
-CI is the only trusted publisher. The hidden `epicenter store publish` command turns **one store generation** into a signed local staging tree and an ordered upload plan:
+CI is the only trusted publisher. The hidden `epicenter store publish` command turns **one store generation** into a signed index, uploads it with conditional S3 writes, and prints the reader handoff:
 
 ```bash
 epicenter exec --harvest -- cargo build --locked
@@ -446,16 +644,19 @@ epicenter store publish \
 - `libraries` publishes only non-executable library units; `full` also includes build-script compile/run units. Proc-macro `.so` units are executable and therefore `full`-only.
 - A generation with several profiles requires `--profile`. Use `--generation` to override the active parity key and `--toolchain` when the build used a rustup selector.
 - Vault gzip objects are reused; the publisher verifies the decoded size/hash and the stored bytes before staging. It never recompresses.
-- It writes `blobs/`, `indexes/`, `publisher.json` and `index.json` into a private staging directory (`--out-dir`), verifies the tree through the reader path, and returns the ordered upload plan. Transport upload is P3.6.
+- It writes `blobs/`, `indexes/`, `publisher.json` and `index.json` into a private staging directory (`--out-dir`) and verifies the tree through the reader path.
+- Uploads use SigV4: immutable blobs and the index body are put-if-absent; `publisher.json` and `index.json` are written last. Blobs of 100 MiB or more use multipart upload with bounded part concurrency and abort on failure. The pointer uses `If-Match`/`If-None-Match`, is read back after upload, and a same-sequence pointer with different bytes is refused.
+- IAM: readers need `s3:GetObject` on `prefix/*`. Publishers need `s3:GetObject` and `s3:PutObject` on `prefix/*`, plus `s3:AbortMultipartUpload` (multipart cleanup). `s3:ListBucket` is optional: it only turns a missing-object `HEAD` into a clean 404 instead of 403, and the publisher treats both as absent. No `s3:DeleteObject` is used.
 - `--sequence` is only for explicit recovery; the default advances past the staged index and refuses a rollback. `--valid-for` defaults to `30d` (max `90d`).
+- Configure a bucket lifecycle rule that aborts incomplete multipart uploads (for example after one day). The publisher aborts its own parts on failure, but a lost `CreateMultipartUpload` response can still leave an orphan.
 
 **Publisher identity.** The CI job owns the signing identity. On first publish the publisher creates a private key under the OS state directory (`$XDG_STATE_HOME/epicenter/publisher`, macOS Application Support, or `%LOCALAPPDATA%\epicenter\publisher`; override with `--publisher-state` or `EPICENTER_PUBLISHER_STATE`). It prints the public key and the exact `setup` handoff in the job summary; later publishes reuse the identity silently.
 
-- The identity directory must be **persistent and private**. Do not put it in a CI cache, artifact, repository, bucket or the vault.
+- The identity directory must be **persistent and private**. It also stores the last published sequence/ETag per endpoint, so a missing remote index cannot silently restart at 1. Do not put it in a CI cache, artifact, repository, bucket or the vault.
 - If an index already exists but the identity is missing, the publisher fails closed instead of silently rotating. Restore the directory or use `--rotate-key` and re-pin readers.
 - `--rotate-key` is manual. Readers must re-pin through the trusted channel; there is no automatic rotation.
 - The private key is never accepted on the command line and never printed. `--expect-key-id` (or the global `publisher_key`) rejects an unexpected identity before signing.
-- P3.4 stages locally and therefore cannot see an existing remote `index.json`. In CI that publishes to a bucket which already has an index, set `--expect-key-id` (or the global `publisher_key`) so a lost identity fails closed instead of silently creating a new one. P3.6 will fetch the remote pointer before staging.
+- The publisher fetches the remote `index.json` before staging, verifies its signature and key id, and advances the sequence. If the pointer is missing but `publisher.json` or publisher state says this bucket was published before, it fails closed unless `--reset-sequence` is explicit. `--dry-run` fetches the pointer read-only, stages locally and prints the plan without writing.
 
 The printed handoff is public data:
 
@@ -625,7 +826,7 @@ epicenter store evict --work-dir agent-1 --yes
 | `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault, filtered by the cwd `Cargo.lock` when present |
 | `epicenter store restore --no-remote ...` | Skip remote compatible-unit fetch while restoring |
 | `epicenter store fetch [--dry-run] [--unit <Q>] [--all]` (hidden) | Verify/import compatible remote units without running a build |
-| `epicenter store publish ...` (hidden) | CI-only: sign one store generation into a local staging tree and print the upload plan |
+| `epicenter store publish ...` (hidden) | CI-only: sign, conditionally upload and print the remote index handoff (`--dry-run` stages only) |
 | `epicenter store vault` | List vault generations, sizes, and active status |
 | `epicenter store verify` | Verify vault file sizes, timestamps, hashes, and list active `work/` dirs |
 | `epicenter store overlap [--json] [--detail]` | Report package/profile variants, unique bytes, and active units in the vault |

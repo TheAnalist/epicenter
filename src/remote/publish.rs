@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use super::{
     BlobRef, Compression, FileRole, IndexBody, IndexPointer, LocalEnvironment,
-    MAX_INDEX_VALIDITY_SECS, PublisherMetadata, RemoteFile, RemoteUnit, RemoteUnitKind,
-    SCHEMA_VERSION, SignedIndex, SourceKind, UnitSource, Upload, make_index, now_secs, read_capped,
-    sha256_hex, upload_plan, write_index_tree,
+    MAX_INDEX_VALIDITY_SECS, PublisherMetadata, RemoteFile, RemotePointer, RemoteUnit,
+    RemoteUnitKind, SCHEMA_VERSION, SignedIndex, SourceKind, UnitSource, Upload, make_index,
+    now_secs, read_capped, sha256_hex, upload_plan, write_index_tree,
 };
 use crate::fingerprint;
 use crate::lockfile::{LockIndex, LockSource};
@@ -39,9 +39,16 @@ pub struct PublishRequest<'a> {
     /// Rustup selector used for the build (`nightly`, `1.91.0`, ...).
     pub selector: Option<&'a str>,
     pub sequence: Option<u64>,
-    /// The current remote pointer, when the transport already fetched it.
-    /// Local staging reads its own `index.json` when this is absent.
-    pub current_pointer: Option<&'a IndexPointer>,
+    /// The current remote pointer fetched by the transport. Local staging
+    /// reads its own `index.json` when this is absent.
+    pub current: Option<&'a RemotePointer>,
+    /// Explicitly allow a missing remote index when the publisher state or a
+    /// prior `publisher.json` says this bucket was published before.
+    pub reset_sequence: bool,
+    /// Local-only mode: read the last pointer from the private staging tree
+    /// when the caller did not fetch a remote one. Network publishers must set
+    /// this to false so a deleted remote index is never masked by stale staging.
+    pub allow_staged_pointer: bool,
     pub valid_for: Duration,
     pub source_commit: &'a str,
     pub ci_job: &'a str,
@@ -123,12 +130,13 @@ pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
     );
 
     let _publish_lock = crate::util::FileLock::acquire(&out_dir.join(".publish.lock"))?;
-    let current = match request.current_pointer {
-        Some(pointer) => {
-            pointer.validate_shape()?;
-            Some(pointer.clone())
+    let current = match request.current {
+        Some(remote) => {
+            remote.pointer.validate_shape()?;
+            Some(remote.pointer.clone())
         }
-        None => read_current_pointer(&out_dir)?,
+        None if request.allow_staged_pointer => read_current_pointer(&out_dir)?,
+        None => None,
     };
     let current_key_id = current.as_ref().map(|pointer| pointer.key_id.as_str());
     let state_dir = publisher_state_dir(request.publisher_state)?;
@@ -144,6 +152,32 @@ pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
         state_real != out_real,
         "publisher identity directory and staging directory must be different"
     );
+    let previous = PublisherState::load(&state_dir, &url)?;
+    if !request.reset_sequence
+        && let Some(previous) = &previous
+    {
+        if let Some(current) = &current {
+            ensure!(
+                current.sequence >= previous.sequence,
+                "remote index sequence {} is older than the publisher state sequence {}; \
+                 refusing a rollback (use --reset-sequence only after investigating)",
+                current.sequence,
+                previous.sequence
+            );
+            ensure!(
+                current.sequence != previous.sequence
+                    || current.body_sha256 == previous.body_sha256,
+                "remote index reuses sequence {} with different bytes; refusing equivocation",
+                current.sequence
+            );
+        } else {
+            anyhow::bail!(
+                "the remote index is missing but publisher state records sequence {}; \
+                 refusing to restart at 1 (use --reset-sequence only after investigating)",
+                previous.sequence
+            );
+        }
+    }
     let identity = resolve_identity(
         &state_dir,
         &bucket,
@@ -451,6 +485,78 @@ fn read_current_pointer(out_dir: &Path) -> Result<Option<IndexPointer>> {
         serde_json::from_slice(&bytes).context("parsing the staged index pointer")?;
     pointer.validate_shape()?;
     Ok(Some(pointer))
+}
+
+/// Publisher-side rollback protection. This is not a reader trust anchor; it
+/// prevents a lost/deleted remote pointer from silently restarting at 1.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublisherState {
+    schema: u32,
+    endpoint: String,
+    key_id: String,
+    sequence: u64,
+    pointer_etag: Option<String>,
+    body_sha256: String,
+    updated: u64,
+}
+
+impl PublisherState {
+    fn path(state_dir: &Path, url: &str) -> Result<PathBuf> {
+        let id = sha256_hex(url.as_bytes());
+        Ok(state_dir.join(format!("publish-{}.json", &id[..16])))
+    }
+
+    fn load(state_dir: &Path, url: &str) -> Result<Option<Self>> {
+        let path = Self::path(state_dir, url)?;
+        if crate::util::probe_file(&path, "publisher state")?.is_none() {
+            return Ok(None);
+        }
+        let bytes = read_capped(&path, 8 * 1024, "publisher state")?;
+        let state: Self = serde_json::from_slice(&bytes)
+            .context("parsing the publisher state; remove it only after investigating")?;
+        ensure!(
+            state.schema == 1,
+            "publisher state schema {} is not supported",
+            state.schema
+        );
+        ensure!(
+            state.endpoint == url,
+            "publisher state belongs to a different endpoint"
+        );
+        ensure!(state.sequence > 0, "publisher state has no sequence");
+        Ok(Some(state))
+    }
+
+    fn record(
+        state_dir: &Path,
+        url: &str,
+        pointer: &IndexPointer,
+        pointer_etag: Option<String>,
+    ) -> Result<()> {
+        let state = Self {
+            schema: 1,
+            endpoint: url.to_string(),
+            key_id: pointer.key_id.clone(),
+            sequence: pointer.sequence,
+            pointer_etag,
+            body_sha256: pointer.body_sha256.clone(),
+            updated: now_secs(),
+        };
+        let path = Self::path(state_dir, url)?;
+        let bytes = serde_json::to_vec_pretty(&state)?;
+        crate::util::write_atomic_private(&path, &bytes)
+    }
+}
+
+/// Record a successful upload after the pointer was replaced.
+pub fn record_publish_state(outcome: &PublishOutcome, pointer_etag: Option<String>) -> Result<()> {
+    PublisherState::record(
+        &outcome.publisher_state,
+        &outcome.url,
+        outcome.index.pointer(),
+        pointer_etag,
+    )
 }
 
 fn choose_sequence(explicit: Option<u64>, current: Option<&IndexPointer>) -> Result<u64> {
@@ -959,6 +1065,33 @@ mod tests {
     }
 
     #[test]
+    fn publisher_state_records_sequence_and_endpoint() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pointer = IndexPointer {
+            schema: SCHEMA_VERSION,
+            key_id: "ed25519:0123456789abcdef".into(),
+            sequence: 7,
+            created: 1,
+            expires: 2,
+            body_sha256: "ab".repeat(32),
+            body_size: 1,
+            signature: "00".repeat(64),
+        };
+        PublisherState::record(
+            dir.path(),
+            "s3://bucket/prefix",
+            &pointer,
+            Some("etag".into()),
+        )?;
+        let loaded =
+            PublisherState::load(dir.path(), "s3://bucket/prefix")?.expect("publisher state");
+        assert_eq!(loaded.sequence, 7);
+        assert_eq!(loaded.pointer_etag.as_deref(), Some("etag"));
+        assert!(PublisherState::load(dir.path(), "s3://bucket/other")?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn publishes_a_store_generation_end_to_end() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = temp.path().join("store");
@@ -1039,7 +1172,9 @@ mod tests {
             profile: Some("debug"),
             selector: None,
             sequence: None,
-            current_pointer: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: true,
             valid_for: Duration::from_secs(3_600),
             source_commit: "0123456789abcdef0123456789abcdef01234567",
             ci_job: "ci/test",

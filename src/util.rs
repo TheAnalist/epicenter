@@ -915,6 +915,7 @@ pub fn check_private_dir(path: &Path, privacy: Privacy) -> Result<()> {
             path.display()
         );
     }
+    // set permissions only on unix systems
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -932,6 +933,8 @@ pub fn check_private_dir(path: &Path, privacy: Privacy) -> Result<()> {
             }
         }
     }
+    // only checks is permitted to write
+    // does not set permissions.
     #[cfg(windows)]
     if windows_acl_is_private(path) != Some(true) {
         anyhow::bail!(

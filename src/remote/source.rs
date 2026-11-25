@@ -1,6 +1,6 @@
 //! Read-only remote object source.
 //!
-//! P3.6 supplies the HTTPS/S3 implementation. Keeping the trait read-only
+//! HTTPS/S3 implementations live in `transport`. Keeping the trait read-only
 //! makes "a reader never writes the bucket" structural: there is no method
 //! that can put or delete an object.
 
@@ -8,13 +8,30 @@ use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use super::transport::is_miss;
 use super::{MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES, blob_path, body_path, read_capped};
 use crate::util;
 
+/// The small signed pointer plus the cache validator for the publisher.
+pub struct FetchedPointer {
+    pub bytes: Vec<u8>,
+    pub etag: Option<String>,
+}
+
 /// A read-only view of one remote bucket prefix.
-pub trait RemoteSource {
+pub trait RemoteSource: Send + Sync {
     /// Fetch the small signed pointer.
     fn fetch_pointer(&self) -> Result<Vec<u8>>;
+
+    /// Fetch the pointer, preserving `None` for a clean 404. The publisher uses
+    /// this to distinguish a first publish from an authorization failure.
+    fn fetch_pointer_optional(&self) -> Result<Option<FetchedPointer>> {
+        match self.fetch_pointer() {
+            Ok(bytes) => Ok(Some(FetchedPointer { bytes, etag: None })),
+            Err(err) if is_miss(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
 
     /// Fetch one canonical index body. The cap is enforced before parsing.
     fn fetch_body(&self, sha256: &str, max_bytes: u64) -> Result<Vec<u8>>;
@@ -80,13 +97,14 @@ impl RemoteSource for DirSource {
 }
 
 /// Source factory for configured endpoints.
-///
-/// P3.5 lands the reader/import path; the network implementation is P3.6.
 pub fn source_for(remote: &crate::settings::RemotePolicy) -> Result<Box<dyn RemoteSource>> {
-    let endpoint = remote
-        .redacted_url()
-        .unwrap_or_else(|| "<unconfigured>".to_string());
-    bail!(
-        "remote transport for {endpoint} lands in P3.6; this build has only the local reader source"
-    )
+    let config = super::transport::TransportConfig::from_policy(remote)?;
+    match &config.endpoint {
+        super::transport::Endpoint::Https(_) => {
+            Ok(Box::new(super::transport::HttpsSource::new(&config)?))
+        }
+        super::transport::Endpoint::S3(_) => {
+            Ok(Box::new(super::transport::S3Source::new(&config)?))
+        }
+    }
 }

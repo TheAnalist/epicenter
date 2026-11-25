@@ -449,12 +449,16 @@ fn ensure_store_root(store_root: &Path) -> Result<()> {
             // Refuse a read-only store before Repair can chmod it. The write
             // probe runs after the repair if a later write needs it.
             check_store_writable(store_root, "harvest/import")?;
+            // To avoid double checking of DACL
+            #[cfg(unix)]
             util::check_private_dir(store_root, util::Privacy::Repair)?;
         }
-        None => util::create_private_dir_all(store_root)?,
+        None => {
+            util::create_private_dir_all(store_root)?;
+            #[cfg(windows)]
+            require_private_windows_acl(store_root, "store root")?;
+        }
     }
-    #[cfg(windows)]
-    require_private_windows_acl(store_root, "store root")?;
     write_marker(&store_root.join(STORE_MARKER))?;
     Ok(())
 }

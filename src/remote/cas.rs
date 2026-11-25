@@ -284,6 +284,7 @@ pub struct Upload {
     pub sha256: String,
     pub size: u64,
     pub mode: UploadMode,
+    pub kind: UploadKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +293,14 @@ pub enum UploadMode {
     PutIfAbsent,
     /// Replace atomically; only the pointer and the human-readable report.
     Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadKind {
+    Blob,
+    Body,
+    Publisher,
+    Pointer,
 }
 
 /// Plan the upload for a signed index tree. Blobs and the body are
@@ -310,6 +319,7 @@ pub fn upload_plan(root: &Path, index: &SignedIndex) -> Result<Vec<Upload>> {
             &file.blob,
             file.blob_size,
             UploadMode::PutIfAbsent,
+            UploadKind::Blob,
         )?);
     }
     uploads.sort_by(|left, right| left.key.cmp(&right.key));
@@ -320,6 +330,7 @@ pub fn upload_plan(root: &Path, index: &SignedIndex) -> Result<Vec<Upload>> {
         &pointer.body_sha256,
         pointer.body_size,
         UploadMode::PutIfAbsent,
+        UploadKind::Body,
     )?);
 
     let report = publisher_report(index)?;
@@ -329,6 +340,7 @@ pub fn upload_plan(root: &Path, index: &SignedIndex) -> Result<Vec<Upload>> {
         &sha256_hex(&report),
         report.len() as u64,
         UploadMode::Replace,
+        UploadKind::Publisher,
     )?);
 
     let pointer_bytes = index.pointer_bytes()?;
@@ -338,6 +350,7 @@ pub fn upload_plan(root: &Path, index: &SignedIndex) -> Result<Vec<Upload>> {
         &sha256_hex(&pointer_bytes),
         pointer_bytes.len() as u64,
         UploadMode::Replace,
+        UploadKind::Pointer,
     )?);
     Ok(uploads)
 }
@@ -348,15 +361,31 @@ fn upload_source(
     expected_sha256: &str,
     expected_size: u64,
     mode: UploadMode,
+    kind: UploadKind,
 ) -> Result<Upload> {
     super::validate::relative_path(&key, "upload object key", MAX_OBJECT_KEY_BYTES)?;
-    crate::util::verify_file_hash(&source, expected_size, expected_sha256, "upload source")?;
+    // The publisher already verified the staged tree. For large blobs, avoid a
+    // second full read here: the multipart uploader hashes each part and the
+    // store/staging source is immutable. Small metadata objects are cheap and
+    // still get the strict hash check.
+    if expected_size <= 64 * 1024 * 1024 {
+        crate::util::verify_file_hash(&source, expected_size, expected_sha256, "upload source")?;
+    } else {
+        let meta = crate::util::metadata_nofollow(&source)
+            .with_context(|| format!("inspecting upload source {}", source.display()))?;
+        ensure!(
+            meta.is_file() && meta.len() == expected_size,
+            "upload source {} has the wrong size (expected {expected_size})",
+            source.display()
+        );
+    }
     Ok(Upload {
         key,
         source,
         sha256: expected_sha256.to_string(),
         size: expected_size,
         mode,
+        kind,
     })
 }
 

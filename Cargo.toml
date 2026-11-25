@@ -29,8 +29,17 @@ toml = "0.8"
 toml_edit = "0.22"
 walkdir = "2"
 ed25519-dalek = "2"
+rustls-native-certs = "0.8.5"
+rustls-pemfile = "2.2.0"
+hmac = "0.12"
+url = "2.5.9"
+time = { version = "0.3.55", features = ["formatting"] }
+
+[target.'cfg(unix)'.dependencies]
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
+ureq = { version = "3.5.2", default-features = false, features = ["native-tls"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -44,6 +53,10 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+rcgen = "0.14.10"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 
 [profile.release]
 lto = "thin"

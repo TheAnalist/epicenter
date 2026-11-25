@@ -1378,6 +1378,39 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
                 "remote S3 transport has no region in AWS_REGION/AWS_DEFAULT_REGION",
             ));
         }
+        if profile.remote_transport == "s3" {
+            match crate::remote::Credentials::load() {
+                Ok(credentials) => {
+                    let source = match credentials.source() {
+                        crate::remote::CredentialSource::Environment => "environment",
+                        crate::remote::CredentialSource::Profile { .. } => "shared profile",
+                    };
+                    checks.push(check(
+                        SEC_CONFIG,
+                        Level::Pass,
+                        format!("remote credentials: {source} (secrets redacted)"),
+                    ));
+                }
+                Err(err) => checks.push(check(
+                    SEC_CONFIG,
+                    Level::Warn,
+                    format!("remote credentials unavailable: {err:#}"),
+                )),
+            }
+            if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL_S3") {
+                let parsed = url::Url::parse(&endpoint).ok();
+                let https = parsed.as_ref().is_some_and(|url| url.scheme() == "https");
+                let host = parsed
+                    .as_ref()
+                    .and_then(|url| url.host_str())
+                    .unwrap_or("<invalid>");
+                checks.push(check(
+                    SEC_CONFIG,
+                    if https { Level::Pass } else { Level::Warn },
+                    format!("remote S3 endpoint: {host}"),
+                ));
+            }
+        }
         checks.push(check(
             SEC_CONFIG,
             Level::Info,
@@ -1385,17 +1418,14 @@ pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)
         ));
         if let Some(ca) = std::env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
             let ca = PathBuf::from(ca);
+            let usable = ca.is_file();
             checks.push(check(
                 SEC_CONFIG,
-                if ca.is_file() {
-                    Level::Pass
-                } else {
-                    Level::Warn
-                },
+                if usable { Level::Pass } else { Level::Warn },
                 format!(
                     "remote CA: SSL_CERT_FILE {}{}",
                     ca.display(),
-                    if ca.is_file() { "" } else { " (missing)" }
+                    if usable { "" } else { " (missing)" }
                 ),
             ));
         } else {

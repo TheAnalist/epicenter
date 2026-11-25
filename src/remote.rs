@@ -20,7 +20,8 @@
 //! private staging root; transport uploads are a separate layer. On the reader
 //! side, the same tree is mirrored under the per-user remote cache, verified,
 //! filtered and imported into the local vault (or the cache store when the
-//! configured vault is read-only). The network source lands in P3.6.
+//! configured vault is read-only). Anonymous HTTPS reads and signed S3 reads,
+//! multipart writes and conditional pointer replacement live in `transport`.
 
 mod cache;
 mod cas;
@@ -28,16 +29,19 @@ mod compat;
 mod index;
 mod publish;
 mod reader;
+mod sink;
 mod source;
 mod state;
+mod transport;
+mod upload;
 pub(crate) mod validate;
 
 #[cfg(test)]
 mod tests;
 
 pub use cas::{
-    BlobRef, Compression, MAX_IN_MEMORY_BLOB_BYTES, Upload, UploadMode, decode_blob, read_blob,
-    upload_plan, verify_blob, write_blob,
+    BlobRef, Compression, MAX_IN_MEMORY_BLOB_BYTES, Upload, UploadKind, UploadMode, decode_blob,
+    read_blob, upload_plan, verify_blob, write_blob,
 };
 pub use compat::{
     Compatibility, LocalEnvironment, Mismatch, RegistryIdentity, RustcIdentity, UnitCompatibility,
@@ -48,12 +52,18 @@ pub use index::{
     RemoteUnitKind, SignedIndex, SourceKind, UnitSource, VerifiedIndex, make_index,
     publisher_report, read_index_tree, verify_body, verify_index, write_index_tree,
 };
-pub use publish::{PublishOutcome, PublishRequest, publish};
+pub use publish::{PublishOutcome, PublishRequest, publish, record_publish_state};
 pub use reader::{FetchReport, FetchRequest, fetch_and_import, preview};
-pub use source::{DirSource, RemoteSource, source_for};
+pub use sink::{ObjectMeta, Precondition, PutOutcome, PutStatus, RemoteSink};
+pub use source::{DirSource, FetchedPointer, RemoteSource, source_for};
 pub use state::{
     IndexStatus, RemoteState, clear_state, load_state, record_state, state_path, status,
 };
+pub use transport::{
+    CredentialSource, Credentials, Endpoint, HttpsEndpoint, HttpsSource, S3Addressing, S3Client,
+    S3Endpoint, S3Sink, S3Source, TransportConfig, TransportError,
+};
+pub use upload::{RemotePointer, UploadReport, UploadRequest, upload, validate_order};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};

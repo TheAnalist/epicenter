@@ -2,6 +2,7 @@
 //! fetch only their blobs, and import them into the local vault.
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -279,15 +280,25 @@ pub fn fetch_and_import(request: &FetchRequest<'_>) -> Result<FetchReport> {
             });
         }
     }
-    for blob in blobs.values() {
-        if let Err(err) = cache.install_blob(request.source, blob) {
-            return Ok(fallback(
-                report,
-                format!(
-                    "fetching blob {}: {err:#}",
-                    &blob.blob[..12.min(blob.blob.len())]
-                ),
-            ));
+    let fetch_blob = |blob: &BlobRef| {
+        cache.install_blob(request.source, blob).map_err(|err| {
+            anyhow::anyhow!(
+                "fetching blob {}: {err:#}",
+                &blob.blob[..12.min(blob.blob.len())]
+            )
+        })
+    };
+    let workers = crate::settings::copy_workers();
+    let fetched: Vec<Result<()>> = if blobs.len() > 1 && workers > 1 {
+        let values: Vec<&BlobRef> = blobs.values().collect();
+        crate::settings::copy_pool()
+            .install(|| values.par_iter().map(|blob| fetch_blob(blob)).collect())
+    } else {
+        blobs.values().map(fetch_blob).collect()
+    };
+    for result in fetched {
+        if let Err(err) = result {
+            return Ok(fallback(report, format!("{err:#}")));
         }
     }
     let imports = build_imports(&selected, &cache)?;

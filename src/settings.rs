@@ -805,6 +805,39 @@ fn validate_https_url(rest: &str) -> Result<()> {
         !authority.contains('@'),
         "`[remote] url` must not embed credentials; use the environment path"
     );
+    let path = rest
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    validate_remote_prefix(path, "`[remote] url`")?;
+    Ok(())
+}
+
+fn validate_remote_prefix(path: &str, what: &str) -> Result<()> {
+    ensure!(
+        !path.starts_with('/'),
+        "{what} path must not begin with an empty component"
+    );
+    let path = path.strip_suffix('/').unwrap_or(path);
+    if path.is_empty() {
+        return Ok(());
+    }
+    for component in path.split('/') {
+        ensure!(
+            !component.is_empty() && component != "." && component != "..",
+            "{what} path must not contain empty, `.` or `..` components"
+        );
+        let lower = component.to_ascii_lowercase();
+        ensure!(
+            !lower.contains("%2e")
+                && !lower.contains("%2f")
+                && !lower.contains("%5c")
+                && !component
+                    .chars()
+                    .any(|ch| { ch.is_control() || crate::remote::validate::is_unsafe_format(ch) }),
+            "{what} path contains an encoded traversal or control character"
+        );
+    }
     Ok(())
 }
 
@@ -819,26 +852,41 @@ fn validate_s3_url(rest: &str) -> Result<()> {
         !bucket.is_empty() && bucket != "." && bucket != "..",
         "`[remote] url` s3:// URL is missing a valid bucket"
     );
-    ensure!(
-        bucket
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
-        "`[remote] url` s3:// bucket {bucket:?} contains unsupported characters"
-    );
+    let custom = std::env::var_os("AWS_ENDPOINT_URL_S3").is_some_and(|value| !value.is_empty());
+    if custom {
+        ensure!(
+            bucket.len() <= 255
+                && bucket
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+            "`[remote] url` s3:// bucket {bucket:?} contains unsupported characters"
+        );
+    } else {
+        ensure!(
+            (3..=63).contains(&bucket.len())
+                && bucket.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'-')
+                })
+                && bucket
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && bucket
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && !bucket.contains(".."),
+            "`[remote] url` s3:// bucket {bucket:?} does not follow AWS bucket naming rules"
+        );
+    }
 
     ensure!(
         !prefix.starts_with('/'),
         "`[remote] url` s3:// prefix must not begin with an empty component"
     );
-    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
-    if !prefix.is_empty() {
-        for component in prefix.split('/') {
-            ensure!(
-                !component.is_empty() && component != "." && component != "..",
-                "`[remote] url` s3:// prefix must not contain empty, `.` or `..` components"
-            );
-        }
-    }
+    validate_remote_prefix(prefix, "`[remote] url` s3:// prefix")?;
     Ok(())
 }
 
@@ -882,7 +930,7 @@ pub fn remote_key_id(public_key: &str) -> Result<String> {
     ))
 }
 
-fn aws_region() -> Option<String> {
+pub fn aws_region() -> Option<String> {
     ["AWS_REGION", "AWS_DEFAULT_REGION"]
         .iter()
         .find_map(|name| {
@@ -1307,8 +1355,11 @@ mod tests {
         for bad in [
             "https://cache.example/root\\evil",
             "https://cache.example/root#fragment",
+            "https://cache.example/../root",
+            "https://cache.example/%2e%2e/root",
             "s3://bucket/../prefix",
             "s3://bucket//prefix",
+            "s3://bucket/%2e%2e/prefix",
         ] {
             write(
                 &global,

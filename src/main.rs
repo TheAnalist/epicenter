@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use epicenter_cli::remote::RemoteSource as _;
 use epicenter_cli::util::metadata_nofollow;
 use epicenter_cli::{
     config, doctor, exec, lockfile, paths, profile, prune, remote, settings, status, util, vault,
@@ -396,6 +397,13 @@ struct PublishArgs {
     /// Path to Cargo.lock (default: nearest lock above the working directory).
     #[arg(long)]
     lockfile: Option<PathBuf>,
+    /// Fetch the current remote pointer, stage, and print the plan without writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Explicitly allow a missing remote index when publisher state or a prior
+    /// publisher.json says this bucket was published before.
+    #[arg(long)]
+    reset_sequence: bool,
 }
 
 #[derive(clap::Args)]
@@ -530,7 +538,7 @@ enum StoreCommand {
     /// Verify and import compatible remote units without running a build.
     #[command(hide = true)]
     Fetch(FetchArgs),
-    /// CI-only: sign a local index and stage the immutable object tree.
+    /// CI-only: sign one store generation and upload the immutable object tree.
     #[command(hide = true)]
     Publish(PublishArgs),
 }
@@ -667,11 +675,13 @@ fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> 
             .context("no `[remote] url`; pass `--url s3://bucket/prefix`")?,
     };
     let expected_key_id = match args.expect_key_id.as_deref() {
-        Some(raw) if raw.contains(':') => Some(raw.to_string()),
-        Some(raw) => {
+        // A full public key (with or without the `ed25519:` prefix) is
+        // normalized to the short id that signs the index.
+        Some(raw) if settings::is_publisher_key_hex(raw) => {
             let key = settings::normalize_remote_publisher_key(raw)?;
             Some(settings::remote_key_id(&key)?)
         }
+        Some(raw) => Some(raw.to_string()),
         // A rotation deliberately changes the pinned identity; do not treat
         // the old global pin as an expectation for the new key.
         None if args.rotate_key => None,
@@ -684,6 +694,45 @@ fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> 
     let store_root = vault::store_root(&build_root);
     let cwd = std::env::current_dir().context("resolving the working directory")?;
 
+    let region = policy
+        .region
+        .clone()
+        .or_else(settings::aws_region)
+        .context("the S3 publisher requires AWS_REGION or AWS_DEFAULT_REGION")?;
+    let transport = remote::TransportConfig::for_s3(&url, &region)?;
+    let client = std::sync::Arc::new(remote::S3Client::new(&transport)?);
+    let source = remote::S3Source::from_client(client.clone());
+    let sink = remote::S3Sink::from_client(client);
+    let expected_public_key = args
+        .expect_key_id
+        .as_deref()
+        .filter(|raw| settings::is_publisher_key_hex(raw));
+    let mut current: Option<remote::RemotePointer> = None;
+    if let Some(fetched) = source.fetch_pointer_optional()? {
+        let pointer: remote::IndexPointer =
+            serde_json::from_slice(&fetched.bytes).context("parsing the remote index pointer")?;
+        let verify_key = expected_public_key
+            .or(policy.publisher_key.as_deref())
+            .context(
+                "a remote index exists; verifying it needs the full publisher public key \
+                 (64 hex, not a short key id) via --expect-key-id or `setup --remote-key`",
+            )?;
+        pointer.verify_signature(verify_key)?;
+        current = Some(remote::RemotePointer {
+            pointer,
+            etag: fetched.etag,
+        });
+    }
+    if current.is_none()
+        && !args.reset_sequence
+        && sink.head_lenient(remote::PUBLISHER_FILE)?.is_some()
+    {
+        anyhow::bail!(
+            "remote publisher.json exists but index.json is missing; \
+             refusing to restart at sequence 1 (use --reset-sequence only after investigating)"
+        );
+    }
+
     let outcome = remote::publish(&remote::PublishRequest {
         store_root: &store_root,
         cwd: &cwd,
@@ -693,7 +742,9 @@ fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> 
         profile: args.profile.as_deref(),
         selector: args.toolchain.as_deref(),
         sequence: args.sequence,
-        current_pointer: None,
+        current: current.as_ref(),
+        reset_sequence: args.reset_sequence,
+        allow_staged_pointer: false,
         valid_for,
         source_commit: &source_commit,
         ci_job: &ci_job,
@@ -756,6 +807,26 @@ fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> 
             util::warn(util::GLYPH_WARN)
         );
     }
+    if args.dry_run {
+        println!(
+            "  {} staged only (dry run; no PUT/POST/DELETE, no publisher state update)",
+            label("upload")
+        );
+    } else {
+        let report = remote::upload(&remote::UploadRequest {
+            sink: &sink,
+            uploads: &outcome.uploads,
+            current: current.as_ref(),
+        })?;
+        remote::record_publish_state(&outcome, report.pointer_etag.clone())?;
+        println!(
+            "  {} {} uploaded · {} already present · {}",
+            label("upload"),
+            report.uploaded,
+            report.skipped,
+            util::green(&util::human_bytes(report.bytes))
+        );
+    }
     let reader_url = match args.reader_url.as_deref() {
         Some(raw) => settings::normalize_remote_url(raw)?,
         None => outcome.url.clone(),
@@ -771,8 +842,8 @@ fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> Result<()> 
     println!(
         "  {}",
         util::dim(
-            "upload `blobs/`, `indexes/`, `publisher.json`, then `index.json` last; \
-             the local staging tree is the upload plan"
+            "objects upload as blobs → index body → publisher.json → index.json last; \
+             the local staging tree remains available for inspection"
         )
     );
     Ok(())
@@ -2772,6 +2843,8 @@ mod cli_tests {
             "nightly",
             "--valid-for",
             "7d",
+            "--dry-run",
+            "--reset-sequence",
         ])
         .unwrap();
         match cli.command {
@@ -2783,6 +2856,8 @@ mod cli_tests {
                 assert_eq!(args.profile.as_deref(), Some("release"));
                 assert_eq!(args.toolchain.as_deref(), Some("nightly"));
                 assert_eq!(args.valid_for, "7d");
+                assert!(args.dry_run);
+                assert!(args.reset_sequence);
             }
             _ => panic!("expected store publish"),
         }
