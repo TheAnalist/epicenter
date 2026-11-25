@@ -4,8 +4,8 @@ use anyhow::{Result, bail};
 use std::io::Write;
 
 use super::http::{HttpClient, HttpRequest, Method};
-use super::{Endpoint, HttpsEndpoint, TransportConfig};
-use crate::remote::{FetchedPointer, MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES, RemoteSource};
+use super::{Endpoint, FetchedPointer, HttpsEndpoint, RemoteSource, TransportConfig};
+use crate::remote::{MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES};
 
 pub struct HttpsSource {
     client: HttpClient,

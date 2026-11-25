@@ -6,22 +6,25 @@
 //! parallel work, and a blocking client keeps the dependency surface small.
 
 mod credentials;
+mod fetch;
 mod http;
 mod https;
 mod s3;
 mod sigv4;
+mod url;
 
 pub use credentials::{CredentialSource, Credentials};
+pub use fetch::{FetchedPointer, RemoteSource};
 pub use https::HttpsSource;
 pub use s3::{S3Client, S3Sink, S3Source};
 
+use ::url::Url;
 use anyhow::{Context, Result, ensure};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
-use url::Url;
 
-use self::sigv4::aws_encode;
+use self::url::aws_encode;
 use crate::settings::{RemotePolicy, RemoteTransport};
 
 /// One resolved remote endpoint.
@@ -170,7 +173,7 @@ impl Endpoint {
     pub fn label(&self) -> String {
         match self {
             Endpoint::Https(endpoint) => endpoint.base.origin().ascii_serialization(),
-            Endpoint::S3(endpoint) => endpoint.base.origin().ascii_serialization(),
+            Endpoint::S3(endpoint) => endpoint.origin(),
         }
     }
 }
@@ -234,6 +237,14 @@ impl S3Endpoint {
             custom: is_custom,
             base,
         })
+    }
+
+    pub(crate) fn origin(&self) -> String {
+        self.base.origin().ascii_serialization()
+    }
+
+    pub(crate) fn base_host(&self) -> Option<&str> {
+        self.base.host_str()
     }
 
     pub fn url_for(&self, key: &str) -> Result<Url> {
@@ -523,6 +534,11 @@ impl TransportError {
             message: message.into(),
             request_id: None,
         }
+    }
+
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
     }
 
     pub fn is_miss(&self) -> bool {

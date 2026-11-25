@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
-use super::sigv4::aws_encode;
+use super::url::aws_encode;
 use super::{ErrorKind, RetryPolicy, TlsConfig, TransportConfig, TransportError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +151,7 @@ impl HttpResponse {
         let status = self.status;
         let request_id = self.header("x-amz-request-id").map(str::to_string);
         let code = self.read_error_code();
-        let mut err = TransportError::status(
+        Err(TransportError::status(
             status,
             format!(
                 "{what} failed{}",
@@ -159,9 +159,8 @@ impl HttpResponse {
                     .map(|code| format!(" ({code})"))
                     .unwrap_or_default()
             ),
-        );
-        err.request_id = request_id;
-        Err(err)
+        )
+        .with_request_id(request_id))
     }
 
     fn read_error_code(self) -> Option<String> {

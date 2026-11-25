@@ -4,6 +4,7 @@ use super::s3::{MAX_MULTIPART_PARTS, MultipartPlan};
 use super::*;
 use crate::remote::sink::{Precondition, PutStatus, RemoteSink};
 use crate::remote::{RemoteSource, Upload, UploadKind, UploadMode, sha256_hex};
+use ::url::Url;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::io::{Read, Write};
@@ -11,7 +12,6 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use url::Url;
 
 #[derive(Clone)]
 struct MockRequest {

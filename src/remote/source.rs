@@ -1,51 +1,20 @@
-//! Read-only remote object source.
+//! Read-only local directory source.
 //!
-//! HTTPS/S3 implementations live in `transport`. Keeping the trait read-only
-//! makes "a reader never writes the bucket" structural: there is no method
-//! that can put or delete an object.
+//! HTTPS/S3 implementations live alongside the [`RemoteSource`] trait in
+//! `transport::fetch`; this module only adapts a local directory tree.
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::transport::is_miss;
+use super::transport::RemoteSource;
 use super::{MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES, blob_path, body_path, read_capped};
 use crate::util;
-
-/// The small signed pointer plus the cache validator for the publisher.
-pub struct FetchedPointer {
-    pub bytes: Vec<u8>,
-    pub etag: Option<String>,
-}
-
-/// A read-only view of one remote bucket prefix.
-pub trait RemoteSource: Send + Sync {
-    /// Fetch the small signed pointer.
-    fn fetch_pointer(&self) -> Result<Vec<u8>>;
-
-    /// Fetch the pointer, preserving `None` for a clean 404. The publisher uses
-    /// this to distinguish a first publish from an authorization failure.
-    fn fetch_pointer_optional(&self) -> Result<Option<FetchedPointer>> {
-        match self.fetch_pointer() {
-            Ok(bytes) => Ok(Some(FetchedPointer { bytes, etag: None })),
-            Err(err) if is_miss(&err) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Fetch one canonical index body. The cap is enforced before parsing.
-    fn fetch_body(&self, sha256: &str, max_bytes: u64) -> Result<Vec<u8>>;
-
-    /// Stream one stored CAS object into `out`. Implementations must stop at
-    /// `max_bytes`; the cache verifies the stored hash/size afterwards.
-    fn fetch_blob(&self, sha256: &str, max_bytes: u64, out: &mut dyn Write) -> Result<()>;
-}
 
 /// Local directory source used by the reader tests and local diagnostics.
 ///
 /// It is deliberately not reachable from a policy URL: exposing a local file
-/// transport through `[remote]` would bypass the TLS requirement. P3.6 adds the
-/// network sources behind the same trait.
+/// transport through `[remote]` would bypass the TLS requirement.
 pub struct DirSource {
     root: PathBuf,
 }

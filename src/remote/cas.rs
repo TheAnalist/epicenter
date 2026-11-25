@@ -7,26 +7,17 @@
 //! replaced.
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    MAX_BLOB_BYTES, SignedIndex, blob_path, body_path, ensure_sha256, publisher_report, sha256_hex,
+    Compression, MAX_BLOB_BYTES, SignedIndex, blob_path, body_path, ensure_sha256,
+    publisher_report, sha256_hex,
 };
 use crate::util::{COMPRESS_MIN_BYTES, metadata_nofollow};
 
 const MAX_OBJECT_KEY_BYTES: usize = 4096;
-
-/// How a blob's stored bytes relate to the decoded file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Compression {
-    Gzip,
-    #[serde(rename = "none")]
-    Raw,
-}
 
 /// One immutable CAS object plus the decoded facts the index records.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use time::OffsetDateTime;
 
 use super::http::{Body, HttpRequest};
+use super::url::aws_encode;
 use super::{Credentials, ErrorKind, TransportError};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -184,20 +185,6 @@ fn canonical_query(pairs: &[(String, String)]) -> String {
         .join("&")
 }
 
-/// RFC 3986 encoding used by SigV4 (space is `%20`, never `+`).
-pub(crate) fn aws_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push('%');
-            out.push_str(&format!("{byte:02X}"));
-        }
-    }
-    out
-}
-
 fn amz_dates(now: u64) -> Result<(String, String), TransportError> {
     let timestamp = i64::try_from(now)
         .map_err(|_| TransportError::new(ErrorKind::Config, "system clock is out of range"))?;
@@ -264,12 +251,5 @@ mod tests {
         );
         assert!(authorization.contains("SignedHeaders=host;range;x-amz-content-sha256;x-amz-date"));
         Ok(())
-    }
-
-    #[test]
-    fn encodes_query_values_without_plus() {
-        assert_eq!(aws_encode("a b"), "a%20b");
-        assert_eq!(aws_encode("upload+id"), "upload%2Bid");
-        assert_eq!(aws_encode("a/b"), "a%2Fb");
     }
 }

@@ -25,10 +25,10 @@
 
 mod cache;
 mod cas;
-mod compat;
 mod index;
 mod publish;
 mod reader;
+mod schema;
 mod sink;
 mod source;
 mod state;
@@ -40,28 +40,29 @@ pub(crate) mod validate;
 mod tests;
 
 pub use cas::{
-    BlobRef, Compression, MAX_IN_MEMORY_BLOB_BYTES, Upload, UploadKind, UploadMode, decode_blob,
-    read_blob, upload_plan, verify_blob, write_blob,
-};
-pub use compat::{
-    Compatibility, LocalEnvironment, Mismatch, RegistryIdentity, RustcIdentity, UnitCompatibility,
-    compare_compatibility, source_path_hash,
+    BlobRef, MAX_IN_MEMORY_BLOB_BYTES, Upload, UploadKind, UploadMode, decode_blob, read_blob,
+    upload_plan, verify_blob, write_blob,
 };
 pub use index::{
-    FileRole, IndexBody, IndexPointer, PublisherMetadata, PublisherReport, RemoteFile, RemoteUnit,
-    RemoteUnitKind, SignedIndex, SourceKind, UnitSource, VerifiedIndex, make_index,
-    publisher_report, read_index_tree, verify_body, verify_index, write_index_tree,
+    IndexBody, IndexPointer, PublisherMetadata, PublisherReport, SignedIndex, VerifiedIndex,
+    make_index, publisher_report, read_index_tree, verify_body, verify_index, write_index_tree,
 };
 pub use publish::{PublishOutcome, PublishRequest, publish, record_publish_state};
 pub use reader::{FetchReport, FetchRequest, fetch_and_import, preview};
+pub use schema::{
+    Compatibility, Compression, FileRole, LocalEnvironment, Mismatch, RegistryIdentity, RemoteFile,
+    RemoteUnit, RemoteUnitKind, RustcIdentity, SourceKind, UnitCompatibility, UnitSource,
+    compare_compatibility, source_path_hash,
+};
 pub use sink::{ObjectMeta, Precondition, PutOutcome, PutStatus, RemoteSink};
-pub use source::{DirSource, FetchedPointer, RemoteSource, source_for};
+pub use source::{DirSource, source_for};
 pub use state::{
     IndexStatus, RemoteState, clear_state, load_state, record_state, state_path, status,
 };
 pub use transport::{
-    CredentialSource, Credentials, Endpoint, HttpsEndpoint, HttpsSource, S3Addressing, S3Client,
-    S3Endpoint, S3Sink, S3Source, TransportConfig, TransportError,
+    CredentialSource, Credentials, Endpoint, FetchedPointer, HttpsEndpoint, HttpsSource,
+    RemoteSource, S3Addressing, S3Client, S3Endpoint, S3Sink, S3Source, TransportConfig,
+    TransportError,
 };
 pub use upload::{RemotePointer, UploadReport, UploadRequest, upload, validate_order};
 

@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use super::http::{Body, HttpClient, HttpRequest, HttpResponse, Method};
 use super::sigv4::{SigV4Signer, hex_sha256};
-use super::{Endpoint, ErrorKind, S3Endpoint, TransportConfig, TransportError};
+use super::{
+    Endpoint, ErrorKind, FetchedPointer, RemoteSource, S3Endpoint, TransportConfig, TransportError,
+};
 use crate::remote::sink::{ObjectMeta, Precondition, PutOutcome, PutStatus, RemoteSink};
 use crate::remote::{
-    INDEX_FILE, MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES, RemoteSource, Upload, UploadKind,
+    INDEX_FILE, MAX_INDEX_BODY_BYTES, MAX_INDEX_POINTER_BYTES, Upload, UploadKind,
 };
 
 const MULTIPART_THRESHOLD: u64 = 100 * 1024 * 1024;
@@ -135,8 +137,7 @@ impl S3Client {
             && (response.is_redirect() || response.status == 400)
             && self
                 .endpoint
-                .base
-                .host_str()
+                .base_host()
                 .is_some_and(|host| host.ends_with("amazonaws.com"))
             && let Some(region) = response.header("x-amz-bucket-region")
             && region != self.endpoint.region
@@ -162,11 +163,11 @@ impl S3Client {
         &self,
         key: &str,
         max_bytes: u64,
-    ) -> Result<crate::remote::FetchedPointer, TransportError> {
+    ) -> Result<FetchedPointer, TransportError> {
         let response = self.get_response(key)?;
         let etag = response.header("etag").map(str::to_string);
         let bytes = response.read_vec(max_bytes)?;
-        Ok(crate::remote::FetchedPointer { bytes, etag })
+        Ok(FetchedPointer { bytes, etag })
     }
 
     pub fn head(&self, key: &str) -> Result<Option<ObjectMeta>, TransportError> {
@@ -536,7 +537,7 @@ impl RemoteSource for S3Source {
             .map_err(anyhow::Error::new)
     }
 
-    fn fetch_pointer_optional(&self) -> Result<Option<crate::remote::FetchedPointer>> {
+    fn fetch_pointer_optional(&self) -> Result<Option<FetchedPointer>> {
         match self
             .client
             .get_with_etag(INDEX_FILE, MAX_INDEX_POINTER_BYTES)

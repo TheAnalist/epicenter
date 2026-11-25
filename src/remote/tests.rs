@@ -661,7 +661,7 @@ fn compatibility_mismatches_name_the_field() -> Result<()> {
     assert!(credential.validate().is_err());
 
     let mut oversize = compatibility;
-    oversize.features = vec!["x".repeat(super::compat::MAX_FEATURE_BYTES + 1)];
+    oversize.features = vec!["x".repeat(super::schema::MAX_FEATURE_BYTES + 1)];
     assert!(oversize.validate().is_err());
     Ok(())
 }
