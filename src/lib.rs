@@ -2,22 +2,17 @@
 //!
 #![doc = include_str!("../README.md")]
 
-pub mod config;
-pub mod doctor;
+mod cache;
+mod diagnostics;
+mod support;
+
 pub mod env;
-pub mod evict;
-pub mod exec;
-pub mod fastlink;
 pub mod fingerprint;
 pub mod job;
-pub mod lockfile;
-pub mod paths;
-pub mod profile;
-pub mod prune;
 pub mod remote;
-pub mod settings;
-pub mod status;
-pub mod toolchain;
 pub mod util;
 pub mod vault;
-pub mod who;
+
+pub use cache::{evict, exec, prune, status, who};
+pub use diagnostics::{doctor, profile};
+pub use support::{config, fastlink, lockfile, paths, settings, toolchain};

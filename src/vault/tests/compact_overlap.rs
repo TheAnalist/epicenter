@@ -1,0 +1,230 @@
+use super::support::*;
+use super::*;
+
+#[test]
+fn overlap_groups_units_by_package_and_profile() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let first = write_overlap_unit(
+        store.path(),
+        "generation",
+        "aaaaaaaaaaaaaaaa",
+        b"0123456789",
+    )?;
+    write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", &[7u8; 20])?;
+    let manifest = Manifest {
+        parity_key: "generation".into(),
+        toolchain: "test".into(),
+        created: 1,
+        updated: 1,
+        units: vec![
+            overlap_unit("aaaaaaaaaaaaaaaa", 10),
+            overlap_unit("bbbbbbbbbbbbbbbb", 20),
+        ],
+        mac: String::new(),
+        signature: String::new(),
+    };
+    save_manifest(store.path(), "generation", &manifest)?;
+    let active = std::collections::HashSet::from(["demo-aaaaaaaaaaaaaaaa".to_string()]);
+    let report = overlap(store.path(), &active)?;
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].package, "demo");
+    assert_eq!(report[0].units, 2);
+    assert_eq!(report[0].hashes, 2);
+    assert_eq!(report[0].identical, 0);
+    assert_eq!(report[0].active, 1);
+    assert_eq!(report[0].bytes, 30);
+    assert_eq!(report[0].unique_bytes, 30);
+    assert!(first.is_file());
+    assert!(report[0].unit_rows.iter().any(|unit| unit.active));
+    Ok(())
+}
+
+#[test]
+fn overlap_counts_identical_units_and_shared_inodes_once() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let first = write_overlap_unit(
+        store.path(),
+        "generation",
+        "aaaaaaaaaaaaaaaa",
+        b"0123456789",
+    )?;
+    let second_dir = store
+        .path()
+        .join("generation2")
+        .join("units")
+        .join("demo-aaaaaaaaaaaaaaaa");
+    fs::create_dir_all(&second_dir)?;
+    #[cfg(unix)]
+    fs::hard_link(&first, second_dir.join("lib-demo"))?;
+    #[cfg(not(unix))]
+    fs::copy(&first, second_dir.join("lib-demo"))?;
+
+    for (generation, created) in [("generation", 1u64), ("generation2", 2u64)] {
+        let manifest = Manifest {
+            parity_key: generation.into(),
+            toolchain: "test".into(),
+            created,
+            updated: created,
+            units: vec![overlap_unit("aaaaaaaaaaaaaaaa", 10)],
+            mac: String::new(),
+            signature: String::new(),
+        };
+        save_manifest(store.path(), generation, &manifest)?;
+    }
+
+    let report = overlap(store.path(), &Default::default())?;
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].units, 2);
+    assert_eq!(report[0].hashes, 1);
+    assert_eq!(report[0].identical, 1);
+    #[cfg(unix)]
+    assert_eq!(report[0].unique_bytes, 10, "a hard link is counted once");
+    Ok(())
+}
+
+fn compact_manifest(generation: &str, hashes: &[&str], size: u64) -> Manifest {
+    Manifest {
+        parity_key: generation.into(),
+        toolchain: "test".into(),
+        created: 1,
+        updated: 1,
+        units: hashes.iter().map(|hash| overlap_unit(hash, size)).collect(),
+        mac: String::new(),
+        signature: String::new(),
+    }
+}
+
+#[test]
+fn compact_links_identical_files_and_is_idempotent() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let payload = b"identical payload";
+    let first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", payload)?;
+    let second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", payload)?;
+    save_manifest(
+        store.path(),
+        "generation",
+        &compact_manifest(
+            "generation",
+            &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"],
+            payload.len() as u64,
+        ),
+    )?;
+
+    let report = compact(store.path(), None, false)?;
+    assert_eq!(report.generations, 1);
+    assert_eq!(report.groups, 1);
+    assert_eq!(report.linked, 1);
+    assert_eq!(report.bytes_saved, payload.len() as u64);
+    assert_eq!(fs::read(&first)?, payload);
+    assert_eq!(fs::read(&second)?, payload);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&first)?.ino(), fs::metadata(&second)?.ino());
+    }
+
+    let again = compact(store.path(), None, false)?;
+    assert_eq!(again.groups, 0);
+    assert_eq!(again.linked, 0);
+    assert!(again.already_shared >= 1);
+    Ok(())
+}
+
+#[test]
+fn compact_dry_run_does_not_link() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let payload = b"dry-run payload";
+    let _first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", payload)?;
+    let _second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", payload)?;
+    save_manifest(
+        store.path(),
+        "generation",
+        &compact_manifest(
+            "generation",
+            &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"],
+            payload.len() as u64,
+        ),
+    )?;
+
+    let report = compact(store.path(), None, true)?;
+    assert_eq!(report.groups, 1);
+    assert_eq!(report.linked, 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(fs::metadata(&_first)?.ino(), fs::metadata(&_second)?.ino());
+    }
+    let applied = compact(store.path(), None, false)?;
+    assert_eq!(applied.linked, 1);
+    Ok(())
+}
+
+#[test]
+fn compact_respects_raw_unit_stamps() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let _first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", b"same")?;
+    let _second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", b"same")?;
+    let mut one = overlap_unit("aaaaaaaaaaaaaaaa", 4);
+    one.stamp = 1;
+    let mut two = overlap_unit("bbbbbbbbbbbbbbbb", 4);
+    two.stamp = 2;
+    let manifest = Manifest {
+        parity_key: "generation".into(),
+        toolchain: "test".into(),
+        created: 1,
+        updated: 1,
+        units: vec![one, two],
+        mac: String::new(),
+        signature: String::new(),
+    };
+    save_manifest(store.path(), "generation", &manifest)?;
+
+    let report = compact(store.path(), None, false)?;
+    assert_eq!(report.groups, 0);
+    assert_eq!(report.linked, 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(fs::metadata(&_first)?.ino(), fs::metadata(&_second)?.ino());
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_leaves_different_files_alone() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", b"one")?;
+    write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", b"two")?;
+    save_manifest(
+        store.path(),
+        "generation",
+        &compact_manifest("generation", &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], 3),
+    )?;
+    let report = compact(store.path(), None, false)?;
+    assert_eq!(report.groups, 0);
+    assert_eq!(report.linked, 0);
+    Ok(())
+}
+
+#[test]
+fn compact_counts_already_hardlinked_files() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", b"shared")?;
+    let second_dir = store
+        .path()
+        .join("generation")
+        .join("units")
+        .join("demo-bbbbbbbbbbbbbbbb");
+    fs::create_dir_all(&second_dir)?;
+    fs::hard_link(&first, second_dir.join("lib-demo"))?;
+    save_manifest(
+        store.path(),
+        "generation",
+        &compact_manifest("generation", &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], 6),
+    )?;
+    let report = compact(store.path(), None, false)?;
+    assert_eq!(report.groups, 0);
+    assert_eq!(report.linked, 0);
+    assert!(report.already_shared >= 1);
+    Ok(())
+}
