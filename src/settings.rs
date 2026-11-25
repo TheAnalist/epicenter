@@ -21,8 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::util::metadata_nofollow;
 
-/// Machine-level (and project-level) epicenter policy file name.
-pub const FILE_NAME: &str = "epicenter.toml";
+pub use crate::paths::FILE_NAME;
 
 /// Conservative per-job memory footprint for the auto job cap. The measured
 /// 37-dep build used ~0.25 GiB/job; 2 GiB keeps a wide machine safe without
@@ -670,7 +669,7 @@ fn validate_project_store(path: &Path, project_dir: &Path) -> Result<()> {
     )?
     .is_some()
     {
-        let marker = path.join(crate::vault::STORE_MARKER);
+        let marker = path.join(crate::paths::STORE_MARKER);
         if !marker.is_file() {
             // An empty directory is a fresh store: the writer creates and
             // marks it. A non-empty unmarked directory is the dangerous
@@ -682,7 +681,7 @@ fn validate_project_store(path: &Path, project_dir: &Path) -> Result<()> {
                 bail!(
                     "store {} is not an epicenter store (missing {}); use the global store or an empty directory",
                     path.display(),
-                    crate::vault::STORE_MARKER
+                    crate::paths::STORE_MARKER
                 );
             }
         }
@@ -759,7 +758,7 @@ fn validate_remote_text(raw: &str, what: &str, max_bytes: usize) -> Result<Strin
     ensure!(!raw.is_empty(), "`[remote] {what}` must not be empty");
     ensure!(
         !raw.chars().any(|ch| {
-            ch.is_control() || ch.is_whitespace() || crate::remote::validate::is_unsafe_format(ch)
+            ch.is_control() || ch.is_whitespace() || crate::util::is_unsafe_format(ch)
         }),
         "`[remote] {what}` must not contain whitespace, control or formatting characters"
     );
@@ -834,7 +833,7 @@ fn validate_remote_prefix(path: &str, what: &str) -> Result<()> {
                 && !lower.contains("%5c")
                 && !component
                     .chars()
-                    .any(|ch| { ch.is_control() || crate::remote::validate::is_unsafe_format(ch) }),
+                    .any(|ch| { ch.is_control() || crate::util::is_unsafe_format(ch) }),
             "{what} path contains an encoded traversal or control character"
         );
     }
@@ -896,7 +895,7 @@ pub fn normalize_remote_url(raw: &str) -> Result<String> {
 }
 
 fn decode_key_hex(raw: &str, what: &str) -> Result<[u8; 32]> {
-    let bytes = crate::vault::hex_decode(raw, what)?;
+    let bytes = crate::util::hex_decode(raw, what)?;
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("`[remote] {what}` must be 32 bytes (64 hex characters)"))
@@ -924,10 +923,7 @@ pub fn normalize_remote_publisher_key(raw: &str) -> Result<String> {
 pub fn remote_key_id(public_key: &str) -> Result<String> {
     let bytes = decode_key_hex(public_key, "public key")?;
     let digest = Sha256::digest(bytes);
-    Ok(format!(
-        "ed25519:{}",
-        crate::vault::hex_encode(&digest[..8])
-    ))
+    Ok(format!("ed25519:{}", crate::util::hex_encode(&digest[..8])))
 }
 
 pub fn aws_region() -> Option<String> {
@@ -1663,7 +1659,7 @@ mod tests {
         );
 
         write(
-            &store.join(crate::vault::STORE_MARKER),
+            &store.join(crate::paths::STORE_MARKER),
             "epicenter-store-v1\n",
         );
         let settings = Settings::load_at(dir.path(), None).unwrap();

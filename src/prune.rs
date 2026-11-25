@@ -290,7 +290,7 @@ pub fn prune_with(
     // Hold Cargo's build locks through the whole scan/delete. A check that
     // drops them lets a build start before the removals and lose artifacts.
     let _build_locks = if delete {
-        match crate::exec::cargo_locks(root)? {
+        match crate::job::cargo_locks(root)? {
             Some(locks) => Some(locks),
             None => anyhow::bail!(
                 "build dir {} is in use by a live build — prune skipped",

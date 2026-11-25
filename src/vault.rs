@@ -33,10 +33,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use std::sync::OnceLock;
-
-static STORE_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
 use anyhow::{Context, Result};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -52,10 +48,7 @@ use crate::fingerprint::{self, ArtifactInfo, Unit};
 /// Seed for the flag digest, versioned: bumping it retires old generations.
 const PARITY_SEED: &str = "epicenter-parity-v3";
 
-/// Per-store marker: identifies a directory as an epicenter store. A
-/// project-selected store must already contain it (or be empty), so a
-/// repository cannot point the sweep at `~/.cargo`, `~/.config`, or a sibling.
-pub const STORE_MARKER: &str = ".epicenter-store";
+pub use crate::paths::STORE_MARKER;
 
 /// Per-generation marker: only marked generation directories are eligible
 /// for automatic debris cleanup. Unknown children are never deleted.
@@ -228,21 +221,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 // ── layout ──────────────────────────────────────────────────────────────────
 
-/// `<build>/../store` — the vault lives beside the shared build dir, so
-/// `cargo clean` can never touch it.
-pub fn store_root(build_root: &Path) -> PathBuf {
-    STORE_OVERRIDE
-        .get()
-        .cloned()
-        .unwrap_or_else(|| build_root.parent().unwrap_or(build_root).join("store"))
-}
-
-/// Install a store path from `epicenter.toml` (once per process).
-pub fn set_store_override(path: PathBuf) -> Result<()> {
-    STORE_OVERRIDE
-        .set(path)
-        .map_err(|_| anyhow::anyhow!("store override is already installed"))
-}
+pub use crate::paths::{set_store_override, store_root};
 
 /// `store/<parity-key>/units`.
 pub fn units_dir(store_root: &Path, parity: &str) -> PathBuf {
@@ -726,26 +705,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     result
 }
 
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
-pub(crate) fn hex_decode(text: &str, what: &str) -> Result<Vec<u8>> {
-    let text = text.trim();
-    if text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("{what} is not a valid hex string");
-    }
-    let mut out = Vec::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks_exact(2) {
-        let pair = std::str::from_utf8(pair).expect("hex pair is ASCII");
-        out.push(u8::from_str_radix(pair, 16).expect("validated hex pair"));
-    }
-    Ok(out)
-}
+pub(crate) use crate::util::{hex_decode, hex_encode};
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
@@ -2041,14 +2001,14 @@ pub fn harvest_with_trust(
 
     // Fence the writer against a live Cargo build. Acquire after the
     // toolchain probe: a forked/exec'd child must not inherit the lock fd.
-    let _build_locks = match crate::exec::cargo_locks(&build_root)? {
+    let _build_locks = match crate::job::cargo_locks(&build_root)? {
         Some(locks) => Some(locks),
         None => anyhow::bail!(
             "build dir {} is in use by a live build — harvest skipped",
             build_root.display()
         ),
     };
-    let mut rows = read_rows(&build_root, pool)?;
+    let mut rows = fingerprint::read_rows(&build_root, pool)?;
 
     // A view that mixes both layouts is ambiguous: keep the layout of the
     // harvest toolchain (stable classic vs nightly new) and drop the other.
@@ -2076,11 +2036,11 @@ pub fn harvest_with_trust(
         if let Some(time) = arts.newest {
             newest_activity = Some(newest_activity.map_or(time, |current| current.max(time)));
         }
-        if crate::who::rustc_of(unit) != "unknown"
+        if crate::fingerprint::rustc_of(unit) != "unknown"
             && active_newest.map_or(true, |current| arts.newest >= Some(current))
         {
             active_newest = arts.newest;
-            active_gen = crate::who::rustc_of(unit);
+            active_gen = crate::fingerprint::rustc_of(unit);
         }
     }
     if let (Some(newest), Some(installed)) = (newest_activity, toolchain_install_time_of(selector))
@@ -2119,7 +2079,7 @@ pub fn harvest_with_trust(
                 continue;
             }
         }
-        let cohort = crate::who::rustc_of(&unit);
+        let cohort = crate::fingerprint::rustc_of(&unit);
         if cohort != "unknown" && active_gen != "unknown" && cohort != active_gen {
             report.skipped_stale += 1;
             continue;
@@ -2278,33 +2238,6 @@ struct UnitPlan {
     bytes: u64,
     deps: Vec<usize>,
     stamp: u64,
-}
-
-/// Read every unit's artifact list. One `deps/` index is built per profile
-/// and shared read-only with the per-unit scan, so artifact attach is a hash
-/// lookup instead of a directory rescan per unit.
-pub(crate) fn read_rows(
-    build_root: &Path,
-    pool: Option<&rayon::ThreadPool>,
-) -> Result<Vec<(Unit, ArtifactInfo)>> {
-    let units = fingerprint::read_units(build_root)?;
-    let mut deps: std::collections::HashMap<String, fingerprint::DepsIndex> =
-        std::collections::HashMap::new();
-    for unit in &units {
-        if !deps.contains_key(&unit.profile) {
-            let index = fingerprint::DepsIndex::load(&build_root.join(&unit.profile));
-            deps.insert(unit.profile.clone(), index);
-        }
-    }
-    let scan = |unit: Unit| {
-        let index = &deps[&unit.profile];
-        let arts = fingerprint::artifacts_for_indexed(build_root, &unit, index);
-        (unit, arts)
-    };
-    Ok(match pool {
-        Some(pool) if units.len() > 1 => pool.install(|| units.into_par_iter().map(scan).collect()),
-        _ => units.into_iter().map(scan).collect(),
-    })
 }
 
 /// Package version from rustc's dep-info side file.
@@ -4022,18 +3955,18 @@ fn authorize_harvest(build_root: &Path, trust: HarvestTrust<'_>) -> Result<()> {
             build_root.display()
         );
     }
-    if let Some(token) = crate::exec::job_marker_token(build_root)? {
-        match crate::exec::record_covers(build_root, &token)? {
-            crate::exec::RecordCoverage::Matching => {}
-            crate::exec::RecordCoverage::Absent => anyhow::bail!(
+    if let Some(token) = crate::job::job_marker_token(build_root)? {
+        match crate::job::record_covers(build_root, &token)? {
+            crate::job::RecordCoverage::Matching => {}
+            crate::job::RecordCoverage::Absent => anyhow::bail!(
                 "job dir {} has no exec record on this host — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
                 build_root.display()
             ),
-            crate::exec::RecordCoverage::Mismatch => anyhow::bail!(
+            crate::job::RecordCoverage::Mismatch => anyhow::bail!(
                 "job dir {} has an exec record for a different build (token or path mismatch) — refusing to sign it",
                 build_root.display()
             ),
-            crate::exec::RecordCoverage::Untrusted => anyhow::bail!(
+            crate::job::RecordCoverage::Untrusted => anyhow::bail!(
                 "job dir {} has an exec record this host does not trust (symlink, foreign owner, or permissive mode) — refusing to sign it",
                 build_root.display()
             ),
@@ -7458,7 +7391,7 @@ mod tests {
         let build = home.join("job");
         util::create_private_dir_all(&build)?;
         fs::write(
-            build.join(crate::exec::JOB_MARKER),
+            build.join(crate::job::JOB_MARKER),
             "epicenter-job-v1\n0123456789abcdef0123456789abcdef\n",
         )?;
         Ok(build)
@@ -7508,7 +7441,7 @@ mod tests {
         let build = job_dir(home.path())?;
         synthetic_build_dir(&build)?;
         let store = tempfile::tempdir()?;
-        crate::exec::record_for_test(&build)?;
+        crate::job::record_for_test(&build)?;
 
         let report = harvest(&build, store.path(), None, false)?;
         assert!(report.stored > 0);

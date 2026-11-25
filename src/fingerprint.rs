@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -936,6 +937,40 @@ fn collect_new_artifacts(
             paths.push((entry.path(), meta.len(), meta.modified().ok()));
         }
     }
+}
+
+/// Read every unit's artifact list. One `deps/` index is built per profile
+/// and shared read-only with the per-unit scan, so artifact attach is a hash
+/// lookup instead of a directory rescan per unit.
+pub(crate) fn read_rows(
+    build_root: &Path,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<(Unit, ArtifactInfo)>> {
+    let units = read_units(build_root)?;
+    let mut deps: HashMap<String, DepsIndex> = HashMap::new();
+    for unit in &units {
+        if !deps.contains_key(&unit.profile) {
+            let index = DepsIndex::load(&build_root.join(&unit.profile));
+            deps.insert(unit.profile.clone(), index);
+        }
+    }
+    let scan = |unit: Unit| {
+        let index = &deps[&unit.profile];
+        let arts = artifacts_for_indexed(build_root, &unit, index);
+        (unit, arts)
+    };
+    Ok(match pool {
+        Some(pool) if units.len() > 1 => pool.install(|| units.into_par_iter().map(scan).collect()),
+        _ => units.into_iter().map(scan).collect(),
+    })
+}
+
+/// The rustc identity a unit was built with.
+pub(crate) fn rustc_of(unit: &Unit) -> String {
+    unit.json
+        .as_ref()
+        .map(|json| json.rustc.clone())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]

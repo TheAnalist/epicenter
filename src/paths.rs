@@ -14,10 +14,12 @@
 //! operations — so the two mechanisms can never drift apart. Same story on
 //! WSL (ext4) and native Windows (NTFS).
 
-use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+
+pub use crate::env::{ambient_cargo_home, cargo_home, home, set_cargo_home_override};
 
 /// The shared-build-dir template, as written into Cargo's global config —
 /// THE canonical value, identical on every OS, written with FORWARD slashes:
@@ -29,130 +31,39 @@ use anyhow::{Context, Result};
 /// `{cargo-cache-home}` itself at every build, per platform.
 pub const DEFAULT_BUILD_DIR: &str = "{cargo-cache-home}/epicenter/build";
 
-/// The user's home directory (`$HOME`, with a portable fallback).
-pub fn home() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return Ok(PathBuf::from(home));
-        }
-    }
-    // Fallback (also correct when running natively on Windows).
-    std::env::home_dir()
-        .filter(|p| !p.as_os_str().is_empty())
-        .with_context(|| "could not determine the user home directory")
-}
-
-#[derive(Clone, Copy)]
-enum UserDir {
-    Config,
-    State,
-    Cache,
-}
-
-fn absolute_env(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-}
-
-/// One XDG/APPDATA/LOCALAPPDATA branch for epicenter's config, state and
-/// cache roots. The environment value is used only when it is absolute, as
-/// the XDG base-directory spec requires.
-fn user_dir(kind: UserDir) -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        let (name, fallback) = match kind {
-            UserDir::Config => ("APPDATA", &["AppData", "Roaming"][..]),
-            UserDir::State | UserDir::Cache => ("LOCALAPPDATA", &["AppData", "Local"][..]),
-        };
-        if let Some(base) = absolute_env(name) {
-            return Ok(base.join("epicenter"));
-        }
-        let mut path = home()?;
-        for part in fallback {
-            path.push(part);
-        }
-        Ok(path.join("epicenter"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let leaf = match kind {
-            UserDir::Config | UserDir::State => "Application Support",
-            UserDir::Cache => "Caches",
-        };
-        return Ok(home()?.join("Library").join(leaf).join("epicenter"));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let (name, fallback) = match kind {
-            UserDir::Config => ("XDG_CONFIG_HOME", &[".config"][..]),
-            UserDir::State => ("XDG_STATE_HOME", &[".local", "state"][..]),
-            UserDir::Cache => ("XDG_CACHE_HOME", &[".cache"][..]),
-        };
-        if let Some(base) = absolute_env(name) {
-            return Ok(base.join("epicenter"));
-        }
-        let mut path = home()?;
-        for part in fallback {
-            path.push(part);
-        }
-        return Ok(path.join("epicenter"));
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = kind;
-        anyhow::bail!("no supported user directory on this platform")
-    }
-}
-
-/// Process-wide effective Cargo home, installed once the policy is loaded.
-static CARGO_HOME_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
-
-fn cargo_home_override() -> &'static RwLock<Option<PathBuf>> {
-    CARGO_HOME_OVERRIDE.get_or_init(|| RwLock::new(None))
-}
-
-/// Install the resolved effective Cargo home for this process. `None` restores
-/// the shell/default `CARGO_HOME` fallback.
-pub fn set_cargo_home_override(path: Option<PathBuf>) {
-    let mut guard = cargo_home_override()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = path;
-}
-
-/// Cargo's home dir: the effective policy override when installed, otherwise
-/// `$CARGO_HOME` or `~/.cargo`.
-pub fn cargo_home() -> Result<PathBuf> {
-    {
-        let guard = cargo_home_override()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(path) = guard.as_ref() {
-            return Ok(path.clone());
-        }
-    }
-    ambient_cargo_home()
-}
-
-/// The shell/default Cargo home, ignoring the epicenter `cargo_home` policy.
-/// This is the fallback for the global policy value and for legacy state
-/// migration; internal callers normally want [`cargo_home`].
-pub fn ambient_cargo_home() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("CARGO_HOME") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
-    }
-    Ok(home()?.join(".cargo"))
-}
-
 /// Per-user state (vault keys, last-build diagnostics), independent of both
 /// `CARGO_HOME` and the policy config path.
 pub fn state_dir() -> Result<PathBuf> {
-    user_dir(UserDir::State)
+    crate::env::user_dir(crate::env::UserDir::State)
 }
+
+/// Machine-level (and project-level) epicenter policy file name.
+pub const FILE_NAME: &str = "epicenter.toml";
+
+/// Per-store marker: identifies a directory as an epicenter store. A
+/// project-selected store must already contain it (or be empty), so a
+/// repository cannot point the sweep at `~/.cargo`, `~/.config`, or a sibling.
+pub const STORE_MARKER: &str = ".epicenter-store";
+
+static STORE_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// `<build>/../store` — the store lives beside the shared build dir, so
+/// `cargo clean` can never touch it.
+pub fn store_root(build_root: &Path) -> PathBuf {
+    STORE_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| build_root.parent().unwrap_or(build_root).join("store"))
+}
+
+/// Install a store path from `epicenter.toml` (once per process).
+pub fn set_store_override(path: PathBuf) -> Result<()> {
+    STORE_OVERRIDE
+        .set(path)
+        .map_err(|_| anyhow::anyhow!("store override is already installed"))
+}
+
+pub use crate::config::cargo_build_dir;
 
 /// The per-user directory that holds epicenter's machine-level policy.
 ///
@@ -160,40 +71,26 @@ pub fn state_dir() -> Result<PathBuf> {
 /// `epicenter.toml` can set `cargo_home`, so it must be readable before the
 /// effective Cargo home is known.
 pub fn global_config_dir() -> Result<PathBuf> {
-    user_dir(UserDir::Config)
+    crate::env::user_dir(crate::env::UserDir::Config)
 }
 
 /// The one machine-level policy file.
 pub fn global_config_path() -> Result<PathBuf> {
-    Ok(global_config_dir()?.join(crate::settings::FILE_NAME))
+    Ok(global_config_dir()?.join(FILE_NAME))
 }
 
 /// The pre-0.1.0 global policy location. Only the doctor uses this to print a
 /// migration hint; it is never read as policy. Always uses the ambient
 /// `CARGO_HOME`, not the configured `cargo_home`.
 pub fn legacy_global_config_path() -> Result<PathBuf> {
-    Ok(ambient_cargo_home()?.join(crate::settings::FILE_NAME))
-}
-
-/// The `[build] build-dir` value from the **global**
-/// `$CARGO_HOME/config.toml`. This is the only trusted source for epicenter
-/// state. A relative config path, or a symlinked `config.toml`, is refused.
-pub fn cargo_build_dir() -> Result<Option<String>> {
-    let config_path = crate::config::cargo_config_path()?;
-    if !config_path.exists() {
-        return Ok(None);
-    }
-    let text = crate::util::read_trusted_config(&config_path, 1024 * 1024)
-        .with_context(|| format!("reading {}", config_path.display()))?;
-    Ok(crate::config::read_table_key(&text, "build", "build-dir")
-        .filter(|value| !value.trim().is_empty()))
+    Ok(ambient_cargo_home()?.join(FILE_NAME))
 }
 
 /// Default per-user, per-machine work root for disposable job dirs. Never
 /// derived from the shared build root: a shared build dir must not imply a
 /// shared, attacker-seedable work directory.
 pub fn default_work_root() -> Result<PathBuf> {
-    Ok(user_dir(UserDir::Cache)?.join("work"))
+    Ok(crate::env::user_dir(crate::env::UserDir::Cache)?.join("work"))
 }
 
 /// Default local cache for verified remote imports. Never the shared vault:

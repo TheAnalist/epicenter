@@ -130,18 +130,7 @@ pub(crate) fn absolute_path(value: &str, what: &str, max_bytes: usize) -> Result
     Ok(())
 }
 
-/// Unicode format characters used for bidi spoofing or invisible names.
-pub(crate) fn is_unsafe_format(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2028}'..='\u{2029}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-    )
-}
+pub(crate) use crate::util::is_unsafe_format;
 
 /// Reject URL userinfo unless it is the conventional SSH `git` user. A
 /// registry/git URL is published in the index; credentials must stay in the

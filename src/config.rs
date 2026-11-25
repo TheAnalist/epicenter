@@ -31,8 +31,21 @@ pub fn cache_root() -> Result<PathBuf> {
 /// or the canonical default template. Never reads a project config and never
 /// executes `cargo metadata`.
 pub fn trusted_cache_root() -> Result<PathBuf> {
-    let value = paths::cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
+    let value = cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string());
     paths::resolve_template(&value)
+}
+
+/// The `[build] build-dir` value from the **global** `$CARGO_HOME/config.toml`.
+/// This is the only trusted source for epicenter state. A relative config path,
+/// or a symlinked `config.toml`, is refused.
+pub fn cargo_build_dir() -> Result<Option<String>> {
+    let config_path = cargo_config_path()?;
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let text = crate::util::read_trusted_config(&config_path, 1024 * 1024)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    Ok(read_table_key(&text, "build", "build-dir").filter(|value| !value.trim().is_empty()))
 }
 
 /// Config values are written inside single-quoted TOML strings. Reject the
@@ -618,7 +631,7 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
     } else if opts.use_default {
         DEFAULT_BUILD_DIR.to_string()
     } else {
-        paths::cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
+        cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
     };
     validate_config_value(&build_dir_value, "build-dir")?;
     if let Some(name) = match opts.wrapper {
@@ -632,7 +645,7 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
     let root = paths::resolve_template(&build_dir_value)?;
     let effective_store = store
         .clone()
-        .unwrap_or_else(|| crate::vault::store_root(&root));
+        .unwrap_or_else(|| crate::paths::store_root(&root));
     if work_root.starts_with(&effective_store) || effective_store.starts_with(&work_root) {
         anyhow::bail!(
             "work root {} overlaps the vault {} — choose a separate local directory",

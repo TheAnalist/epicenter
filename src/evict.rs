@@ -500,7 +500,7 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                     },
                     None => None,
                 };
-                let Some(_cargo_locks) = crate::exec::cargo_locks(root)? else {
+                let Some(_cargo_locks) = crate::job::cargo_locks(root)? else {
                     errors += 1;
                     eprintln!("view {label} is in use by a live build — skipped");
                     continue;
@@ -616,7 +616,7 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
     // Hold Cargo's own lock files through the rename/delete. A boolean check
     // here would release the locks immediately and let a build start in the
     // window before `rename`.
-    let cargo_locks = match crate::exec::cargo_locks(&path)? {
+    let cargo_locks = match crate::job::cargo_locks(&path)? {
         Some(locks) => locks,
         None => bail!(
             "job dir {} is in use by a live build — remove it when it finishes",
@@ -975,7 +975,7 @@ fn evict_work_dirs(
                 continue;
             }
         };
-        let cargo_locks = match crate::exec::cargo_locks(&row.path)? {
+        let cargo_locks = match crate::job::cargo_locks(&row.path)? {
             Some(locks) => locks,
             None => {
                 report.in_use += 1;
@@ -1473,7 +1473,7 @@ fn evict_generations(build_root: &Path, opts: &Options<'_>, query: &str) -> Resu
     let mut errors = 0u64;
     let mut unlinked_views = 0usize;
     for (label, root, units) in &views {
-        let Some(_cargo_locks) = crate::exec::cargo_locks(root)? else {
+        let Some(_cargo_locks) = crate::job::cargo_locks(root)? else {
             errors += 1;
             eprintln!("view {label} became busy — skipped");
             continue;
@@ -1573,7 +1573,7 @@ fn view_list(views: &[String]) -> String {
 fn evict_from_view(build_root: &Path, opts: &Options<'_>, work: &str) -> Result<()> {
     let root = resolve_view(build_root, work)?;
     // Hold the lock descriptors for the entire unlink operation.
-    let Some(_cargo_locks) = crate::exec::cargo_locks(&root)? else {
+    let Some(_cargo_locks) = crate::job::cargo_locks(&root)? else {
         bail!(
             "view {} is in use by a live build — unlink when it finishes",
             root.display()

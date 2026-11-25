@@ -4,10 +4,12 @@
 
 pub mod config;
 pub mod doctor;
+pub mod env;
 pub mod evict;
 pub mod exec;
 pub mod fastlink;
 pub mod fingerprint;
+pub mod job;
 pub mod lockfile;
 pub mod paths;
 pub mod profile;

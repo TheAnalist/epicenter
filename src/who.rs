@@ -22,7 +22,7 @@ pub fn active_unit_names(build_root: &Path) -> Result<std::collections::HashSet<
 
 /// Fully attached unit list, sorted by size (largest first).
 pub(crate) fn collect(build_root: &Path) -> Result<Vec<(Unit, ArtifactInfo)>> {
-    let mut rows = crate::vault::read_rows(build_root, None)?;
+    let mut rows = crate::fingerprint::read_rows(build_root, None)?;
     rows.sort_by_key(|(_, arts)| std::cmp::Reverse(arts.bytes));
     Ok(rows)
 }
@@ -42,12 +42,7 @@ pub(crate) fn rustc_cohorts(rows: &[(Unit, ArtifactInfo)]) -> BTreeMap<String, u
     cohorts
 }
 
-pub(crate) fn rustc_of(unit: &Unit) -> String {
-    unit.json
-        .as_ref()
-        .map(|json| json.rustc.clone())
-        .unwrap_or_else(|| "unknown".into())
-}
+pub(crate) use crate::fingerprint::rustc_of;
 
 fn deps_of(unit: &Unit) -> usize {
     unit.json.as_ref().map_or(0, |json| json.deps.len())

@@ -250,7 +250,7 @@ pub fn which_path(program: &str) -> Option<PathBuf> {
             }
         }
     }
-    let cargo_bin = crate::paths::cargo_home().ok()?.join("bin");
+    let cargo_bin = crate::env::cargo_home().ok()?.join("bin");
     if !cargo_bin.is_absolute() {
         return None;
     }
@@ -804,7 +804,7 @@ pub fn expand_tilde(raw: &str) -> Result<PathBuf> {
     let raw = raw.trim();
     if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
         let rest = raw[1..].trim_start_matches(['/', '\\']);
-        return Ok(crate::paths::home()?.join(rest));
+        return Ok(crate::env::home()?.join(rest));
     }
     Ok(PathBuf::from(raw))
 }
@@ -826,7 +826,7 @@ pub fn reject_protected_path(path: &Path, what: &str) -> Result<()> {
     if path.parent().is_none() || path == Path::new("/") {
         anyhow::bail!("{what} {} must not be a filesystem root", path.display());
     }
-    if let Ok(home) = crate::paths::home()
+    if let Ok(home) = crate::env::home()
         && (path == home || home.starts_with(path))
     {
         anyhow::bail!(
@@ -3624,6 +3624,40 @@ impl<'a> SafeWalk<'a> {
             .filter_entry(filter)
             .take(if reject_root { 0 } else { usize::MAX })
     }
+}
+
+/// Unicode format characters used for bidi spoofing or invisible names.
+pub(crate) fn is_unsafe_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+pub(crate) fn hex_decode(text: &str, what: &str) -> Result<Vec<u8>> {
+    let text = text.trim();
+    if text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("{what} is not a valid hex string");
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).expect("hex pair is ASCII");
+        out.push(u8::from_str_radix(pair, 16).expect("validated hex pair"));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
