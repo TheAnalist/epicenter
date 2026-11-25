@@ -1,0 +1,3 @@
+# Existing architectural debt suppressed by `deslop-please --allow`.
+# Fixing an entry here never fails CI; new issues not listed here fail.
+shallow-module epicenter_cli::util
