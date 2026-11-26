@@ -1,0 +1,130 @@
+//! Remote artifact distribution: signed index, immutable CAS, replay state and
+//! compatibility gates.
+//!
+//! The bucket is untrusted storage. Trust comes from the pinned Ed25519
+//! publisher key and SHA-256 object names; the layout is deliberately boring:
+//!
+//! ```text
+//! index.json                 small signed pointer (replaced atomically)
+//! indexes/<sha256>.json      immutable canonical index body
+//! publisher.json             human-readable copy of the signed metadata
+//! blobs/<sha256>             immutable stored bytes (gzip or raw)
+//! ```
+//!
+//! The pointer commits to the body hash and size and carries the sequence,
+//! creation/expiry and signature. A body that does not hash to the committed
+//! value is never parsed. Readers persist the highest accepted sequence per
+//! endpoint/key and refuse rollbacks, equivocation and expired indexes.
+//!
+//! The CI-only publisher turns one vault generation into that tree under a
+//! private staging root; transport uploads are a separate layer. On the reader
+//! side, the same tree is mirrored under the per-user remote cache, verified,
+//! filtered and imported into the local vault (or the cache store when the
+//! configured vault is read-only). Anonymous HTTPS reads and signed S3 reads,
+//! multipart writes and conditional pointer replacement live in `transport`.
+
+mod cache;
+mod cas;
+mod index;
+mod publish;
+mod reader;
+mod schema;
+mod sink;
+mod source;
+mod state;
+mod transport;
+mod upload;
+pub(crate) mod validate;
+
+#[cfg(test)]
+mod tests;
+
+pub use cas::{
+    BlobRef, MAX_IN_MEMORY_BLOB_BYTES, Upload, UploadKind, UploadMode, decode_blob, read_blob,
+    upload_plan, verify_blob, write_blob,
+};
+pub use index::{
+    IndexBody, IndexPointer, PublisherMetadata, PublisherReport, SignedIndex, VerifiedIndex,
+    make_index, publisher_report, read_index_tree, verify_body, verify_index, write_index_tree,
+};
+pub use publish::{PublishOutcome, PublishRequest, publish, record_publish_state};
+pub use reader::{FetchReport, FetchRequest, fetch_and_import, preview};
+pub use schema::{
+    Compatibility, Compression, FileRole, LocalEnvironment, Mismatch, RegistryIdentity, RemoteFile,
+    RemoteUnit, RemoteUnitKind, RustcIdentity, SourceKind, UnitCompatibility, UnitSource,
+    compare_compatibility, source_path_hash,
+};
+pub use sink::{ObjectMeta, Precondition, PutOutcome, PutStatus, RemoteSink};
+pub use source::{DirSource, source_for};
+pub use state::{
+    IndexStatus, RemoteState, clear_state, load_state, record_state, state_path, status,
+};
+pub use transport::{
+    CredentialSource, Credentials, Endpoint, FetchedPointer, HttpsEndpoint, HttpsSource,
+    RemoteSource, S3Addressing, S3Client, S3Endpoint, S3Sink, S3Source, TransportConfig,
+    TransportError,
+};
+pub use upload::{RemotePointer, UploadReport, UploadRequest, upload, validate_order};
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+/// Version of the pointer/body schema. A reader refuses anything else.
+pub const SCHEMA_VERSION: u32 = 1;
+
+pub const INDEX_FILE: &str = "index.json";
+pub const PUBLISHER_FILE: &str = "publisher.json";
+pub const BLOBS_DIR: &str = "blobs";
+pub const INDEXES_DIR: &str = "indexes";
+pub const STATE_DIR: &str = "remote";
+
+/// The signed pointer is tiny by design.
+pub const MAX_INDEX_POINTER_BYTES: u64 = 16 * 1024;
+/// The canonical body is a metadata document, never artifact bytes.
+pub const MAX_INDEX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_INDEX_UNITS: usize = 100_000;
+pub const MAX_INDEX_FILES: usize = 1_000_000;
+pub const MAX_BLOB_BYTES: u64 = crate::util::MAX_FILE_BYTES;
+pub const MAX_INDEX_VALIDITY_SECS: u64 = 90 * 24 * 60 * 60;
+pub const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
+
+pub use crate::util::now_secs;
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    crate::vault::hex_encode(&Sha256::digest(bytes))
+}
+
+/// Verify the one canonical SHA-256 spelling used by every remote object.
+pub fn ensure_sha256(text: &str, what: &str) -> Result<()> {
+    validate::lower_hex(text, 64, what)
+}
+
+/// Object key for an immutable blob.
+pub fn blob_key(sha256: &str) -> Result<String> {
+    ensure_sha256(sha256, "blob SHA-256")?;
+    Ok(format!("{BLOBS_DIR}/{sha256}"))
+}
+
+/// Object key for an immutable canonical index body.
+pub fn body_key(sha256: &str) -> Result<String> {
+    ensure_sha256(sha256, "index body SHA-256")?;
+    Ok(format!("{INDEXES_DIR}/{sha256}.json"))
+}
+
+pub fn blob_path(root: &Path, sha256: &str) -> Result<PathBuf> {
+    ensure_sha256(sha256, "blob SHA-256")?;
+    Ok(root.join(BLOBS_DIR).join(sha256))
+}
+
+pub fn body_path(root: &Path, sha256: &str) -> Result<PathBuf> {
+    ensure_sha256(sha256, "index body SHA-256")?;
+    Ok(root.join(INDEXES_DIR).join(format!("{sha256}.json")))
+}
+
+/// Read a local regular file with a hard cap and no symlink following.
+pub(crate) fn read_capped(path: &Path, max_bytes: u64, what: &str) -> Result<Vec<u8>> {
+    let text = crate::util::read_small_text(path, max_bytes)
+        .with_context(|| format!("reading {what} {}", path.display()))?;
+    Ok(text.into_bytes())
+}

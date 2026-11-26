@@ -1,0 +1,835 @@
+<h1 align="center">
+    <img width="99" alt="epicenter logo" src="epicenter-icon.svg">
+    <br>
+    <b>epicenter</b>
+    <br>
+    <sub>
+        <sup>The state layer for cargo builds</sup>
+    </sub>
+</h1>
+
+<p align="center">
+    <a href="https://crates.io/crates/epicenter-cli"><img src="https://img.shields.io/crates/v/epicenter-cli.svg" alt="Crates.io"></a>
+    <a href="https://crates.io/crates/epicenter-cli"><img alt="downloads" src="https://img.shields.io/crates/d/epicenter-cli?color=%230099ff"></a>
+    <a href="https://docs.rs/epicenter-cli"><img src="https://docs.rs/epicenter-cli/badge.svg" alt="Documentation"></a>
+    <a href="https://github.com/TheAnalist/epicenter/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/crates/l/epicenter-cli.svg"></a>
+    <a href="https://github.com/rust-lang/rfcs/blob/master/text/2495-min-rust-version.md" title="MSRV"><img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.91%2B-blue"></a>
+</p>
+
+<p align="center">
+    <b>Three-Tier Build State &amp; Shared Dependency Cache for Rust</b>
+    <br>
+    <i>Shared build cache + durable fingerprint vault + lock-free per-job work dirs + explicit linker choices + honest eviction + zero rustc shims.</i>
+</p>
+
+<br>
+
+**Epicenter** is the state layer for Cargo builds. It solves Rust's two biggest headaches—slow compile times and bloated `target/` directories—by sharing compiled dependencies across all your projects without wrapping `rustc` or running a background daemon.
+
+* **Requirement:** Rust **1.91+** (Cargo with `build.build-dir` support).
+* **How it works:** Epicenter uses Cargo's native `[build] build-dir` configuration and fingerprint engine. When a unit is restored from Epicenter, Cargo sees it as `Fresh` in milliseconds and spawns **zero `rustc` processes**.
+
+---
+
+## Index
+
+Find what you need fast. Each link goes to one section.
+
+| I want to... | Go to |
+|---|---|
+| Understand what `build`, `store`, and `work` are | [1. Core Concepts](#1-core-concepts-three-tiers-one-tool) |
+| Install and run the first build | [2. Installation & Quickstart](#2-installation--30-second-quickstart) |
+| Copy a ready-made command for a task | [3. Practical Recipes](#3-practical-recipes-i-want-to) |
+| Set up local dev, the vault, CI, or parallel agents | [4. Detailed Workflows](#4-detailed-workflows) |
+| Use multiple git worktrees, or run parallel agents | [Workflow 3: Worktrees & Agents](#workflow-3-ai-agents-git-worktrees--parallel-local-builds-exec) |
+| Set up CI, a read-only vault, or multiple VMs | [Workflow 4: CI/CD & Multi-VM](#workflow-4-cicd--multi-vm-fleets) |
+| Publish compiled dependencies from CI and use them on laptops and agents | [Workflow 5: CI Remote Dependencies](#workflow-5-ci-remote-dependencies-remote-tier) |
+| Change settings in `epicenter.toml` | [5. Configuration Reference](#5-configuration-reference-epicentertoml--presets) |
+| Check cache health or see what is stored | [6. Observability & Diagnostics](#6-observability--diagnostics-status--doctor) |
+| Free disk space safely | [7. Reclaiming Disk Space](#7-reclaiming-disk-space-prune-vs-evict) |
+| Know how Windows, WSL, macOS, or Cargo versions differ | [8. Cross-OS & Toolchain Notes](#8-cross-os--toolchain-notes) |
+| Look up any command or flag | [9. Command Cheat Sheet](#9-complete-command-cheat-sheet) |
+
+**Quick rule:** if you are unsure, run `epicenter doctor`. It says what is wrong and what to run next.
+
+---
+
+## 1. Core Concepts: Three Tiers, One Tool
+
+Epicenter organizes build state into three simple tiers:
+
+1. **`build` (Shared Warm Cache)** — `{cargo-cache-home}/epicenter/build/`
+   Where your normal projects compile by default. Compile `serde` or `tokio` once in Project A, and Project B reuses it immediately.
+2. **`store` (The Durable Vault)** — `{cargo-cache-home}/epicenter/store/`
+   A read-only, content-addressed snapshot of compiled units keyed by toolchain and compiler flags. It survives `cargo clean`, branch switches, and feeds cold starts.
+3. **`work` (Disposable Per-Job Directories)** — per-user OS cache, e.g. `$XDG_CACHE_HOME/epicenter/work/<id>/` (overridable with `--work-root`)
+   Isolated build directories created by `epicenter exec` and seeded from the `store` vault in milliseconds. Allows multiple **git worktrees** of the same project, 10+ AI agents, or CI jobs to compile in parallel with **zero Cargo lock contention**.
+
+---
+
+## 2. Installation & 30-Second Quickstart
+
+```bash
+# 1. Install
+cargo install epicenter-cli
+
+# 2. Configure Cargo to use the shared build cache (backs up existing config automatically)
+epicenter setup
+
+# 3. Build any Rust project as usual
+cargo build
+
+# 4. Check cache status and health
+epicenter status
+epicenter doctor
+```
+
+> **Safety first:** Every time `epicenter setup` edits a file, it saves a backup (`config.toml.epicenter-bak[.N]`). Run `epicenter setup --revert` at any time to restore your previous configuration atomically.
+
+---
+
+## 3. Practical Recipes ("I want to...")
+
+Straight-to-the-point commands for humans and AI agents:
+
+### Local Compilation & Linker Choices
+* **You want plug-and-play shared builds with the bundled LLVM linker (`lld`, no extra install needed):**
+  ```bash
+  epicenter setup --preset dev --linker lld
+  ```
+* **You want to compile fast and you have installed `wild` (plus `clang` or GCC 16.1+) for fast linking on Linux:**
+  ```bash
+  epicenter setup --preset dev --linker wild
+  ```
+* **You are on Linux and have `mold` or `gold` (plus `clang`) installed:**
+  ```bash
+  epicenter setup --preset dev --linker mold
+  # or
+  epicenter setup --preset dev --linker gold
+  ```
+* **You want to revert to your OS default linker:**
+  ```bash
+  epicenter setup --linker system
+  ```
+
+### Memory & Profile Tuning
+* **You want to limit parallel Cargo jobs so `rustc` never exceeds 16 GiB of RAM (2 GiB per job cap):**
+  ```bash
+  epicenter setup --memory 16GiB
+  ```
+* **You want Epicenter to write recommended profile settings into your workspace `Cargo.toml` (with line-tables debug info):**
+  ```bash
+  epicenter setup --preset dev --write-profile --dev-debug line
+  ```
+* **You want to preview what `setup` will change without touching any files:**
+  ```bash
+  epicenter setup --preset dev --linker lld --memory 16GiB --dry-run
+  ```
+* **You want to apply setup and run one calibration build to record time and peak RSS for `epicenter doctor`:**
+  ```bash
+  epicenter setup --preset dev --measure
+  ```
+
+### Surviving `cargo clean` (The Vault)
+* **You want to save your compiled dependencies before running `cargo clean` and get them back instantly:**
+  ```bash
+  epicenter store harvest   # Snapshot compiled units into the vault
+  cargo clean               # Wipe the build view
+  epicenter store restore   # Link/copy units back from the vault in milliseconds
+  cargo build               # Instant "Fresh" build, zero rustc processes spawned
+  ```
+
+### Running AI Agents, Git Worktrees & Parallel Jobs (Zero Lock Waits)
+* **You are working on multiple git worktrees of the same project:**
+  Use an isolated `work` directory per worktree via `epicenter exec` so concurrent builds, test runs, or editor checks across worktrees never block each other on the shared `build/` lock:
+  ```bash
+  # In worktree 1 (e.g. feature-auth):
+  epicenter exec --id wt-auth --reuse --target-dir -- cargo test
+
+  # In worktree 2 (e.g. hotfix-db) at the exact same time:
+  epicenter exec --id wt-hotfix --reuse --target-dir -- cargo build
+  ```
+* **You are running multiple AI coding agents on the same repository simultaneously:**
+  ```bash
+  # Agent 1 gets its own isolated build dir and target dir, seeded from the vault:
+  epicenter exec --id agent-1 --target-dir -- cargo test
+
+  # Agent 2 runs at the exact same time without waiting on Cargo's build-dir lock:
+  epicenter exec --id agent-2 --target-dir -- cargo check
+  ```
+* **An agent wants to keep reusing its own warm workspace across multiple commands:**
+  ```bash
+  epicenter exec --id agent-1 --target-dir -- cargo build
+  epicenter exec --id agent-1 --reuse --target-dir -- cargo test
+  ```
+* **You want a one-shot isolated test run that deletes its working directory when done:**
+  ```bash
+  epicenter exec --rm --id quick-check -- cargo test
+  ```
+* **You are running a CI job that should seed from the vault, build, and save any newly compiled dependencies back to the vault:**
+  ```bash
+  epicenter exec --harvest -- cargo test
+  ```
+
+### Shared Compiled Dependencies from CI (remote tier)
+* **You are a developer or agent and want CI's compiled dependencies locally (one-time setup):**
+  ```bash
+  epicenter setup --remote-url https://cache.example/deps --remote-key <public-key-hex-or-file> --remote-tier libraries
+  epicenter exec -- cargo build --locked
+  ```
+* **You want to skip the remote for one job (debugging, offline work):**
+  ```bash
+  epicenter exec --no-remote -- cargo build --locked
+  ```
+* **You want to stop using remote dependencies on this machine:**
+  ```bash
+  epicenter setup --remote-off
+  ```
+* **You are a CI publisher and want to rehearse a publish without any remote write:**
+  ```bash
+  epicenter store publish --dry-run --url s3://bucket/prefix --reader-url https://cache.example/prefix --tier libraries --profile debug
+  ```
+
+### Custom Cache Location & External Wrappers
+* **You want to put the shared build cache on a fast or larger secondary drive:**
+  ```bash
+  epicenter setup --cache-root /mnt/fast-nvme/rust-cache
+  ```
+* **You want to reset the cache path back to the default:**
+  ```bash
+  epicenter setup --use-default
+  ```
+* **You also use `kache` or `sccache` for cross-machine `rustc` wrapper caching:**
+  ```bash
+  epicenter setup --wrapper kache
+  # or
+  epicenter setup --wrapper sccache
+  ```
+
+---
+
+## 4. Detailed Workflows
+
+### Workflow 1: Daily Local Development (Set and Forget)
+
+Run once on your machine:
+
+```bash
+epicenter setup --preset dev --linker lld
+```
+
+What happens under the hood:
+1. Epicenter writes `[build] build-dir = '{cargo-cache-home}/epicenter/build'` to `~/.cargo/config.toml`.
+2. It configures `incremental = true` (unless a `rustc-wrapper` is active) and sets `build.jobs` based on your RAM (`min(cores, floor(RAM / 2 GiB))`).
+3. It configures Rust's bundled `lld` linker for your host target.
+4. From now on, every `cargo build`, `cargo check`, or `cargo test` in any directory automatically shares compiled dependencies.
+
+### Workflow 2: Using the Vault (`store harvest` & `store restore`)
+
+The shared `build/` directory is fast while warm, but `cargo clean` wipes it. The **Vault** (`store/`) makes your compiled dependencies permanent.
+
+```bash
+# 1. After building your project(s), save the compiled units into the vault
+epicenter store harvest
+
+# 2. Inspect what generations (toolchain + flags) are stored in the vault
+epicenter store vault
+
+# 3. Verify vault integrity (file sizes, timestamps, hashes, dependency ordering)
+epicenter store verify
+
+# 4. Anytime after a cargo clean or on a fresh directory, restore units
+epicenter store restore
+```
+
+* **Performance & Reflinks:** `harvest` and `restore` process independent unit groups in parallel (1 worker per core, capped at 8). On Unix, `harvest` copies or reflinks (`FICLONE` on btrfs/XFS/ZFS) artifacts into the vault so build outputs and `0444` store files never share a mutable inode.
+* **CPU-starved hosts:** By default, copied artifacts in the vault use content-addressed gzip compression (while `.rlib`/`.a` library outputs stay raw). To skip compression during harvest, pass `--no-compress`:
+  ```bash
+  epicenter store harvest --no-compress
+  ```
+* **Nightly toolchains:** `harvest` stores units matching the layout of the active toolchain. To harvest nightly builds:
+  ```bash
+  epicenter exec --harvest -- cargo +nightly build
+  # or
+  RUSTUP_TOOLCHAIN=nightly epicenter store harvest
+  ```
+
+### Workflow 3: AI Agents, Git Worktrees & Parallel Local Builds (`exec`)
+
+> **Important rule for multiple git worktrees & parallel agents:** If you are working on **multiple git worktrees of the same project** (or running concurrent AI agents/jobs), **use Epicenter `work` directories (`epicenter exec`)** instead of pointing concurrent builds at the shared writable `build/` directory. Cargo's build-dir lock serializes concurrent builds on the same `build/` directory—giving each git worktree or agent its own `--id` work directory eliminates lock waits while still sharing 100% of compiled dependencies from the read-only vault.
+
+How `epicenter exec` works:
+1. Reads the project's `Cargo.lock` and selects only the registry/git packages needed by this project from the read-only vault, then narrows to the child's Cargo profile (`debug` for `cargo build`/`test`, `release` for `--release`, `-r`, or `bench`). Path/workspace packages are never seeded.
+2. Creates a private work directory under the per-user OS cache (`$XDG_CACHE_HOME/epicenter/work/<id>/` by default, or `--work-root`) and seeds it in milliseconds (hard-linking immutable `.rlib`/`.a` archives from a local private vault, and copying mutable metadata/fingerprints).
+3. Pins `CARGO_BUILD_BUILD_DIR` (and `CARGO_TARGET_DIR` when `--target-dir` is passed) in the child process environment.
+4. Passes through the child command's `stdout`, `stderr`, and exit code unchanged.
+
+Common `exec` flags:
+* `--id <NAME>`: Name the job directory (`work/<NAME>/`). New job directories are created with `O_EXCL` and stamped with `.epicenter-job`.
+* `--reuse`: Continue in an existing job directory with the same `--id`. Epicenter refuses a directory it did not create, and refuses one that a running build is using. If the directory does not exist yet, `--reuse` simply creates it, so you can always pass it.
+* `--target-dir [DIR]`: Give the job its own `CARGO_TARGET_DIR` (defaults to `<work-dir>/target` if no path is given) so final binaries don't collide either.
+* `--work-root <PATH>`: Override the per-VM work directory root for this run.
+* `--harvest`: After the command succeeds, harvest newly built units back into the vault.
+* `--no-compress`: Skip gzip compression when used with `--harvest`.
+* `--rm`: Delete the job directory as soon as the command finishes.
+* `--cwd <DIR>`: Run the command in `<DIR>` and resolve `epicenter.toml` / `Cargo.lock` from there.
+
+#### Why `exec` records builds (the harvest trust boundary)
+
+A build directory is **untrusted input**. Cargo's fingerprint is just a set of
+files, so anything that can write the build dir — a foreign VM on a shared
+mount, a co-tenant, or a repository build script — can write a complete unit
+shape that looks exactly like a real one. No amount of shape validation can
+tell the two apart, because the attacker writes the same shape Cargo writes.
+
+`epicenter exec` therefore writes a small `ExecRecord` **next to the job dir**
+(`work/.exec-<id>.json`, in the private work root, never inside the build dir)
+before it starts the command. It records the job token, the canonical build
+root, the source directory, toolchain, command and timing. `harvest` checks
+that record before it signs anything:
+
+* A job dir (marked `.epicenter-job`) must have a matching record from this
+  host. A foreign VM cannot write the private work root, so it cannot mint one
+  and cannot make this host sign its bytes.
+* The shared build dir is signed only when it is a local, private directory. A
+  network/shared mount is refused unless you pass `--trusted`, which is an
+  explicit statement that every writer is in the same trust domain.
+* `exec` itself refuses a work root that is a network/shared mount, so a job
+  dir always lives on the machine that recorded it.
+
+This is a **provenance boundary, not a safety check**. It proves that this host
+ran the build; it does not prove the build is safe. A build script inside a
+recorded run can still write files, so treat untrusted source as code
+execution: build it in a sandbox (separate user/VM) or do not harvest it.
+
+Restore is bound the other way. A stored unit records the package version it
+was compiled from (read from rustc's `.d` source list at harvest), and `exec`
+seeds it only into a job whose `Cargo.lock` resolves the same
+`(package, version)` from a registry or git source. Path/workspace packages are
+skipped: their name and version do not identify the checkout, so a unit from
+another project could otherwise be seeded by accident. `exec` also narrows to
+the child's Cargo profile, so a debug job never inherits release units. The lock
+is parsed once per job and each check is a hash-map lookup, so the binding costs
+one small file read, not a per-unit scan. `store restore` applies the same
+package/source rule from the cwd `Cargo.lock`. With no readable lock, `exec` and
+`store restore` warn and seed without a lock filter; remote import is skipped
+(`store fetch --all` is the explicit unfiltered import).
+
+### Workflow 4: CI/CD & Multi-VM Fleets
+
+In CI or multi-VM agent fleets, share the **read-only vault** (`store/`) across VMs, and give each VM its own fast local writable `work/` directory.
+
+1. **Configure CI policy:**
+   ```bash
+   epicenter setup --preset ci --linker lld
+   ```
+   *(Or set `CI=true` in the environment—the default `auto` preset automatically switches to `ci` mode and sets `CARGO_INCREMENTAL=0`.)*
+2. **Configure local writable work root (`--work-root`):**
+   Keep disposable job directories on fast local VM disk (never on the read-only vault or slow `/mnt/c` mounts). The default is the per-user OS cache; `work` is global-only:
+   ```bash
+   epicenter setup --work-root /var/lib/epicenter/work
+   epicenter setup --work-root default   # reset to OS cache default
+   # Or override per job:
+   epicenter exec --work-root /var/lib/epicenter/work -- cargo test
+   ```
+3. **Keep fleet parity & check for duplicate variants:**
+   Every VM in a shared fleet must use the exact same Rust toolchain, host architecture, `RUSTFLAGS`, target, and Cargo profile settings.
+   * **Tip:** Set `debug = "line-tables-only"` (for shared dev+CI fleets) or `debug = 0` (for CI-only fleets) in `Cargo.toml`. Different `debug` levels produce different unit hashes and prevent sharing. (`strip` only affects the final binary, not dependency units.)
+   * **Audit profile/package duplication:** Run `epicenter store overlap` to see package/profile pools with their nominal and actual unique bytes (hard links and compression counted once), distinct variants, units sharing a fingerprint hash, and how many units are still linked in the shared build dir. Add `--detail` for one row per unit (hash, generation, age, active) or `--json` for scripts. Different hashes are feature/profile/flag variants and cannot be merged.
+   * **Share identical bytes:** `epicenter store compact` scans `units/` and `blobs/` and replaces duplicate files with hard links to one inode. It only links byte-identical content, never changes manifests, and prints a no-op when nothing matches. Run `epicenter store verify` afterward.
+4. **Vault signing (who can publish):**
+   The vault manifest is signed with Ed25519. Only the writer machine keeps the private key (in the per-user state folder; `doctor` shows the exact path). Readers only need the public key, which is stored in the vault as `.epicenter-pubkey`. You never copy the private key to other machines.
+5. **Builder / Uploader job (writable vault):**
+   ```bash
+   epicenter exec --harvest -- cargo build --locked
+   ```
+6. **Worker jobs (read-only vault mount):**
+   ```bash
+   epicenter exec --rm --target-dir -- cargo test --locked
+   ```
+   *(Note: Keep a checked-in `Cargo.lock` in the repo so `exec` seeds only the packages your project uses.)*
+7. **Clean up old job directories periodically:**
+   ```bash
+   epicenter store evict --work-dirs --older-than 2d --yes
+   ```
+8. **Optional OverlayFS (Linux):**
+   If you use `overlayfs` (or `fuse-overlayfs` rootless) for lazy copy-up, mount the `lowerdir` over a **materialized read-only build-dir view** (with `0644`/`0664` state files, not `0444`), not directly over the raw `store/` vault layout, and place Cargo's `upperdir` in the VM's local job directory.
+
+---
+
+### Workflow 5: CI Remote Dependencies (`remote` tier)
+
+CI compiles the dependencies once, signs them and publishes them to a bucket or an HTTPS
+location. Developers and agents fetch the verified units before building, so a clean
+checkout compiles only the workspace. This is **opt-in**: without a `[remote]` table, epicenter
+behaves exactly as before.
+
+#### Roles
+
+| Role | Runs | Needs | Writes |
+|---|---|---|---|
+| **Publisher** (CI, trusted) | `exec --harvest`, then `store publish` | AWS write credentials (or none for a local-only dry run), a persistent private identity directory | bucket: `blobs/`, `indexes/`, `publisher.json`, `index.json` |
+| **Reader** (developer, agent, CI test job) | `setup --remote-*` once, then `exec` | Anonymous HTTPS, or a read-only S3 role | local cache and local vault only |
+
+Readers never write the bucket. The publisher never trusts the bucket for keys.
+
+#### Trust rules (read before rolling out)
+
+1. The **public key comes from the publisher's job log or an admin channel**, never from the
+   bucket. The bucket is untrusted storage.
+2. A reader is only as good as its pin. Rotating the key means re-running `setup` on every reader.
+3. Remote units are an exact match. Toolchain, host, target, profile, `RUSTFLAGS`/config,
+   layout, registry source and `CARGO_HOME` must all match; anything else is a silent miss that
+   builds locally.
+4. Keep the reader and publisher on the same runner class (OS, architecture, libc) and the same
+   pinned toolchain. A `ubuntu-latest` reader will not match a self-hosted publisher with a
+   different glibc or rustc.
+5. Epicenter does not prove a dependency is safe. It proves the publisher signed it.
+
+#### Publisher (CI, trusted branches only)
+
+Run the publisher only for trusted events (`push` to the default branch, a schedule, or
+`workflow_dispatch`). Never use `pull_request_target` and never run it on fork PRs.
+
+```yaml
+name: epicenter-publish
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'            # weekly; the index expires after 30 days by default
+  workflow_dispatch:
+
+permissions:
+  id-token: write                  # OIDC to AWS; no long-lived keys in the repo
+  contents: read
+
+concurrency:
+  group: epicenter-publish-linux-x64
+  cancel-in-progress: false        # one writer per bucket and host class
+
+jobs:
+  publish:
+    runs-on: [self-hosted, linux, x64, epicenter]   # persistent identity directory
+    env:
+      CARGO_HOME: /var/lib/epicenter/cargo-home     # identical on every reader
+      EPICENTER_PUBLISHER_STATE: /var/lib/epicenter/publisher
+      EPICENTER_REMOTE: s3://${{ vars.EPICENTER_BUCKET }}/deps
+      EPICENTER_READER_URL: https://cache.example/deps
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master          # pin the commit SHA in your fork
+        with:
+          toolchain: 1.91.0                          # the exact fleet version
+      - run: cargo install epicenter-cli --version <pinned> --locked
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/epicenter-publisher
+          aws-region: eu-west-1
+      - run: epicenter setup --preset ci
+      - run: epicenter exec --harvest -- cargo build --locked
+      - name: Rehearse the publish (no remote writes)
+        run: epicenter store publish --dry-run --url "$EPICENTER_REMOTE" --reader-url "$EPICENTER_READER_URL" --tier libraries --profile debug
+      - name: Publish
+        run: epicenter store publish --url "$EPICENTER_REMOTE" --reader-url "$EPICENTER_READER_URL" --tier libraries --profile debug
+```
+
+What each step does:
+- `exec --harvest` builds with the same flags readers use and stores the new units locally.
+- `store publish --dry-run` fetches the current pointer read-only and stages the index locally.
+- `store publish` signs the index, uploads the immutable objects first, writes `publisher.json`
+  and `index.json` last, and prints the reader handoff.
+
+The first publish creates the identity under `EPICENTER_PUBLISHER_STATE` and prints the public
+key and the exact reader `setup` line in the job summary. Copy that line once into the reader's
+setup. Later publishes reuse the identity silently.
+
+**Publisher caveats:**
+- The identity directory must persist and stay private. Do not put it in a GitHub Actions cache,
+  artifact, repository, bucket or the vault. A GitHub-hosted runner is ephemeral and loses it, so
+  use a persistent self-hosted runner. If an index exists but the identity is missing, publish
+  fails closed. Restore the directory or rotate deliberately with `--rotate-key`; never
+  auto-rotate.
+- The index expires after 30 days by default (`--valid-for`, maximum 90 days). Keep the schedule
+  shorter than the validity window. An expired index makes readers fall back to local builds.
+- A missing pointer with prior publish state fails closed. Use `--reset-sequence` only for a
+  deliberate recovery, never in automation.
+- Set a bucket lifecycle rule that aborts incomplete multipart uploads (for example after one day).
+- Required IAM: readers need `s3:GetObject` on `prefix/*`. Publishers add `s3:PutObject` and
+  `s3:AbortMultipartUpload` on `prefix/*`. `s3:ListBucket` is optional and only turns a missing
+  object's 403 into a clean 404. epicenter never deletes objects.
+
+#### Reader (developers, agents, CI test jobs)
+
+One-time setup with the handoff line from the publisher's job summary:
+
+```bash
+epicenter setup --remote-url https://cache.example/deps --remote-key <public-key> --remote-tier libraries
+```
+
+Then use the normal commands. Remote fetch happens inside `exec`, before the build:
+
+```bash
+epicenter exec -- cargo test --locked
+```
+
+A successful fetch prints one line:
+
+```text
+  remote      N unit(s) · M file(s) · X MiB
+```
+
+Readers need no credentials for a public HTTPS endpoint. A private S3 bucket needs a read-only
+role. Readers in CI on the same runner class as the publisher can use the same job:
+
+```yaml
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, epicenter]
+    env:
+      CARGO_HOME: /var/lib/epicenter/cargo-home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.0
+      - run: cargo install epicenter-cli --version <pinned> --locked
+      - run: epicenter setup --remote-url https://cache.example/deps --remote-key "$EPICENTER_PUBLIC_KEY" --remote-tier libraries
+        env:
+          EPICENTER_PUBLIC_KEY: ${{ vars.EPICENTER_PUBLIC_KEY }}
+      - run: epicenter exec -- cargo test --locked
+```
+
+For fork PRs, GitHub gives no secrets. Use anonymous HTTPS (no AWS keys needed) or skip the
+remote and build locally with `epicenter exec --no-remote -- cargo test --locked`.
+
+**Reader rules:**
+- Pass `--locked` and keep a checked-in `Cargo.lock`. Without a readable lock, remote fetch is
+  skipped.
+- Do not pass `--target` to `exec`. Remote fetch is not used for a child `--target`.
+- Keep `CARGO_HOME` identical to the publisher's. A different path is a silent miss.
+- Use `--no-remote` to isolate a problem; it skips both the fetch and the cache overlay.
+
+#### Troubleshooting zero hits
+
+| You see | Meaning | Fix |
+|---|---|---|
+| `remote  skipped: <reason>` from `exec` | Fetch was not used; the reason names the cause | Follow the reason below |
+| `doctor`: `remote index has expired` | The signed index is past its validity | Ask CI to publish; check the schedule |
+| `doctor`: `compatibility mismatch` with listed items | Toolchain, flags, layout, `CARGO_HOME` or source path differ | Align the toolchain and `CARGO_HOME` with the publisher |
+| `doctor`: `no verified index yet` | Nothing fetched yet | Run `exec` once with network access |
+| `doctor`: `remote credentials unavailable` | S3 credentials are missing or the profile is not owner-only | Configure the AWS environment or a private profile |
+| `doctor`: `remote S3 transport has no region` | `AWS_REGION` / `AWS_DEFAULT_REGION` is unset | Export the region |
+| `doctor`: `CARGO_HOME ... differs` | Raw `cargo` uses another home than `exec` | Use `exec` for remote-seeded builds |
+
+#### For AI agents
+
+- Never run `store publish` outside the CI publisher job.
+- Never take the public key from the bucket or from a file the bucket delivered. Use the
+  handoff line from CI.
+- Never put `[remote]` endpoint, key or credential fields in a project `epicenter.toml`; the
+  project may only set `tier`.
+- Never pass a private key on the command line. The publisher reads the identity directory only.
+- Use `exec` for cargo builds that should use the remote, `exec --no-remote` for local-only runs,
+  and `doctor --json` for the machine-readable status.
+
+---
+
+## 5. Configuration Reference (`epicenter.toml` & Presets)
+
+Cargo's `~/.cargo/config.toml` owns `[build] build-dir`. Epicenter's policy lives in `epicenter.toml`.
+
+### Precedence Order
+For every setting, Epicenter resolves values in this exact order:
+1. **CLI flags** (highest priority)
+2. **Project `epicenter.toml`** (nearest file walking up from current directory; read-only, never modified by Epicenter)
+3. **Global `epicenter.toml`** in the per-user OS config directory (updated when you pass `--preset`, `--memory`, `--linker`, `--work-root`, or `--cargo-home` to `epicenter setup`):
+   - Linux/BSD: `${XDG_CONFIG_HOME:-$HOME/.config}/epicenter/epicenter.toml`
+   - macOS: `$HOME/Library/Application Support/epicenter/epicenter.toml`
+   - Windows: `%APPDATA%\epicenter\epicenter.toml`
+4. **`auto` defaults** (lowest priority)
+
+The old `$CARGO_HOME/epicenter.toml` is no longer read or written. `doctor` reports it as legacy and prints the move command. Make relative `store` and `work` values absolute before moving the file; the new location is their base.
+
+`[remote] tier` follows project > global > `libraries`; all other `[remote]` fields are global-only.
+
+### The 7 Keys of `epicenter.toml`
+
+All keys are top-level (no `[section]` headers).
+
+```toml
+# Example project or global epicenter.toml
+preset = "dev"                   # "auto" | "dev" | "ci"
+memory = "16GiB"                 # RAM budget for job calculation (e.g. "16GiB", "8192MiB", or 16384)
+linker = "lld"                   # "auto" | "system" | "lld" | "wild"
+store  = "~/.cargo/epicenter/store" # Path to the durable vault
+work   = "~/.cache/epicenter/work"  # Global-only job-dir root
+cargo_home = "/opt/epicenter/cargo" # Global-only, absolute, identical on every VM
+link   = "auto"                  # "auto" | "copy" | "link"
+```
+
+| Key | Values | Default | What it does |
+|---|---|---|---|
+| `preset` | `"auto"`, `"dev"`, `"ci"` | `"auto"` | Controls `incremental` and `build.jobs`. See table below. |
+| `memory` | `"16GiB"`, `"8192MiB"`, or integer MiB | Physical RAM | Sets `build.jobs = min(cores, floor(memory / 2 GiB))` (minimum 1). |
+| `linker` | `"auto"`, `"system"`, `"lld"`, `"wild"` | `"auto"` | `auto` leaves flags untouched; `system` removes Epicenter linker flags; `lld`/`wild` select a linker explicitly. (CLI also accepts `mold` and `gold`). |
+| `store` | File path string | `$CARGO_HOME/epicenter/store` | Location of the durable vault. |
+| `work` | File path string | Per-user OS cache | Local job-dir root for `exec`, `evict --work-dirs`, `status` and `doctor`. Global-only; a project cannot set it. |
+| `cargo_home` | Absolute path string | Shell `CARGO_HOME` or `~/.cargo` | Global-only `CARGO_HOME` for `exec`. Must be identical on every machine/VM that shares remote units; no `~`, relative path or `..`. A project cannot set it. |
+| `link` | `"auto"`, `"copy"`, `"link"` | `"auto"` | How `restore`/`exec` materialize `.rlib`/`.a` files. `auto` hard-links from a private local store (owner-only ACL on Windows) and copies from network/shared mounts (`9p`, `drvfs`, `NFS`, `SMB`, etc.) or a Windows store with a permissive DACL. `copy` never hard-links. `link` forces hard links on a trusted store but still copies from a mutable store whose Windows DACL is not owner-only (only allowed in global `epicenter.toml`, projects can only tighten to `auto` or `copy`). |
+
+`cargo_home` is opt-in and global-only. `epicenter setup --cargo-home PATH` creates a missing directory with private permissions (or validates an existing real directory), never copies the registry or Cargo credentials, and pins `exec`'s child `CARGO_HOME` to that absolute path. `epicenter setup --cargo-home default` clears it. The same absolute path must be used by the CI publisher and every reader; a different path changes Cargo's source `path` hash and the remote unit is a miss. Raw `cargo` outside `exec` still uses the shell's `CARGO_HOME`; `doctor` warns when the two differ.
+
+### Remote Policy (`[remote]`)
+
+Remote artifact distribution uses a deliberately small table:
+
+```toml
+[remote]
+tier = "libraries"                 # "libraries" | "full"
+url = "https://cache.example/epicenter"
+publisher_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+- `tier` defaults to `libraries`. A project may set only `[remote] tier`; it can tighten `full` to `libraries`, and may select `full` only when the global tier is already `full`.
+- `url` selects the transport: `https://` is anonymous GET, `s3://bucket/prefix` is authenticated S3 (SigV4). TLS is mandatory for both; redirects and non-identity content encodings are refused. Region and credentials come from `AWS_REGION`/`AWS_DEFAULT_REGION` and the AWS environment or a shared profile; custom S3-compatible endpoints use `AWS_ENDPOINT_URL_S3`. The credentials file must be a regular, owner-only file (`0600`/private DACL). Proxies and `SSL_CERT_FILE` are environment-only. No IMDS/ECS metadata, and no secrets in `epicenter.toml`. Unix builds use `rustls`; Windows uses the OS Schannel provider, with the same certificate-validation policy.
+- `publisher_key` is the pinned Ed25519 public key, 64 hex characters. The short key id is derived from its fingerprint (`ed25519:<16 hex>`). Obtain the key from the CI job summary or an admin-managed channel, **never from the bucket**.
+- The remote import cache defaults to the per-user OS cache (`$XDG_CACHE_HOME/epicenter/remote`, `~/Library/Caches/epicenter/remote`, or `%LOCALAPPDATA%\epicenter\remote`); it is not configurable in the policy file.
+- `epicenter setup --remote-url URL --remote-key HEX|FILE --remote-tier libraries|full` writes the global table and prints the derived key id. `--remote-off` removes it.
+- `epicenter exec --no-remote` and `epicenter store restore --no-remote` force a local-only operation.
+- `doctor` reports the effective tier/source, enabled state, endpoint, key id, transport/region, cache path, credential source and resolved S3 endpoint; `--json` uses the same shape. It warns when an S3 endpoint has no region or credentials.
+
+**Publisher-key handoff:** CI prints the public key and its key id; a developer copies the exact `setup --remote-key ...` command or file from that trusted output. A key fetched from the bucket is only a TOFU hint, not a trust anchor, and epicenter does not use it automatically.
+
+#### Index and CAS layout
+
+A published bucket is deliberately small:
+
+```text
+index.json                 small Ed25519-signed pointer
+indexes/<sha256>.json      immutable canonical index body
+publisher.json             human-readable copy of the signed metadata
+blobs/<sha256>             immutable stored file (gzip or raw)
+```
+
+- `index.json` carries the schema, publisher key id, sequence, created/expiry, body SHA-256/size and the signature over its canonical bytes (domain-separated).
+- `indexes/<sha256>.json` is the canonical body: tier, publisher metadata, compatibility tuple and unit/file refs. It is immutable and addressed by the hash the signed pointer commits to.
+- `blobs/<sha256>` stores one file per object. The index records the stored hash/size and the decoded hash/size, so a reader verifies the object before decompressing it and verifies the decoded bytes again.
+- `publisher.json` mirrors the signed metadata for humans and CI logs; it is not a trust anchor.
+
+Remote parsing is strict: fields and paths are bounded, control/bidi formatting characters are rejected, registry/git URLs must not embed credentials, and an S3 prefix cannot contain empty, `.`, or `..` components. Blob imports stream against the signed decoded size; only small blobs are buffered in memory.
+
+Readers verify the pointer signature, key id, sequence/expiry, body hash/size/canonical form and then each blob. They keep the highest accepted sequence per endpoint/key under the OS state directory and reject rollback, same-sequence equivocation and expired indexes. Rotation/revocation is a trusted-channel operation: re-pin the new key with `setup`; an old-key index fails both the key-id and signature checks. A deliberate sequence reset under the same key requires clearing the local state.
+
+`libraries` indexes contain only non-executable library/metadata units. `full` may add build-script trees and proc-macro/shared objects; a `libraries` reader accepts a `full` index but imports only non-executable units (the reader-side filter is the boundary). Path/workspace units are always excluded. `doctor` compares the last verified index tuple (rustc, Cargo, target, cargo home, flags, layout, registry source path) with this machine and names each mismatch; the reader applies the same tuple before filtering units.
+
+**Reader cache and import.** `exec` and `store restore` fetch before seeding. Verified pointer/body/blobs are cached under the per-user remote cache, and a still-valid cached index may be reused when the network is offline. The cache root, endpoint directory and cache-store directory are rejected if they are symlinks/reparse points before any read or write. Units are selected by machine tuple, tier, child profile (`--release`/`--profile`), layout and `Cargo.lock` package/version/source; only the selected units' blobs are fetched. Import stages complete unit groups, stamps raw files, keeps store files read-only, preserves gzip objects, merges the manifest once and re-signs it with the local key. A miss, incompatibility, tamper, timeout or offline falls back to a local build; `--no-remote` skips fetch and the cache overlay. Remote fetch is skipped for non-cargo commands, a missing/unreadable lock and a child `--target`.
+
+When the configured store is read-only, imported units go to `<remote.cache>/<endpoint+key-id>/store` and restore layers the main store first, then that cache store. The cache store is an ordinary signed vault: it is the seam for a host-populated **read-only** cache in the later multi-VM topology. A shared writable cache is out of scope. The hidden `store fetch [--dry-run] [--unit Q] [--all]` command verifies and imports without running a build; `--all` is required when no lock is available.
+
+### CI Publisher
+
+CI is the only trusted publisher. The hidden `epicenter store publish` command turns **one store generation** into a signed index, uploads it with conditional S3 writes, and prints the reader handoff:
+
+```bash
+epicenter exec --harvest -- cargo build --locked
+epicenter store publish \
+  --url s3://bucket/prefix \
+  --reader-url https://cache.example/prefix \
+  --tier libraries \
+  --profile debug
+```
+
+- It reads `Cargo.lock` (or `--lockfile`) and refuses an ambiguous or missing lock. Workspace/path packages and `Other` units are skipped.
+- `libraries` publishes only non-executable library units; `full` also includes build-script compile/run units. Proc-macro `.so` units are executable and therefore `full`-only.
+- A generation with several profiles requires `--profile`. Use `--generation` to override the active parity key and `--toolchain` when the build used a rustup selector.
+- Vault gzip objects are reused; the publisher verifies the decoded size/hash and the stored bytes before staging. It never recompresses.
+- It writes `blobs/`, `indexes/`, `publisher.json` and `index.json` into a private staging directory (`--out-dir`) and verifies the tree through the reader path.
+- Uploads use SigV4: immutable blobs and the index body are put-if-absent; `publisher.json` and `index.json` are written last. Blobs of 100 MiB or more use multipart upload with bounded part concurrency and abort on failure. The pointer uses `If-Match`/`If-None-Match`, is read back after upload, and a same-sequence pointer with different bytes is refused.
+- IAM: readers need `s3:GetObject` on `prefix/*`. Publishers need `s3:GetObject` and `s3:PutObject` on `prefix/*`, plus `s3:AbortMultipartUpload` (multipart cleanup). `s3:ListBucket` is optional: it only turns a missing-object `HEAD` into a clean 404 instead of 403, and the publisher treats both as absent. No `s3:DeleteObject` is used.
+- `--sequence` is only for explicit recovery; the default advances past the staged index and refuses a rollback. `--valid-for` defaults to `30d` (max `90d`).
+- Configure a bucket lifecycle rule that aborts incomplete multipart uploads (for example after one day). The publisher aborts its own parts on failure, but a lost `CreateMultipartUpload` response can still leave an orphan.
+
+**Publisher identity.** The CI job owns the signing identity. On first publish the publisher creates a private key under the OS state directory (`$XDG_STATE_HOME/epicenter/publisher`, macOS Application Support, or `%LOCALAPPDATA%\epicenter\publisher`; override with `--publisher-state` or `EPICENTER_PUBLISHER_STATE`). It prints the public key and the exact `setup` handoff in the job summary; later publishes reuse the identity silently.
+
+- The identity directory must be **persistent and private**. It also stores the last published sequence/ETag per endpoint, so a missing remote index cannot silently restart at 1. Do not put it in a CI cache, artifact, repository, bucket or the vault.
+- If an index already exists but the identity is missing, the publisher fails closed instead of silently rotating. Restore the directory or use `--rotate-key` and re-pin readers.
+- `--rotate-key` is manual. Readers must re-pin through the trusted channel; there is no automatic rotation.
+- The private key is never accepted on the command line and never printed. `--expect-key-id` (or the global `publisher_key`) rejects an unexpected identity before signing.
+- The publisher fetches the remote `index.json` before staging, verifies its signature and key id, and advances the sequence. If the pointer is missing but `publisher.json` or publisher state says this bucket was published before, it fails closed unless `--reset-sequence` is explicit. `--dry-run` fetches the pointer read-only, stages locally and prints the plan without writing.
+
+The printed handoff is public data:
+
+```bash
+epicenter setup --remote-url '<reader-url>' --remote-key '<public-key>' --remote-tier libraries
+```
+
+### Presets Explained (`auto`, `dev`, `ci`)
+
+| Preset | Best For | What `setup` writes to Cargo config | What `exec` sets |
+|---|---|---|---|
+| `auto` | General use | Sets `build.jobs` if missing (or if `--memory` is passed); leaves `incremental` untouched | Sets `CARGO_INCREMENTAL=0` if `CI` env var is truthy (`1`, `true`, `yes`); otherwise keeps Cargo config |
+| `dev` | Local coding loop | `incremental = true` (or `false` if a wrapper is active) + `build.jobs` | `CARGO_INCREMENTAL=1` (unless a wrapper is active) |
+| `ci` | CI & AI agents | `incremental = false` + `build.jobs` | `CARGO_INCREMENTAL=0` |
+
+### Linker Support Matrix
+
+| Linker Flag | OS / Target Support | Requirements |
+|---|---|---|
+| `--linker lld` | Linux, BSD, Windows MSVC | **None** — uses the `lld` already bundled inside your `rustup` toolchain. (Refused on macOS). |
+| `--linker wild` | Linux ELF, `wasm32` | `wild` on `PATH` + `clang` (or GCC 16.1+). |
+| `--linker mold` | Linux ELF | `mold` on `PATH` + `clang`. |
+| `--linker gold` | Linux ELF | `gold` on `PATH` + `clang`. |
+| `--linker system` | All | Removes any linker flags managed by Epicenter. |
+| `--linker auto` | All | Leaves existing `rustflags` completely alone. |
+
+The old `--fast` and `--without-fast` flags were removed. Pick `--linker lld` or `--linker system` explicitly.
+
+*Note: Changing linkers alters `RUSTFLAGS`, which creates a new unit hash generation in Cargo and the vault. After switching linkers, run one `cargo build` and then `epicenter store harvest`.*
+
+---
+
+## 6. Observability & Diagnostics (`status` & `doctor`)
+
+### Checking Cache Status & Unit Forensics
+```bash
+# High-level overview of build cache, vault, and work directories
+epicenter status
+
+# Machine-readable JSON output (ideal for AI agents and scripts)
+epicenter status --json
+
+# Inspect all cached units, grouped by package and toolchain generation
+epicenter status --units
+
+# Filter unit forensics by package name
+epicenter status --units --filter serde
+
+# Deep-dive into a single unit (hashes, features, dependencies, artifacts, FRESH/DIRTY verdict)
+epicenter status --unit serde
+```
+
+### Auditing Health with `doctor`
+Run `epicenter doctor` whenever something feels slow or misconfigured:
+```bash
+epicenter doctor
+epicenter doctor --json
+```
+`doctor` checks and reports in plain language:
+* Cargo config and `epicenter.toml` agreement
+* Cargo profile audit (`jobs`, `codegen-units`, `lto`, `debug`, `split-debuginfo`, plus last calibrated build time/RSS)
+* Wrapper (`kache`/`sccache`) health
+* Filesystem performance warnings (e.g., warning if your WSL cache accidentally points to a slow `/mnt/c` Windows mount)
+* Toolchain and mtime ordering integrity
+* Vault health and legacy config reminders
+
+---
+
+## 7. Reclaiming Disk Space: `prune` vs `evict`
+
+Both commands run in **dry-run mode by default** so you never delete files by accident. Add `--yes` to actually delete.
+
+### Quick Rule of Thumb
+* **Use `epicenter store prune`** for routine age-based housekeeping of the shared `build/` directory (never touches the vault).
+* **Use `epicenter store evict`** to deliberately remove specific crates, stale toolchain generations, broken units, or finished agent `work/` directories across the vault and views.
+
+### `prune` Examples (Housekeeping the Shared Build Dir)
+```bash
+# Preview removing build-dir units untouched for 30 days (default)
+epicenter store prune
+
+# Delete build-dir units untouched for 60 days
+epicenter store prune --older-than 60d --yes
+
+# Keep only the 2 newest unit groups per package/kind and delete older ones
+epicenter store prune --keep-latest 2 --yes
+
+# Prune only incremental compilation state, keeping only the latest 1
+epicenter store prune --incremental --keep-latest 1 --yes
+```
+
+### `evict` Examples (Deliberate Removal Across Tiers)
+
+ Epicenter separates **nominal size**, **bytes actually freed** (last hard link removed), and **links released** (another tier still holds a hard link to the file), so disk reports never lie.
+
+```bash
+# Remove a specific unit from both the vault and all build/work views
+epicenter store evict --unit regex --tier all --yes
+
+# Remove a unit from the vault ONLY (working build dirs keep functioning)
+epicenter store evict --unit regex --tier store --yes
+
+# Remove a unit from working views ONLY (vault stays untouched)
+epicenter store evict --unit regex --tier view --yes
+
+# Surgical cache-bust: unlink one crate from one specific job dir (or 'build')
+epicenter store evict --work agent-1 --crate my-patched-dep --yes
+
+# Delete an entire old toolchain/flag generation from the vault
+epicenter store evict --generation <parity-key> --yes
+
+# Bulk evict stale units, incomplete "husk" units, or units older than 90 days
+epicenter store evict --stale --yes
+epicenter store evict --husks --yes
+epicenter store evict --older-than 90d --yes
+
+# Clean up finished agent/CI job directories older than 7 days (default)
+# (Live builds holding a lock are automatically skipped)
+epicenter store evict --work-dirs --older-than 7d --yes
+
+# Immediately delete one specific finished job directory right now
+epicenter store evict --work-dir agent-1 --yes
+```
+
+---
+
+## 8. Cross-OS & Toolchain Notes
+
+* **One Config Everywhere:** Epicenter writes `build-dir = '{cargo-cache-home}/epicenter/build'` using forward slashes and Cargo's native `{cargo-cache-home}` template token. Cargo expands this at build time, so the exact same config works across Linux, WSL, macOS, and Windows.
+* **Windows `%USERPROFILE%\.cargo` owner:** an elevated installer may leave `.cargo` owned by `Administrators` instead of the user. Epicenter accepts that when the DACL grants write access only to the current user, `SYSTEM`, `Administrators` or the object owner; it rejects a permissive DACL. If the directory is not writable by the user, either repair its ACL (`icacls`) or point `epicenter setup --cargo-home PATH` at a private directory.
+* **WSL Best Practice:** Your source code can stay on `/mnt/c/...`. Keep the Epicenter cache (`~/.cargo/epicenter/`) and the `work/` directory on the Linux filesystem. Linux ext4 I/O is 10–30× faster than `/mnt/c`. `epicenter doctor` warns if the cache drifts onto a Windows mount.
+* **Never Hardcode Windows Backslash Paths:** Do not manually write `C:\...` into `~/.cargo/config.toml` if WSL shares that file. Always use `epicenter setup --cache-root ...` so paths stay portable.
+* **Cargo Build-Dir Layouts (1.91+ vs 1.100+ / Nightly):**
+  Cargo 1.91–1.99 uses the classic layout (`<profile>/.fingerprint/...` plus `<profile>/deps/...`), while Cargo 1.99 nightly and 1.100+ use the new per-unit layout (`<profile>/build/<pkg>/<hash>/{fingerprint,out,run}/...`). Epicenter inspects and supports both layouts side-by-side automatically.
+* **Cargo 1.100: nothing to enable.** The new layout is the default. The setting you use is `build.build-dir` (stable since Cargo 1.91), which `epicenter setup` writes for you. Intermediate files go to the shared build dir. Final binaries still go to each project's `target/`. In 1.100, different `--features`, profiles, and git worktrees no longer overwrite each other's units.
+* **What Cargo does not do on its own.** Cargo does not clean up old build artifacts in a shared build dir, does not lock builds finely, and does not share cache between machines. Builds that share one build dir wait for each other on its lock, so parallel jobs must each use `epicenter exec`. Use `epicenter store prune` or `store evict` to reclaim space, and the vault to share between machines.
+* **`cargo clean` also wipes the shared build dir.** `cargo clean` removes both `target/` and the shared build dir. The vault (`store/`) survives, so `epicenter store restore` brings units back. To drop only final binaries, delete the project's `target/` folder. To clean one job, run `cargo clean` inside `epicenter exec`.
+* **Upgrading to Cargo 1.100.** Cargo 1.100 does not reuse classic-layout units, so expect one full recompile. Old directories stay on disk until you clean them. `epicenter store prune` and `store evict` handle both layouts. A different `rustc` version always means a full rebuild.
+
+---
+
+## 9. Complete Command Cheat Sheet
+
+| Command | Description |
+|---|---|
+| `epicenter setup` | Configure shared build dir with `auto` preset; backs up touched config files |
+| `epicenter setup --preset auto\|dev\|ci` | Set build jobs and incremental compilation policy |
+| `epicenter setup --linker auto\|system\|lld\|wild\|mold\|gold` | Configure linker flags in global Cargo config |
+| `epicenter setup --memory <SIZE>` | Set RAM budget (e.g. `16GiB`) for `2 GiB/job` concurrency calculation |
+| `epicenter setup --cargo-home PATH\|default` | Set or clear the global absolute `CARGO_HOME` used by `exec` |
+| `epicenter setup --remote-url URL --remote-key HEX\|FILE [--remote-tier libraries\|full]` | Pin a remote endpoint and publisher key in the global `[remote]` table |
+| `epicenter setup --remote-off` | Remove the global `[remote]` policy table |
+| `epicenter setup --write-profile [--dev-debug full\|line\|none]` | Write recommended profile settings to workspace `Cargo.toml` (with backup) |
+| `epicenter setup --measure` | Run a calibration `cargo build` after setup to record wall time and peak RSS |
+| `epicenter setup --wrapper kache\|sccache\|none` | Configure an external `rustc-wrapper` |
+| `epicenter setup --cache-root <PATH>` / `--use-default` | Set a custom shared build dir path or reset to default |
+| `epicenter setup --work-root <PATH\|default>` | Set or reset the local per-VM job-dir root (`work` in global `epicenter.toml`) |
+| `epicenter setup --dry-run` | Print effective policy and config diffs without writing anything |
+| `epicenter setup --revert` | Restore the newest backups of Cargo config and global `epicenter.toml` |
+| `epicenter status [--json]` | Show cache sizes and tier summary |
+| `epicenter status --units [--filter <Q>]` | Show per-package unit forensics and generations (alias: `who`) |
+| `epicenter status --unit <NAME>` | Inspect one unit's hashes, deps, files, and freshness (alias: `why`) |
+| `epicenter doctor [--json]` | Audit config, profile, wrapper, filesystem, toolchain, mtimes, and vault |
+| `epicenter exec [FLAGS] -- <CMD>` | Run `<CMD>` in an isolated per-job build dir seeded from the vault |
+| `epicenter exec --no-remote [FLAGS] -- <CMD>` | Force a local-only job; skip remote compatible-unit fetch |
+| `epicenter store harvest [--unit <Q>] [--no-compress] [--dry-run] [--trusted]` | Save compiled units from the shared build dir into the durable vault (`--trusted` accepts a shared/network build dir) |
+| `epicenter store restore [--into <DIR>] [--unit <Q>] [--dry-run]` | Seed a build dir (default: shared build dir) from the vault, filtered by the cwd `Cargo.lock` when present |
+| `epicenter store restore --no-remote ...` | Skip remote compatible-unit fetch while restoring |
+| `epicenter store fetch [--dry-run] [--unit <Q>] [--all]` (hidden) | Verify/import compatible remote units without running a build |
+| `epicenter store publish ...` (hidden) | CI-only: sign, conditionally upload and print the remote index handoff (`--dry-run` stages only) |
+| `epicenter store vault` | List vault generations, sizes, and active status |
+| `epicenter store verify` | Verify vault file sizes, timestamps, hashes, and list active `work/` dirs |
+| `epicenter store overlap [--json] [--detail]` | Report package/profile variants, unique bytes, and active units in the vault |
+| `epicenter store compact [--generation <Q>] [--dry-run]` | Hard-link identical files and blobs in the vault; manifests stay unchanged |
+| `epicenter store prune [--older-than 30d] [--keep-latest N] [--incremental] [--yes]` | Age/count-based cleanup of the shared build dir (dry-run without `--yes`) |
+| `epicenter store evict [SELECTOR] [--tier all\|store\|view] [--yes]` | Deliberately remove units, generations, or `work/` dirs (dry-run without `--yes`) |

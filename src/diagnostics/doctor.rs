@@ -1,0 +1,2266 @@
+//! `epicenter doctor`: one check per known failure mode of a shared
+//! build-dir setup. Each check emits one line with a severity icon; the
+//! checks are grouped into sections for printing.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use anyhow::Result;
+
+use crate::fingerprint::{ArtifactInfo, Unit};
+use crate::paths;
+use crate::settings::{self, Settings};
+use crate::util::{human_age, human_bytes, human_duration, metadata_nofollow};
+use crate::who;
+
+/// Severity of one check.
+#[derive(Debug, Clone, Copy)]
+pub enum Level {
+    Pass,
+    Info,
+    Warn,
+    Fail,
+}
+
+impl Level {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Level::Pass => "pass",
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Fail => "fail",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Level::Pass => crate::util::GLYPH_PASS,
+            Level::Info => crate::util::GLYPH_INFO,
+            Level::Warn => crate::util::GLYPH_WARN,
+            Level::Fail => crate::util::GLYPH_FAIL,
+        }
+    }
+}
+
+/// One doctor check result, tagged with its section for grouped printing.
+pub struct Check {
+    pub section: &'static str,
+    pub level: Level,
+    pub message: String,
+}
+
+pub const SEC_CACHE: &str = "shared cache";
+pub const SEC_CONFIG: &str = "configuration";
+pub const SEC_WRAPPER: &str = "wrapper";
+pub const SEC_FS: &str = "filesystem";
+pub const SEC_TC: &str = "toolchain";
+pub const SEC_MTIME: &str = "mtime discipline";
+
+fn check(section: &'static str, level: Level, message: impl Into<String>) -> Check {
+    Check {
+        section,
+        level,
+        message: message.into(),
+    }
+}
+
+/// The full checklist.
+pub fn run() -> Result<Vec<Check>> {
+    let mut checks = Vec::new();
+
+    // Everything hangs on resolving the cache dir; if it fails, say so in
+    // check language instead of crashing the whole report.
+    let root = match crate::config::trusted_cache_root() {
+        Ok(root) => root,
+        Err(e) => {
+            return Ok(vec![check(
+                SEC_CACHE,
+                Level::Fail,
+                format!("could not resolve the shared cache dir ({e:#}) — run `epicenter setup`"),
+            )]);
+        }
+    };
+
+    let work_root = crate::exec::work_root(&root);
+    checks.push(check(
+        SEC_CACHE,
+        Level::Info,
+        format!("work root: {}", work_root.display()),
+    ));
+    #[cfg(target_os = "linux")]
+    if work_root.to_string_lossy().starts_with("/mnt/") {
+        checks.push(check(
+            SEC_CACHE,
+            Level::Warn,
+            format!(
+                "work root {} is on a Windows-mounted WSL path — keep job dirs on ext4/local disk",
+                work_root.display()
+            ),
+        ));
+    }
+    if work_root.starts_with(&root) || root.starts_with(&work_root) {
+        checks.push(check(
+            SEC_CACHE,
+            Level::Warn,
+            format!(
+                "work root {} overlaps the shared cache root {} — choose a separate local directory",
+                work_root.display(),
+                root.display()
+            ),
+        ));
+    }
+
+    let store_root = crate::vault::store_root(&root);
+    if store_root.is_dir() {
+        let pubkey = store_root.join(crate::vault::PUBKEY_FILE);
+        checks.push(if pubkey.is_file() {
+            check(
+                SEC_CACHE,
+                Level::Info,
+                format!("vault public key: {}", pubkey.display()),
+            )
+        } else {
+            check(
+                SEC_CACHE,
+                Level::Warn,
+                format!(
+                    "vault has no Ed25519 public key at {} — re-harvest on the writer for multi-VM sharing",
+                    pubkey.display()
+                ),
+            )
+        });
+    }
+
+    // Shared cache dir exists.
+    checks.push(if root.is_dir() {
+        check(
+            SEC_CACHE,
+            Level::Pass,
+            format!("shared cache exists at {}", root.display()),
+        )
+    } else {
+        check(
+            SEC_CACHE,
+            Level::Fail,
+            format!(
+                "shared cache missing at {} — run `epicenter setup`",
+                root.display()
+            ),
+        )
+    });
+
+    // Template cleanliness + drift (global build-dir vs cargo's answer).
+    checks.push(check_build_dir(&root));
+    checks.push(check_cache_permissions(&root));
+
+    // Ancestor configs shadowing keys per-key.
+    checks.extend(check_ancestor_configs());
+
+    // rustc-wrapper in env AND config, plus discoverability.
+    checks.extend(check_rustc_wrapper());
+
+    // Cache root on a slow filesystem.
+    if root.starts_with("/mnt/") {
+        checks.push(check(
+            SEC_FS,
+            Level::Warn,
+            String::from(concat!(
+                "shared cache on a Windows-mounted drive — very slow I/O under WSL; ",
+                "prefer the default {cargo-cache-home} location"
+            )),
+        ));
+    } else {
+        checks.push(check(
+            SEC_FS,
+            Level::Pass,
+            format!("cache root on the local filesystem: {}", root.display()),
+        ));
+    }
+
+    // Cache vs this project's target/ on different mounts (EXDEV).
+    if let Some(cross) = check_exdev(&root) {
+        checks.push(cross);
+    }
+
+    // Migration note: the former ~/.epicenter/config.toml state file is no
+    // longer used (~/.cargo/config.toml is the single source of truth).
+    if let Ok(home) = paths::home() {
+        let legacy = home.join(".epicenter").join("config.toml");
+        if legacy.exists() {
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Info,
+                "legacy ~/.epicenter/config.toml found — no longer used; safe to delete",
+            ));
+        }
+    }
+
+    // Unit-graph facts, one scan: toolchain generations, then mtime ordering.
+    // Toolchain identity is part of every unit's fingerprint, so a rustc
+    // upgrade re-keys the whole cache; ordering decides what recompiles.
+    let rows = match who::collect(&root) {
+        Ok(rows) => {
+            checks.extend(check_toolchain_generation(&rows));
+            Some(rows)
+        }
+        Err(e) => {
+            checks.push(check(
+                SEC_TC,
+                Level::Warn,
+                format!("could not read the shared cache: {e:#}"),
+            ));
+            None
+        }
+    };
+    checks.push(check_rustc());
+    checks.push(check_locking());
+    checks.extend(incremental_checks(&root, rows.as_deref()));
+    if let Some(rows) = &rows {
+        checks.extend(check_mtime_ordering(rows));
+    }
+
+    Ok(checks)
+}
+
+/// Template cleanliness + drift: the global [build] build-dir value must be
+/// templated and must resolve to the dir cargo actually builds into.
+fn check_build_dir(root: &Path) -> Check {
+    let section: &'static str = SEC_CONFIG;
+    // Cargo lets the environment win over every config file. When the
+    // override is present, the config template says nothing about the
+    // effective build-dir, so judge the value cargo will actually use.
+    if let Some(raw) = std::env::var_os("CARGO_BUILD_BUILD_DIR") {
+        return check_build_dir_override(root, &raw.to_string_lossy());
+    }
+    let value = match crate::paths::cargo_build_dir() {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return check(
+                section,
+                Level::Warn,
+                "no build-dir in the global cargo config — run `epicenter setup`",
+            );
+        }
+        Err(e) => {
+            return check(
+                section,
+                Level::Warn,
+                format!("could not read the cargo config: {e:#}"),
+            );
+        }
+    };
+
+    let has_braces = value.contains('{') && value.contains('}');
+    if !has_braces {
+        // A literal path from another OS (a C:\ value read by WSL cargo) is
+        // joined into LD_LIBRARY_PATH and breaks every build: reject it.
+        if value.contains("C:\\") || value.contains("/mnt/") {
+            return check(
+                section,
+                Level::Fail,
+                String::from(concat!(
+                    "build-dir value is a literal other-OS path — the cross-OS-safe form is ",
+                    "'{cargo-cache-home}\\epicenter\\build'; run `epicenter setup`"
+                )),
+            );
+        }
+        return check(
+            section,
+            Level::Warn,
+            format!(
+                "build-dir = '{value}' is a literal path (no template) — fine locally, \
+                 fragile when configs are shared across OSes; `epicenter setup` writes the template form"
+            ),
+        );
+    }
+
+    match paths::resolve_template(&value) {
+        Ok(resolved) if resolved == root => check(
+            section,
+            Level::Pass,
+            format!(
+                "build-dir template resolves to the shared cache: {}",
+                root.display()
+            ),
+        ),
+        Ok(resolved) => check(
+            section,
+            Level::Warn,
+            format!(
+                "config drift: the global build-dir resolves to {}, but cargo's effective \
+                 build-dir is {} — an ancestor config may be winning; run `epicenter setup`",
+                resolved.display(),
+                root.display()
+            ),
+        ),
+        Err(e) => check(
+            section,
+            Level::Warn,
+            format!(
+                "could not expand the build-dir template locally ({e:#}) — cargo still \
+                 expands it at build time; only epicenter's local view failed"
+            ),
+        ),
+    }
+}
+
+/// Judge the effective build-dir when `CARGO_BUILD_BUILD_DIR` overrides the
+/// config file; the resolved path is compared against the shared cache.
+fn check_build_dir_override(root: &Path, value: &str) -> Check {
+    let section: &'static str = SEC_CONFIG;
+    match paths::resolve_template(value) {
+        Ok(resolved) if resolved == root => check(
+            section,
+            Level::Pass,
+            format!(
+                "CARGO_BUILD_BUILD_DIR resolves to the shared cache: {}",
+                root.display()
+            ),
+        ),
+        Ok(resolved) => check(
+            section,
+            Level::Warn,
+            format!(
+                "CARGO_BUILD_BUILD_DIR={value} overrides the config build-dir and resolves to \
+                 {} — cargo builds outside the shared cache {}; unset it or restore the \
+                 build-dir template",
+                resolved.display(),
+                root.display()
+            ),
+        ),
+        Err(e) => check(
+            section,
+            Level::Info,
+            format!(
+                "CARGO_BUILD_BUILD_DIR={value} is set but could not be expanded locally ({e:#}) \
+                 — cargo expands it at build time"
+            ),
+        ),
+    }
+}
+
+/// Cache root ownership/mode: a shared, foreign-owned, or group/world-
+/// writable cache is a poisoning/secret-leak vector.
+fn check_cache_permissions(root: &Path) -> Check {
+    let section: &'static str = SEC_CACHE;
+    let meta = match metadata_nofollow(root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return check(section, Level::Fail, "cache root does not exist");
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            return check(
+                section,
+                Level::Fail,
+                "cache root is a symlink/reparse point",
+            );
+        }
+        Err(err) => {
+            return check(
+                section,
+                Level::Fail,
+                format!("could not inspect cache root: {err}"),
+            );
+        }
+    };
+    if !meta.is_dir() {
+        return check(section, Level::Fail, "cache root is not a directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !crate::util::owned_by_us(root, &meta) {
+            return check(
+                section,
+                Level::Fail,
+                format!(
+                    "cache root owned by uid {} (not uid {}) — never share a mutable vault between users",
+                    meta.uid(),
+                    crate::util::euid()
+                ),
+            );
+        }
+        if meta.mode() & 0o077 != 0 {
+            return check(
+                section,
+                Level::Fail,
+                format!(
+                    "cache root mode {:o} is accessible by other users — run `chmod 700 {}`",
+                    meta.mode() & 0o777,
+                    root.display()
+                ),
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Err(err) = crate::util::ensure_windows_user_path(root, "cache root") {
+            return check(section, Level::Fail, format!("{err:#}"));
+        }
+        if !crate::util::owned_by_us(root, &meta) {
+            return check(
+                section,
+                Level::Fail,
+                "cache root is owned by another user — never share a mutable vault between principals",
+            );
+        }
+        return match crate::util::windows_acl_is_private(root) {
+            Some(true) => check(
+                section,
+                Level::Pass,
+                "cache root is private (write access is owner/SYSTEM/Administrators only)",
+            ),
+            Some(false) => check(
+                section,
+                Level::Fail,
+                "cache root DACL grants write access to another principal — use `icacls` to make it owner-only or choose a private local directory",
+            ),
+            None => check(
+                section,
+                Level::Fail,
+                "cache root DACL could not be inspected — choose a private local directory with an owner-only ACL",
+            ),
+        };
+    }
+    #[cfg(not(windows))]
+    check(section, Level::Pass, "cache root is private (owner-only)")
+}
+
+/// Ancestor scan: from the CWD upward, any `.cargo/config.toml` that sets a
+/// key DIFFERENTLY from the global one wins silently (deep config wins
+/// per-key) — how a Windows literal once bricked WSL builds.
+fn check_ancestor_configs() -> Vec<Check> {
+    let section: &'static str = SEC_CONFIG;
+    let mut out = Vec::new();
+    let home_cfg = crate::config::cargo_config_path().ok();
+    let mut dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => return out,
+    };
+
+    let mut found = false;
+    loop {
+        for name in ["config.toml", "config"] {
+            let candidate = dir.join(".cargo").join(name);
+            let is_home = home_cfg.as_ref().map_or(false, |h| *h == candidate)
+                || home_cfg
+                    .as_ref()
+                    .and_then(|h| h.parent())
+                    .map(|p| p.join("config") == candidate)
+                    .unwrap_or(false);
+            if !candidate.exists() || is_home {
+                continue;
+            }
+            found = true;
+            for key in ["build-dir", "rustc-wrapper"] {
+                let Some(ancestor) = crate::config::read_build_table_key(&candidate, key) else {
+                    continue; // key absent there — nothing to shadow
+                };
+                let home_value = crate::config::cargo_configured_in("build", key)
+                    .ok()
+                    .flatten();
+                if home_value.as_deref() != Some(ancestor.as_str()) {
+                    out.push(check(
+                        section,
+                        Level::Warn,
+                        format!(
+                            "{} sets {key} = '{ancestor}' differently from the global config \
+                             (cargo applies it to builds) — epicenter ignores it for its own state",
+                            candidate.display()
+                        ),
+                    ));
+                } else {
+                    out.push(check(
+                        section,
+                        Level::Pass,
+                        format!(
+                            "{} sets {key} = '{ancestor}', matching the global config",
+                            candidate.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+
+    if !found {
+        out.push(check(
+            section,
+            Level::Pass,
+            "no ancestor .cargo/config(.toml) shadows the global config",
+        ));
+    }
+    out
+}
+
+/// Wrapper checks, merged across env + config:
+/// where it is configured (env wins over config files), whether it is
+/// discoverable (PATH or $CARGO_HOME/bin), and whether PATH is actually set
+/// (cargo spawns the wrapper by NAME at build time).
+fn check_rustc_wrapper() -> Vec<Check> {
+    let section: &'static str = SEC_WRAPPER;
+    let mut out = Vec::new();
+
+    for var in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+        if let Some(value) = std::env::var_os(var) {
+            out.push(check(
+                section,
+                Level::Warn,
+                format!(
+                    "{var}={} — environment wins over config files",
+                    value.to_string_lossy()
+                ),
+            ));
+        }
+    }
+
+    let configured = crate::config::cargo_configured_in("build", "rustc-wrapper");
+    match configured {
+        Err(e) => out.push(check(section, Level::Warn, format!("could not read the cargo config: {e:#}"))),
+        Ok(None) => out.push(check(section,
+            Level::Info,
+            "no rustc-wrapper configured — kache/sccache are optional layers (`epicenter setup --with-wrapper kache`)",
+        )),
+        Ok(Some(name)) => match wrapper_location(&name) {
+            None => out.push(check(section,
+                Level::Warn,
+                format!(
+                    "rustc-wrapper '{name}' is configured but not found in PATH or $CARGO_HOME/bin — \
+                     builds fail until it is installed or removed (`epicenter setup --without-wrapper`)"
+                ),
+            )),
+            Some(path) => {
+                out.push(check(section,
+                    Level::Pass,
+                    format!("rustc-wrapper '{name}' discovered: {}", path.display()),
+                ));
+                // A wrapper configured as an absolute path is invoked directly;
+                // only a bare name is spawned through PATH.
+                if !Path::new(&name).is_absolute() && !crate::util::on_path(&name) {
+                    out.push(check(section,
+                        Level::Warn,
+                        format!(
+                            "'{name}' lives in the cargo bin dir but NOT on PATH — cargo spawns \
+                             the wrapper by NAME at build time, so add the bin dir to PATH"
+                        ),
+                    ));
+                }
+            }
+        },
+    }
+    out
+}
+
+/// Locate the configured wrapper: an absolute path is checked as-is (Cargo
+/// invokes it directly), a bare name is resolved through PATH and the cargo
+/// bin dir.
+fn wrapper_location(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    crate::util::which_path(name)
+}
+
+/// EXDEV class: cache on a different filesystem than this project's
+/// target/ — finals then always copy, never hardlink.
+fn check_exdev(root: &Path) -> Option<Check> {
+    let section: &'static str = SEC_FS;
+    let target = std::env::current_dir().ok()?.join("target");
+    if !target.is_dir() {
+        return Some(check(
+            section,
+            Level::Info,
+            "no ./target next to this invocation — filesystem-match check skipped",
+        ));
+    }
+    match (device_id(&target), device_id(root)) {
+        (Some(target_dev), Some(root_dev)) if target_dev != root_dev => Some(check(
+            section,
+            Level::Warn,
+            format!(
+                "cache filesystem differs from ./target/ ({} vs {}) — final artifacts are \
+                 copied per project, never hardlinked (expected when projects live on /mnt)",
+                root.display(),
+                target.display()
+            ),
+        )),
+        (Some(_), Some(_)) => Some(check(
+            section,
+            Level::Pass,
+            "cache and ./target/ share one filesystem — hardlink reuse is possible",
+        )),
+        _ => Some(check(
+            section,
+            Level::Info,
+            "filesystem identity not measurable on this platform",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn device_id(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| std::os::unix::fs::MetadataExt::dev(&meta))
+}
+
+#[cfg(not(unix))]
+fn device_id(path: &Path) -> Option<u64> {
+    // Windows std exposes no volume serial; the std-only proxy is the
+    // canonical path's volume prefix (`\\?\C:\…` → `C:`, `\\?\UNC\server\share…`
+    // → `\\server\share`) — enough to distinguish local drives, WSL mounts
+    // (`\\wsl$…`) and network shares. A true volume serial requires Win32
+    // FFI (`GetFileInformationByHandle`), which is deliberately avoided to
+    // keep the dependency tree std-only.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = path.canonicalize().ok()?;
+    let text = canonical.to_string_lossy();
+    let key = strip_volume_prefix(&text)?;
+    // Hashing only needs determinism WITHIN one doctor run (two ids compared).
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// `\\?\C:\Users\…` → `C:`; `\\?\UNC\server\share\…` → `\\server\share`.
+#[cfg(not(unix))]
+fn strip_volume_prefix(canonical: &str) -> Option<String> {
+    let rest = canonical.strip_prefix(r"\\?\")?;
+    let mut chars = rest.chars();
+    let (_first, second) = (chars.next()?, chars.next()?);
+    if second == ':' {
+        Some(rest[..2].to_string()) // drive letter
+    } else if rest.starts_with("UNC\\") {
+        let unc = &rest["UNC\\".len()..];
+        let mut segments = unc.split('\\');
+        let server = segments.next()?;
+        let share = segments.next()?;
+        Some(format!(r"\\{server}\{share}"))
+    } else {
+        None
+    }
+}
+
+/// rustc version + the upgrade-prune hint.
+fn check_rustc() -> Check {
+    let section: &'static str = SEC_TC;
+    let output = crate::util::command_for("rustc")
+        .and_then(|mut command| Ok(command.arg("--version").output()?));
+    match output {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            check(
+                section,
+                Level::Info,
+                format!(
+                    "{version} — after toolchain upgrades, run `epicenter prune` to drop old artifacts"
+                ),
+            )
+        }
+        _ => check(section, Level::Warn, "could not run `rustc --version`"),
+    }
+}
+
+/// Cache freshness relative to the installed toolchain, plus reclaimable
+/// older generations.
+///
+/// The `rustc` fingerprint field changes with every toolchain update, which
+/// re-keys every unit. Two distinct consequences, kept separate on purpose:
+/// - **staleness (fail)** when the installed toolchain is newer than the
+///   newest cached unit — the next build recompiles everything;
+/// - **dead weight (warning)** when older generations still occupy space —
+///   nothing is broken, they can be reclaimed deliberately.
+fn check_toolchain_generation(rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
+    if rows.is_empty() {
+        return vec![check(
+            SEC_TC,
+            Level::Info,
+            "shared cache holds no fingerprint units yet",
+        )];
+    }
+
+    let newest_art = rows.iter().filter_map(|(_, arts)| arts.newest).max();
+    // The generation of the most recently built unit is the active one.
+    let active_gen = rows
+        .iter()
+        .filter(|(_, arts)| arts.newest == newest_art)
+        .find_map(|(unit, _)| unit.json.as_ref().map(|json| json.rustc.clone()))
+        .unwrap_or_else(|| "unknown".into());
+
+    let mut checks = Vec::new();
+
+    match (newest_art, toolchain_mtime()) {
+        (Some(newest), Some(toolchain)) if newest < toolchain => checks.push(check(
+            SEC_TC,
+            Level::Fail,
+            format!(
+                "installed toolchain is newer than the newest cached unit ({}): the cache is \
+                 stale — the next build recompiles it; outdated units can be reclaimed below",
+                human_age(newest)
+            ),
+        )),
+        (Some(newest), Some(_)) => checks.push(check(
+            SEC_TC,
+            Level::Pass,
+            format!(
+                "cache is aligned with the installed toolchain (newest unit {})",
+                human_age(newest)
+            ),
+        )),
+        _ => checks.push(check(
+            SEC_TC,
+            Level::Info,
+            "toolchain install time could not be read (`rustc --print sysroot` failed)",
+        )),
+    }
+
+    let stale: Vec<&(crate::fingerprint::Unit, crate::fingerprint::ArtifactInfo)> = rows
+        .iter()
+        .filter(|(unit, _)| who::rustc_of(unit) != active_gen)
+        .collect();
+    if !stale.is_empty() {
+        let stale_bytes: u64 = stale.iter().map(|(_, arts)| arts.bytes).sum();
+        checks.push(check(
+            SEC_TC,
+            Level::Warn,
+            format!(
+                "{} unit(s) on older toolchain generations ({}) — reclaim with `epicenter evict --stale`",
+                stale.len(),
+                human_bytes(stale_bytes)
+            ),
+        ));
+    }
+    checks
+}
+
+/// Stale vault generations occupy space even when the build view is aligned
+/// with the installed toolchain. They are safe to remove as whole generations.
+fn check_store_generations(store: &Path) -> Vec<Check> {
+    if let Ok(meta) = metadata_nofollow(store)
+        && !meta.is_dir()
+    {
+        return Vec::new();
+    }
+    match crate::vault::generations(store) {
+        Ok(generations) => {
+            let stale: Vec<_> = generations
+                .iter()
+                .filter(|generation| !generation.active)
+                .collect();
+            if stale.is_empty() {
+                return Vec::new();
+            }
+            let units: usize = stale.iter().map(|generation| generation.units).sum();
+            let bytes: u64 = stale.iter().map(|generation| generation.bytes).sum();
+            vec![check(
+                SEC_TC,
+                Level::Warn,
+                format!(
+                    "{} stale vault generation(s) hold {} unit(s) · {} — reclaim with `epicenter store evict --generation <key>`",
+                    stale.len(),
+                    units,
+                    human_bytes(bytes)
+                ),
+            )]
+        }
+        Err(err) => vec![check(
+            SEC_TC,
+            Level::Warn,
+            format!("could not inspect vault generations: {err:#}"),
+        )],
+    }
+}
+
+/// Incremental directories are not fingerprinted by the vault. Older rustc
+/// session directories can outlive the unit that created them; wrapper
+/// `incremental.*` state is opaque but reclaimable as a family.
+///
+/// Liveness comes from the unit scan: when it failed there are no rows, so a
+/// missing row cannot be read as an orphan. Say the check was skipped instead
+/// of warning about every session.
+fn incremental_checks(root: &Path, rows: Option<&[(Unit, ArtifactInfo)]>) -> Vec<Check> {
+    match rows {
+        Some(rows) => check_incremental_state(root, rows),
+        None => vec![check(
+            SEC_CACHE,
+            Level::Info,
+            "incremental orphan check skipped — the unit scan failed, so session liveness is unknown",
+        )],
+    }
+}
+
+fn check_incremental_state(root: &Path, rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
+    let live: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|(unit, _)| unit.package.replace('-', "_"))
+        .collect();
+    let mut orphan_dirs = 0usize;
+    let mut orphan_bytes = 0u64;
+    let mut wrapper_dirs = 0usize;
+    let mut checks = Vec::new();
+
+    let Ok(profiles) = fs::read_dir(root) else {
+        return checks;
+    };
+    for profile in profiles.flatten() {
+        if !profile
+            .file_type()
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(profile.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "incremental" {
+                let Ok(sessions) = fs::read_dir(entry.path()) else {
+                    continue;
+                };
+                for session in sessions.flatten() {
+                    if !session
+                        .file_type()
+                        .map(|kind| kind.is_dir())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let cookie = session.file_name().to_string_lossy().into_owned();
+                    let package = cookie
+                        .rsplit_once('-')
+                        .map(|(package, _)| package.replace('-', "_"))
+                        .unwrap_or(cookie);
+                    if !live.contains(&package) {
+                        orphan_dirs += 1;
+                        orphan_bytes += directory_bytes(&session.path());
+                    }
+                }
+            } else if name.starts_with("incremental") {
+                wrapper_dirs += 1;
+            }
+        }
+    }
+
+    if orphan_dirs > 0 {
+        checks.push(check(
+            SEC_CACHE,
+            Level::Warn,
+            format!(
+                "{orphan_dirs} incremental session(s) without a live fingerprint ({}): reclaim with `epicenter prune --incremental`",
+                human_bytes(orphan_bytes)
+            ),
+        ));
+    }
+    if wrapper_dirs > 0 {
+        checks.push(check(
+            SEC_CACHE,
+            Level::Info,
+            format!(
+                "{wrapper_dirs} wrapper incremental tree(s) present (`incremental.*`) — `epicenter prune --incremental` handles them by age or keep-latest"
+            ),
+        ));
+    }
+    checks
+}
+
+fn directory_bytes(root: &Path) -> u64 {
+    let mut budget = crate::util::ScanBudget::new("doctor");
+    crate::util::SafeWalk::new(root)
+        .walk_with(&mut budget)
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .fold(0u64, |total, meta| total.saturating_add(meta.len()))
+}
+
+/// Mtime discipline across the unit graph: cargo re-runs a unit when a
+/// dependency's artifact is newer than the unit's own outputs ("the
+/// dependency `X` was rebuilt"). Restored views preserve the stored order,
+/// but a view that mixed restored and locally rebuilt units can break it —
+/// each violation costs exactly one recompile, so this warns.
+fn check_mtime_ordering(rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let units: Vec<Unit> = rows.iter().map(|(unit, _)| unit.clone()).collect();
+    let edges = crate::fingerprint::dep_edges(&units);
+
+    let mut checked = 0usize;
+    let mut violations: Vec<(usize, usize)> = Vec::new();
+    let mut flagged = std::collections::HashSet::new();
+    for (dependent, deps) in edges.iter().enumerate() {
+        let own = rows[dependent].1.newest;
+        for &dep in deps {
+            // An edge is only evidence when both ends carry a timestamp.
+            let (Some(own), Some(dep_newest)) = (own, rows[dep].1.newest) else {
+                continue;
+            };
+            checked += 1;
+            // One unit recompiles once per build, however many of its
+            // dependencies are newer, so report each dependent once.
+            if dep_newest > own && flagged.insert(dependent) {
+                violations.push((dependent, dep));
+            }
+        }
+    }
+
+    if checked == 0 {
+        return vec![check(
+            SEC_MTIME,
+            Level::Info,
+            "mtime ordering not checked — no dependency edge has timestamps for both units",
+        )];
+    }
+
+    if violations.is_empty() {
+        return vec![check(
+            SEC_MTIME,
+            Level::Pass,
+            format!(
+                "every unit is at least as new as its dependencies ({checked} edge(s) checked)"
+            ),
+        )];
+    }
+
+    let mut checks = vec![check(
+        SEC_MTIME,
+        Level::Warn,
+        format!(
+            "{} unit(s) recompile once — a dependency is newer ({} edge(s) checked)",
+            violations.len(),
+            checked
+        ),
+    )];
+    for (dependent, dep) in violations.iter().take(3) {
+        let own = rows[*dependent].1.newest.expect("violation has timestamps");
+        let dep_newest = rows[*dep].1.newest.expect("violation has timestamps");
+        checks.push(check(
+            SEC_MTIME,
+            Level::Info,
+            format!(
+                "{} ← {} is {} newer (cargo: \"the dependency was rebuilt\")",
+                units[*dependent].dir_name,
+                units[*dep].dir_name,
+                human_duration(dep_newest.duration_since(own).unwrap_or_default())
+            ),
+        ));
+    }
+    if violations.len() > 3 {
+        checks.push(check(
+            SEC_MTIME,
+            Level::Info,
+            format!("… and {} more", violations.len() - 3),
+        ));
+    }
+    checks
+}
+
+/// Build concurrency: is fine-grain locking enabled, and is it even available?
+fn check_locking() -> Check {
+    let env_on = std::env::var("CARGO_UNSTABLE_FINE_GRAIN_LOCKING")
+        .map(|value| is_truthy(&value))
+        .unwrap_or(false);
+    let config_on = crate::config::cargo_configured_in("unstable", "fine-grain-locking")
+        .ok()
+        .flatten()
+        .map(|value| is_truthy(&value))
+        .unwrap_or(false);
+
+    if env_on || config_on {
+        return check(
+            SEC_TC,
+            Level::Pass,
+            "fine-grain locking enabled — concurrent builds on the shared build-dir overlap \
+             instead of serializing",
+        );
+    }
+    if toolchain_is_nightly() {
+        check(
+            SEC_TC,
+            Level::Warn,
+            "fine-grain locking is available but OFF — concurrent builds serialize on the \
+             shared build-dir; enable with `[unstable] fine-grain-locking = true` in \
+             ~/.cargo/config.toml",
+        )
+    } else {
+        check(
+            SEC_TC,
+            Level::Info,
+            "one file lock guards the shared build-dir: concurrent builds serialize; \
+             fine-grain locking (`-Z fine-grain-locking`) is nightly-only",
+        )
+    }
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Install time of the active toolchain (the real `rustc` binary, falling
+/// back to the sysroot directory). The vault owns toolchain identity; this
+/// is the same reference its harvest freshness gate uses.
+fn toolchain_mtime() -> Option<SystemTime> {
+    crate::vault::toolchain_install_time()
+}
+
+fn toolchain_is_nightly() -> bool {
+    crate::util::command_for("rustc")
+        .and_then(|mut command| Ok(command.arg("--version").output()?))
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("nightly"))
+        .unwrap_or(false)
+}
+
+pub const SEC_POLICY: &str = "policy";
+pub const SEC_PROFILE: &str = "profile";
+pub const SEC_SYSTEM: &str = "system";
+pub const SEC_NIGHTLY: &str = "nightly hints";
+
+/// Effective Cargo profile values, as far as epicenter can read them.
+#[derive(Debug, Clone)]
+pub struct ProfileValues {
+    pub opt_level: String,
+    pub debug: String,
+    pub lto: String,
+    pub codegen_units: String,
+    pub split_debuginfo: String,
+    pub incremental: String,
+}
+
+impl Default for ProfileValues {
+    fn default() -> Self {
+        Self {
+            opt_level: "3".to_string(),
+            debug: "false".to_string(),
+            lto: "false".to_string(),
+            codegen_units: "16".to_string(),
+            split_debuginfo: "default".to_string(),
+            incremental: "false".to_string(),
+        }
+    }
+}
+
+/// Everything `doctor --json` and the policy section report.
+#[derive(Debug, Clone)]
+pub struct ProfileSummary {
+    pub preset: String,
+    pub effective_preset: String,
+    pub preset_source: String,
+    pub linker: String,
+    pub linker_source: String,
+    pub link: String,
+    pub link_source: String,
+    pub active_linker: String,
+    pub wrapper: Option<String>,
+    pub memory_bytes: Option<u64>,
+    pub memory_source: String,
+    pub cores: usize,
+    pub jobs: usize,
+    pub jobs_source: String,
+    pub job_cap: usize,
+    pub global_config: String,
+    pub cargo_home: String,
+    pub cargo_home_source: String,
+    pub remote_tier: String,
+    pub remote_tier_source: String,
+    pub remote_enabled: bool,
+    pub remote_url: Option<String>,
+    pub remote_key_id: Option<String>,
+    pub remote_transport: String,
+    pub remote_region: Option<String>,
+    pub remote_cache: String,
+    pub remote_index: Option<crate::remote::IndexStatus>,
+    pub remote_index_error: Option<String>,
+    pub store: String,
+    pub project: Option<String>,
+    pub dev: ProfileValues,
+    pub release: ProfileValues,
+    pub package_overrides: bool,
+    /// Reserved for a measured build; epicenter does not record one yet.
+    pub last_build: Option<String>,
+}
+
+impl ProfileSummary {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "preset": self.preset,
+            "effective_preset": self.effective_preset,
+            "preset_source": self.preset_source,
+            "linker": self.linker,
+            "linker_source": self.linker_source,
+            "link": self.link,
+            "link_source": self.link_source,
+            "active_linker": self.active_linker,
+            "wrapper": self.wrapper,
+            "memory_bytes": self.memory_bytes,
+            "memory_source": self.memory_source,
+            "cores": self.cores,
+            "jobs": self.jobs,
+            "jobs_source": self.jobs_source,
+            "job_cap": self.job_cap,
+            "global_config": self.global_config,
+            "cargo_home": self.cargo_home,
+            "cargo_home_source": self.cargo_home_source,
+            "remote_tier": self.remote_tier,
+            "remote_tier_source": self.remote_tier_source,
+            "remote_enabled": self.remote_enabled,
+            "remote_url": self.remote_url,
+            "remote_key_id": self.remote_key_id,
+            "remote_transport": self.remote_transport,
+            "remote_region": self.remote_region,
+            "remote_cache": self.remote_cache,
+            "remote_index": self.remote_index,
+            "remote_index_error": self.remote_index_error,
+            "store": self.store,
+            "project": self.project,
+            "dev": {
+                "opt_level": self.dev.opt_level,
+                "debug": self.dev.debug,
+                "lto": self.dev.lto,
+                "codegen_units": self.dev.codegen_units,
+                "split_debuginfo": self.dev.split_debuginfo,
+                "incremental": self.dev.incremental,
+            },
+            "release": {
+                "opt_level": self.release.opt_level,
+                "debug": self.release.debug,
+                "lto": self.release.lto,
+                "codegen_units": self.release.codegen_units,
+                "split_debuginfo": self.release.split_debuginfo,
+                "incremental": self.release.incremental,
+            },
+            "package_overrides": self.package_overrides,
+            "last_build": self.last_build,
+        })
+    }
+}
+
+/// Build the profile summary for the effective epicenter policy.
+pub fn profile(settings: &Settings) -> Result<ProfileSummary> {
+    let (preset, preset_source) = settings.preset();
+    let (effective, _, _) = settings.effective_preset();
+    let (linker, linker_source) = settings.linker();
+    let (memory, memory_source) = settings.memory_bytes();
+    let cores = settings::available_cores();
+    let job_cap = settings::job_cap(cores, memory);
+    let (jobs, jobs_source) = effective_jobs(cores, job_cap);
+    let (link, link_source) = settings.link()?;
+    let (cargo_home, cargo_home_source) = settings.cargo_home()?;
+    let remote = settings.remote()?;
+    let (active_linker, _) = active_linker();
+    let wrapper = crate::config::cargo_configured_in("build", "rustc-wrapper")?;
+    let build_root = crate::config::cache_root().ok();
+    let store = match settings.store()? {
+        Some((path, _)) => path,
+        None => crate::vault::store_root(build_root.as_deref().unwrap_or_else(|| Path::new("."))),
+    };
+    let project = workspace_root();
+    let (dev, release, package_overrides) = project
+        .as_deref()
+        .and_then(profiles)
+        .unwrap_or_else(|| (ProfileValues::default(), ProfileValues::default(), false));
+    let remote_url = remote.redacted_url();
+    let (remote_index, remote_index_error) = if remote.enabled {
+        match crate::remote::status(&remote) {
+            Ok(status) => (status, None),
+            Err(err) => (
+                None,
+                Some(crate::util::safe_display(std::ffi::OsStr::new(&format!(
+                    "{err:#}"
+                )))),
+            ),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(ProfileSummary {
+        preset: preset.as_str().to_string(),
+        effective_preset: effective.as_str().to_string(),
+        preset_source: preset_source.as_str().to_string(),
+        linker: linker.as_str().to_string(),
+        linker_source: linker_source.as_str().to_string(),
+        link: link.as_str().to_string(),
+        link_source: link_source.as_str().to_string(),
+        active_linker,
+        wrapper,
+        memory_bytes: memory,
+        memory_source: memory_source.as_str().to_string(),
+        cores,
+        jobs,
+        jobs_source,
+        job_cap,
+        global_config: crate::paths::global_config_path()?.display().to_string(),
+        cargo_home: cargo_home.display().to_string(),
+        cargo_home_source: cargo_home_source.as_str().to_string(),
+        remote_tier: remote.tier.as_str().to_string(),
+        remote_tier_source: remote.tier_source.as_str().to_string(),
+        remote_enabled: remote.enabled,
+        remote_url,
+        remote_key_id: remote.key_id,
+        remote_transport: remote.transport.as_str().to_string(),
+        remote_region: remote.region,
+        remote_cache: remote.cache.display().to_string(),
+        remote_index,
+        remote_index_error,
+        store: store.display().to_string(),
+        project: project.map(|path| path.display().to_string()),
+        dev,
+        release,
+        package_overrides,
+        last_build: read_last_build(),
+    })
+}
+
+/// Policy/profile checks for the doctor, in the same shape as the store
+/// checks. All of them are read-only.
+pub fn policy_checks(settings: &Settings) -> Result<(Vec<Check>, ProfileSummary)> {
+    let profile = profile(settings)?;
+    let mut checks = Vec::new();
+    let global_path = crate::paths::global_config_path()?;
+    checks.push(check(
+        SEC_CONFIG,
+        if settings.global_path().is_some() {
+            Level::Info
+        } else {
+            Level::Warn
+        },
+        if settings.global_path().is_some() {
+            format!("global policy: {}", global_path.display())
+        } else {
+            format!(
+                "no global policy at {} — defaults apply; run `epicenter setup` to persist intent",
+                global_path.display()
+            )
+        },
+    ));
+    // The old location is never read as policy. Keep the hint concrete so a
+    // user can move the file without guessing the new OS path.
+    if let Ok(legacy) = crate::paths::legacy_global_config_path() {
+        if legacy != global_path && legacy.exists() {
+            let parent = global_path.parent().unwrap_or_else(|| Path::new("."));
+            let move_hint = if cfg!(windows) {
+                format!(
+                    "mkdir \"{}\" && move \"{}\" \"{}\"",
+                    parent.display(),
+                    legacy.display(),
+                    global_path.display()
+                )
+            } else {
+                format!(
+                    "mkdir -p '{}' && mv -n '{}' '{}'",
+                    parent.display(),
+                    legacy.display(),
+                    global_path.display()
+                )
+            };
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!(
+                    "legacy global policy {} is no longer read; make relative `store`/`work` absolute, then move it: {move_hint}",
+                    legacy.display()
+                ),
+            ));
+        }
+    }
+    let (cargo_home, cargo_home_source) = settings.cargo_home()?;
+    checks.push(check(
+        SEC_CONFIG,
+        Level::Info,
+        format!(
+            "cargo home: {} ({})",
+            cargo_home.display(),
+            cargo_home_source.as_str()
+        ),
+    ));
+    if cargo_home_source == settings::Source::Global {
+        match metadata_nofollow(&cargo_home) {
+            Ok(meta) if meta.is_dir() => {
+                match crate::util::validate_private_dir(&cargo_home, "cargo home") {
+                    Ok(()) => checks.push(check(
+                        SEC_CONFIG,
+                        Level::Pass,
+                        format!(
+                            "cargo home is private and writable: {}",
+                            cargo_home.display()
+                        ),
+                    )),
+                    Err(err) => checks.push(check(
+                        SEC_CONFIG,
+                        Level::Fail,
+                        format!("cargo home {}: {err:#}", cargo_home.display()),
+                    )),
+                }
+            }
+            Ok(_) => checks.push(check(
+                SEC_CONFIG,
+                Level::Fail,
+                format!(
+                    "configured cargo home {} is not a directory",
+                    cargo_home.display()
+                ),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!(
+                    "configured cargo home {} is missing — run `epicenter setup --cargo-home {}`",
+                    cargo_home.display(),
+                    cargo_home.display()
+                ),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => checks.push(check(
+                SEC_CONFIG,
+                Level::Fail,
+                format!(
+                    "configured cargo home {} is a symlink/reparse point",
+                    cargo_home.display()
+                ),
+            )),
+            Err(err) => checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!(
+                    "could not inspect cargo home {}: {err}",
+                    cargo_home.display()
+                ),
+            )),
+        }
+        if let Some(shell) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+            let shell = PathBuf::from(shell);
+            if shell != cargo_home {
+                checks.push(check(
+                    SEC_CONFIG,
+                    Level::Warn,
+                    format!(
+                        "shell CARGO_HOME {} differs from the configured {} — raw `cargo` will miss remote units",
+                        shell.display(),
+                        cargo_home.display()
+                    ),
+                ));
+            }
+        }
+    }
+    match crate::config::cargo_config_path() {
+        Ok(config) => checks.push(check(
+            SEC_CONFIG,
+            if config.is_file() {
+                Level::Pass
+            } else {
+                Level::Warn
+            },
+            format!(
+                "cargo config: {}{}",
+                config.display(),
+                if config.is_file() {
+                    ""
+                } else {
+                    " (missing — run `epicenter setup`)"
+                }
+            ),
+        )),
+        Err(err) => checks.push(check(
+            SEC_CONFIG,
+            Level::Warn,
+            format!("could not resolve Cargo's global config: {err:#}"),
+        )),
+    }
+    let registry = cargo_home.join("registry");
+    checks.push(check(
+        SEC_CONFIG,
+        if registry.is_dir() {
+            Level::Info
+        } else {
+            Level::Warn
+        },
+        format!(
+            "cargo registry: {}{}",
+            registry.display(),
+            if registry.is_dir() {
+                ""
+            } else {
+                " (missing — the first build fetches it)"
+            }
+        ),
+    ));
+    checks.push(check(
+        SEC_CONFIG,
+        if profile.remote_enabled {
+            Level::Pass
+        } else {
+            Level::Info
+        },
+        format!(
+            "remote: {} ({}){}",
+            profile.remote_tier,
+            profile.remote_tier_source,
+            if profile.remote_enabled {
+                " — enabled"
+            } else {
+                " — disabled (no [remote] url)"
+            }
+        ),
+    ));
+    if let Some(url) = &profile.remote_url {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("remote endpoint: {url}"),
+        ));
+    }
+    if let Some(key_id) = &profile.remote_key_id {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Pass,
+            format!(
+                "remote publisher: {key_id} (pinned; obtain it from CI/admin, never the bucket)"
+            ),
+        ));
+    }
+    if profile.remote_enabled {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!(
+                "remote transport: {}{}",
+                profile.remote_transport,
+                profile
+                    .remote_region
+                    .as_deref()
+                    .map(|region| format!(" · region {region}"))
+                    .unwrap_or_default()
+            ),
+        ));
+        if profile.remote_transport == "s3" && profile.remote_region.is_none() {
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                "remote S3 transport has no region in AWS_REGION/AWS_DEFAULT_REGION",
+            ));
+        }
+        if profile.remote_transport == "s3" {
+            match crate::remote::Credentials::load() {
+                Ok(credentials) => {
+                    let source = match credentials.source() {
+                        crate::remote::CredentialSource::Environment => "environment",
+                        crate::remote::CredentialSource::Profile { .. } => "shared profile",
+                    };
+                    checks.push(check(
+                        SEC_CONFIG,
+                        Level::Pass,
+                        format!("remote credentials: {source} (secrets redacted)"),
+                    ));
+                }
+                Err(err) => checks.push(check(
+                    SEC_CONFIG,
+                    Level::Warn,
+                    format!("remote credentials unavailable: {err:#}"),
+                )),
+            }
+            if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL_S3") {
+                let parsed = url::Url::parse(&endpoint).ok();
+                let https = parsed.as_ref().is_some_and(|url| url.scheme() == "https");
+                let host = parsed
+                    .as_ref()
+                    .and_then(|url| url.host_str())
+                    .unwrap_or("<invalid>");
+                checks.push(check(
+                    SEC_CONFIG,
+                    if https { Level::Pass } else { Level::Warn },
+                    format!("remote S3 endpoint: {host}"),
+                ));
+            }
+        }
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("remote cache: {}", profile.remote_cache),
+        ));
+        if let Some(ca) = std::env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
+            let ca = PathBuf::from(ca);
+            let usable = ca.is_file();
+            checks.push(check(
+                SEC_CONFIG,
+                if usable { Level::Pass } else { Level::Warn },
+                format!(
+                    "remote CA: SSL_CERT_FILE {}{}",
+                    ca.display(),
+                    if usable { "" } else { " (missing)" }
+                ),
+            ));
+        } else {
+            checks.push(check(SEC_CONFIG, Level::Info, "remote CA: system roots"));
+        }
+        if std::env::var_os("HTTPS_PROXY")
+            .or_else(|| std::env::var_os("ALL_PROXY"))
+            .is_some_and(|value| !value.is_empty())
+        {
+            checks.push(check(
+                SEC_CONFIG,
+                Level::Info,
+                "remote proxy: environment (redacted)",
+            ));
+        }
+    } else {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("remote cache: {}", profile.remote_cache),
+        ));
+    }
+    if !profile.remote_enabled && profile.remote_key_id.is_some() {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Warn,
+            "remote publisher key is configured but there is no `[remote] url` — remote stays disabled",
+        ));
+    }
+    if profile.remote_enabled {
+        match (&profile.remote_index, &profile.remote_index_error) {
+            (Some(index), _) => {
+                let published = SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(index.publisher.built_at))
+                    .map(human_age)
+                    .unwrap_or_else(|| "unknown time".to_string());
+                let compatible = index.mismatches.is_empty();
+                checks.push(check(
+                    SEC_CONFIG,
+                    if compatible { Level::Pass } else { Level::Warn },
+                    format!(
+                        "remote index: sequence {} · published {} ago · {}",
+                        index.sequence,
+                        published,
+                        if compatible {
+                            "compatibility matches"
+                        } else {
+                            "compatibility mismatch"
+                        }
+                    ),
+                ));
+                for mismatch in &index.mismatches {
+                    checks.push(check(
+                        SEC_CONFIG,
+                        Level::Warn,
+                        format!("remote compatibility: {mismatch}"),
+                    ));
+                }
+                if index.is_expired(crate::remote::now_secs()) {
+                    checks.push(check(
+                        SEC_CONFIG,
+                        Level::Warn,
+                        "remote index has expired — ask CI to publish a fresh sequence",
+                    ));
+                }
+            }
+            (None, Some(err)) => checks.push(check(
+                SEC_CONFIG,
+                Level::Warn,
+                format!("remote index state: {err}"),
+            )),
+            (None, None) => checks.push(check(
+                SEC_CONFIG,
+                Level::Info,
+                "remote index: no verified index yet — `exec` fetches one",
+            )),
+        }
+    }
+    if let Ok(state) = paths::state_dir() {
+        checks.push(check(
+            SEC_CONFIG,
+            Level::Info,
+            format!("epicenter state: {}", state.display()),
+        ));
+        if let Ok(legacy_home) = paths::ambient_cargo_home() {
+            let legacy = legacy_home.join("epicenter");
+            if legacy.join("manifest.ed25519").is_file() || legacy.join("manifest.key").is_file() {
+                checks.push(check(
+                    SEC_CONFIG,
+                    Level::Warn,
+                    format!(
+                        "legacy vault keys in {} — move them to {} to keep the writer identity stable",
+                        legacy.display(),
+                        state.display()
+                    ),
+                ));
+            }
+        }
+    }
+    let memory_label = if profile.memory_source == "auto" {
+        "physical memory"
+    } else {
+        "memory budget"
+    };
+    checks.push(check(
+        SEC_SYSTEM,
+        Level::Info,
+        format!(
+            "{} {}, {} cores; safe job cap {} (2 GiB/job)",
+            profile
+                .memory_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown".to_string()),
+            memory_label,
+            profile.cores,
+            profile.job_cap
+        ),
+    ));
+    if profile.job_cap < profile.cores {
+        checks.push(check(
+            SEC_SYSTEM,
+            Level::Info,
+            format!(
+                "{memory_label} caps jobs from {} cores to {}; set `memory` or CARGO_BUILD_JOBS to change it",
+                profile.cores, profile.job_cap
+            ),
+        ));
+    }
+    checks.push(check(
+        SEC_POLICY,
+        Level::Pass,
+        format!(
+            "preset: {} -> {} ({})",
+            profile.preset, profile.effective_preset, profile.preset_source
+        ),
+    ));
+    checks.push(check(
+        SEC_POLICY,
+        if profile.jobs > profile.job_cap {
+            Level::Warn
+        } else {
+            Level::Pass
+        },
+        format!(
+            "jobs: {} ({}){}",
+            profile.jobs,
+            profile.jobs_source,
+            if profile.jobs > profile.job_cap {
+                format!(" — above the memory cap {}", profile.job_cap)
+            } else {
+                String::new()
+            }
+        ),
+    ));
+    checks.push(check(
+        SEC_POLICY,
+        if profile.linker == "auto"
+            || profile.active_linker == profile.linker
+            || profile.active_linker == "custom"
+        {
+            Level::Pass
+        } else {
+            Level::Warn
+        },
+        format!(
+            "linker: intent {} ({}), active {}",
+            profile.linker, profile.linker_source, profile.active_linker
+        ),
+    ));
+    checks.push(check(
+        SEC_POLICY,
+        Level::Info,
+        format!(
+            "link policy: {} ({}) — a writable network/shared store is copied; auto links only immutable archive outputs in a private local store",
+            profile.link, profile.link_source
+        ),
+    ));
+    checks.push(check(
+        SEC_POLICY,
+        Level::Info,
+        match &profile.wrapper {
+            Some(wrapper) => format!("rustc-wrapper: {wrapper}"),
+            None => "rustc-wrapper: none".to_string(),
+        },
+    ));
+    if let Some(wrapper) = &profile.wrapper {
+        if profile.dev.incremental == "true" {
+            checks.push(check(
+                SEC_POLICY,
+                Level::Warn,
+                format!(
+                    "rustc-wrapper {wrapper} is active but dev incremental is on — wrapper caches and incremental state fight; set incremental=false or remove the wrapper"
+                ),
+            ));
+        }
+    }
+    checks.push(check(
+        SEC_POLICY,
+        Level::Info,
+        format!("store: {}", profile.store),
+    ));
+    checks.extend(check_store_generations(Path::new(&profile.store)));
+    if let Some(last) = &profile.last_build {
+        checks.push(check(
+            SEC_POLICY,
+            Level::Info,
+            format!("last build: {last}"),
+        ));
+    }
+    if let Some(project) = &profile.project {
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            format!("workspace: {project}"),
+        ));
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            format!(
+                "dev: opt-level={}, debug={}, lto={}, codegen-units={}, split-debuginfo={}, incremental={}",
+                profile.dev.opt_level,
+                profile.dev.debug,
+                profile.dev.lto,
+                profile.dev.codegen_units,
+                profile.dev.split_debuginfo,
+                profile.dev.incremental
+            ),
+        ));
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            format!(
+                "release: opt-level={}, debug={}, lto={}, codegen-units={}, split-debuginfo={}",
+                profile.release.opt_level,
+                profile.release.debug,
+                profile.release.lto,
+                profile.release.codegen_units,
+                profile.release.split_debuginfo
+            ),
+        ));
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            "recommend dev: debug=2, lto=false, codegen-units=256, incremental=true — edit Cargo.toml; epicenter never rewrites a profile automatically",
+        ));
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            "recommend release: lto=\"thin\", codegen-units=16, debug=false — thin LTO measured 4.84→2.99 MiB binary and 760→729 MiB build",
+        ));
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            "with full debug, split-debuginfo=unpacked trims the binary and linker RSS (not total disk; Windows/MSVC semantics differ)",
+        ));
+        if profile.dev.lto != "false" && profile.dev.lto != "off" {
+            checks.push(check(
+                SEC_PROFILE,
+                Level::Warn,
+                format!(
+                    "dev lto={} — thin/fat LTO makes warm edits slower; keep LTO for release",
+                    profile.dev.lto
+                ),
+            ));
+        }
+        if profile.dev.codegen_units != "256" {
+            checks.push(check(
+                SEC_PROFILE,
+                Level::Warn,
+                format!(
+                    "dev codegen-units={} (Cargo default 256) — raising CGU without measurement was 5–17% slower in screening",
+                    profile.dev.codegen_units
+                ),
+            ));
+        }
+        if profile.dev.debug == "false" {
+            checks.push(check(
+                SEC_PROFILE,
+                Level::Warn,
+                "dev debug=false — no debuginfo for incident investigation; use line-tables-only if size is the goal",
+            ));
+        }
+        if profile.package_overrides {
+            checks.push(check(
+                SEC_PROFILE,
+                Level::Info,
+                "profile package overrides present — the values above are the top-level profile, not per-package",
+            ));
+        }
+    } else {
+        checks.push(check(
+            SEC_PROFILE,
+            Level::Info,
+            "no Cargo project here — profile audit skipped",
+        ));
+    }
+    if nightly_available() {
+        for (flag, effect) in [
+            (
+                "-Zdebuginfo-compression=zstd",
+                "−25% build time / −69% binary, neutral time",
+            ),
+            (
+                "-Zcodegen-backend=cranelift",
+                "−12% wall / −9% build (preview backend)",
+            ),
+            ("-Zshare-generics", "neutral on the 37-dep screen"),
+            ("-Zmir-opt-level=0", "~3% faster builds; runtime cost"),
+        ] {
+            checks.push(check(
+                SEC_NIGHTLY,
+                Level::Info,
+                format!("nightly hint: `{flag}` — {effect}; optional, never applied automatically"),
+            ));
+        }
+    }
+    Ok((checks, profile))
+}
+
+fn read_last_build() -> Option<String> {
+    let state = crate::paths::state_dir().ok()?.join("last-build.json");
+    let path = if state.is_file() {
+        state
+    } else {
+        let legacy = crate::paths::ambient_cargo_home()
+            .ok()?
+            .join("epicenter")
+            .join("last-build.json");
+        if legacy.is_file() {
+            legacy
+        } else {
+            return None;
+        }
+    };
+    let text = crate::util::read_small_text(&path, 1024 * 1024).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let command = value.get("command")?.as_str()?;
+    let seconds = value.get("elapsed_secs")?.as_f64()?;
+    let rss = value
+        .get("peak_rss_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|bytes| *bytes > 0);
+    Some(match rss {
+        Some(rss) => format!("`{command}` — {seconds:.1}s, peak RSS {}", human_bytes(rss)),
+        None => format!("`{command}` — {seconds:.1}s, peak RSS unavailable"),
+    })
+}
+
+fn effective_jobs(cores: usize, cap: usize) -> (usize, String) {
+    if let Some(raw) = std::env::var_os("CARGO_BUILD_JOBS") {
+        if let Some(jobs) = parse_jobs(&raw.to_string_lossy(), cores) {
+            return (jobs, "CARGO_BUILD_JOBS".to_string());
+        }
+    }
+    if let Some(raw) = project_cargo_jobs() {
+        if let Some(jobs) = parse_jobs(&raw, cores) {
+            return (jobs, "project .cargo/config".to_string());
+        }
+    }
+    if let Ok(Some(raw)) = crate::config::cargo_configured_in("build", "jobs") {
+        if let Some(jobs) = parse_jobs(&raw, cores) {
+            return (jobs, "global cargo config".to_string());
+        }
+    }
+    (cap, "auto memory cap".to_string())
+}
+
+fn parse_jobs(raw: &str, cores: usize) -> Option<usize> {
+    let value: i64 = raw.trim().parse().ok()?;
+    Some(if value > 0 {
+        value as usize
+    } else if value < 0 {
+        (cores as i64 + value).max(1) as usize
+    } else {
+        1
+    })
+}
+
+fn project_cargo_jobs() -> Option<String> {
+    cargo_jobs_between(&std::env::current_dir().ok()?)
+}
+
+/// Nearest ancestor `.cargo` config that sets `build.jobs`, matching Cargo's
+/// per-key merge. Cargo reads one file per directory and the extensionless
+/// `config` wins when both files exist, so never consult `config.toml` in a
+/// directory that has `config`.
+fn cargo_jobs_between(start: &Path) -> Option<String> {
+    for ancestor in start.ancestors() {
+        let dir = ancestor.join(".cargo");
+        let path = if dir.join("config").is_file() {
+            dir.join("config")
+        } else {
+            let toml = dir.join("config.toml");
+            if !toml.is_file() {
+                continue;
+            }
+            toml
+        };
+        if let Some(value) = crate::config::read_build_table_key(&path, "jobs") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn host_triple() -> Option<String> {
+    crate::toolchain::rustc_info(None)
+        .ok()
+        .map(|info| info.host)
+}
+
+fn active_linker() -> (String, Option<String>) {
+    let Some(host) = host_triple() else {
+        return ("unknown".to_string(), None);
+    };
+    let key = format!("target.{host}");
+    let raw = crate::config::cargo_configured_in(&key, "rustflags")
+        .ok()
+        .flatten();
+    let active = match raw.as_deref() {
+        Some(value) if linker_flags_target_wild(value) => "wild",
+        Some(value)
+            if value.contains("-fuse-ld=lld")
+                || value.contains("rust-lld")
+                || value.contains("lld-link") =>
+        {
+            "lld"
+        }
+        Some(_) => "custom",
+        None => "system",
+    };
+    (active.to_string(), raw)
+}
+
+/// Does the rustflags value select Wild? `--ld-path` may hold the bare name
+/// (legacy) or a resolved absolute path written by setup; compare the path's
+/// file name so a directory or sibling containing "wild" never matches.
+/// The linker is also selected through the whole `-fuse-ld=` rustflag token,
+/// either bare or wrapped as the `-C link-arg=-fuse-ld=wild` option pair.
+fn linker_flags_target_wild(raw: &str) -> bool {
+    raw.split(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '"' | '\'' | ','))
+        .any(|flag| {
+            if let Some(path) = flag.strip_prefix("--ld-path=") {
+                let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                let name = name.to_ascii_lowercase();
+                return name == "wild" || name == "wild.exe";
+            }
+            let flag = flag.strip_prefix("-C").unwrap_or(flag);
+            let arg = flag.strip_prefix("link-arg=").unwrap_or(flag);
+            arg.strip_prefix("-fuse-ld=")
+                .is_some_and(|value| value.eq_ignore_ascii_case("wild"))
+        })
+}
+
+pub(crate) fn workspace_root() -> Option<PathBuf> {
+    let output = crate::util::command_for("cargo")
+        .ok()?
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    json.get("workspace_root")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+}
+
+fn profiles(root: &Path) -> Option<(ProfileValues, ProfileValues, bool)> {
+    let text = crate::util::read_small_text(&root.join("Cargo.toml"), 4 * 1024 * 1024).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    let profile = value.get("profile");
+    let dev = profile.and_then(|profile| profile.get("dev"));
+    let release = profile.and_then(|profile| profile.get("release"));
+    let package_overrides = dev.and_then(|dev| dev.get("package")).is_some()
+        || release.and_then(|release| release.get("package")).is_some();
+    Some((
+        profile_values(dev, false),
+        profile_values(release, true),
+        package_overrides,
+    ))
+}
+
+fn profile_values(profile: Option<&toml::Value>, release: bool) -> ProfileValues {
+    let get = |key: &str| profile.and_then(|profile| profile.get(key));
+    ProfileValues {
+        opt_level: render(get("opt-level"), if release { "3" } else { "0" }),
+        debug: render(get("debug"), if release { "false" } else { "true" }),
+        lto: render(get("lto"), "false"),
+        codegen_units: render(get("codegen-units"), if release { "16" } else { "256" }),
+        split_debuginfo: render(get("split-debuginfo"), "default"),
+        incremental: render(get("incremental"), if release { "false" } else { "true" }),
+    }
+}
+
+fn render(value: Option<&toml::Value>, default: &str) -> String {
+    match value {
+        Some(toml::Value::String(value)) => value.clone(),
+        Some(toml::Value::Boolean(value)) => value.to_string(),
+        Some(toml::Value::Integer(value)) => value.to_string(),
+        Some(toml::Value::Float(value)) => value.to_string(),
+        Some(value) => value.to_string(),
+        None => default.to_string(),
+    }
+}
+
+fn nightly_available() -> bool {
+    crate::util::command_for("rustc")
+        .ok()
+        .and_then(|mut command| command.args(["+nightly", "--version"]).output().ok())
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    fn stamp(path: &Path, secs: u64) -> Result<()> {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(time)?;
+        Ok(())
+    }
+
+    fn le_hex(value: u64) -> String {
+        value
+            .to_le_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Write one classic-layout unit: memo, optional fingerprint JSON with
+    /// dependency triples, and optionally a stamped artifact.
+    fn write_unit(
+        root: &Path,
+        package: &str,
+        suffix: &str,
+        memo: &str,
+        deps: &[(u64, &str)],
+        artifact_at: Option<u64>,
+    ) -> Result<()> {
+        let dir = root
+            .join("debug/.fingerprint")
+            .join(format!("{package}-{suffix}"));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(format!("lib-{package}")), memo)?;
+        let deps_json: Vec<String> = deps
+            .iter()
+            .map(|(hash, name)| format!("[{hash},\"{name}\",false,{hash}]"))
+            .collect();
+        fs::write(
+            dir.join(format!("lib-{package}.json")),
+            format!(
+                r#"{{"rustc":5244445300240561903,"features":"[]","declared_features":"[]","deps":[{}]}}"#,
+                deps_json.join(",")
+            ),
+        )?;
+        if let Some(at) = artifact_at {
+            fs::create_dir_all(root.join("debug/deps"))?;
+            let artifact = root
+                .join("debug/deps")
+                .join(format!("lib{package}-{suffix}.rlib"));
+            fs::write(&artifact, [1u8; 32])?;
+            stamp(&artifact, at)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mtime_violations_count_units_not_dependency_edges() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (first, second) = (1u64, 2u64);
+        write_unit(
+            root.path(),
+            "dep_a",
+            "1111111111111111",
+            &le_hex(first),
+            &[],
+            Some(1_700_000_600),
+        )?;
+        write_unit(
+            root.path(),
+            "dep_b",
+            "2222222222222222",
+            &le_hex(second),
+            &[],
+            Some(1_700_000_700),
+        )?;
+        write_unit(
+            root.path(),
+            "top",
+            "3333333333333333",
+            "3333333333333333",
+            &[(first, "dep_a"), (second, "dep_b")],
+            Some(1_700_000_000),
+        )?;
+
+        let rows = who::collect(root.path())?;
+        let checks = check_mtime_ordering(&rows);
+        assert!(
+            matches!(checks[0].level, Level::Warn),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("1 unit(s)"),
+            "two newer deps are still one recompiling unit: {}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("2 edge(s) checked"),
+            "both timestamped edges were inspected: {}",
+            checks[0].message
+        );
+        assert_eq!(checks.len(), 2, "one example for one affected unit");
+        Ok(())
+    }
+
+    #[test]
+    fn mtime_check_ignores_edges_without_timestamps() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let dep = 1u64;
+        write_unit(
+            root.path(),
+            "dep_a",
+            "1111111111111111",
+            &le_hex(dep),
+            &[],
+            Some(1_700_000_600),
+        )?;
+        // The dependent has no artifact, so the edge cannot be judged.
+        write_unit(
+            root.path(),
+            "top",
+            "3333333333333333",
+            "3333333333333333",
+            &[(dep, "dep_a")],
+            None,
+        )?;
+
+        let rows = who::collect(root.path())?;
+        let checks = check_mtime_ordering(&rows);
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].level, Level::Info),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("not checked"),
+            "got: {}",
+            checks[0].message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_wrapper_is_checked_directly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wrapper = dir.path().join("wrapper-tool");
+        fs::write(&wrapper, b"")?;
+        assert_eq!(
+            wrapper_location(&wrapper.to_string_lossy()),
+            Some(wrapper.clone())
+        );
+        assert!(wrapper_location(&dir.path().join("missing-tool").to_string_lossy()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_jobs_prefers_extensionless_config() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cargo = root.path().join(".cargo");
+        fs::create_dir_all(&cargo)?;
+        fs::write(cargo.join("config"), "[build]\njobs = 3\n")?;
+        fs::write(cargo.join("config.toml"), "[build]\njobs = 9\n")?;
+        assert_eq!(cargo_jobs_between(root.path()).as_deref(), Some("3"));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_jobs_uses_nearest_ancestor() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join(".cargo"))?;
+        fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[build]\njobs = 4\n",
+        )?;
+        let nested = root.path().join("crates/app");
+        fs::create_dir_all(nested.join(".cargo"))?;
+        fs::write(nested.join(".cargo/config.toml"), "[build]\njobs = 5\n")?;
+        assert_eq!(cargo_jobs_between(&nested).as_deref(), Some("5"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_dir_env_override_is_judged_against_the_cache() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cache = root.path().join("cache");
+        let elsewhere = root.path().join("elsewhere");
+        let aligned = check_build_dir_override(&cache, &cache.to_string_lossy());
+        assert!(matches!(aligned.level, Level::Pass), "{}", aligned.message);
+        let drifting = check_build_dir_override(&cache, &elsewhere.to_string_lossy());
+        assert!(
+            matches!(drifting.level, Level::Warn),
+            "{}",
+            drifting.message
+        );
+        assert!(drifting.message.contains("CARGO_BUILD_BUILD_DIR"));
+        Ok(())
+    }
+
+    #[test]
+    fn wild_is_matched_by_file_name_not_substring() {
+        assert!(linker_flags_target_wild(
+            "--ld-path=/home/dev/.cargo/bin/wild"
+        ));
+        assert!(linker_flags_target_wild(
+            r#"["--ld-path=C:\tools\wild.exe"]"#
+        ));
+        assert!(linker_flags_target_wild("--ld-path=wild"));
+        assert!(linker_flags_target_wild("-C link-arg=-fuse-ld=wild"));
+        assert!(!linker_flags_target_wild(
+            "--ld-path=/opt/wild-thing/bin/ld"
+        ));
+        assert!(!linker_flags_target_wild("--ld-path=/opt/lld/wildly"));
+    }
+
+    #[test]
+    fn failed_unit_scan_skips_orphan_diagnosis() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("debug/incremental/orphan-abc123/session"))?;
+        let checks = incremental_checks(root.path(), None);
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].level, Level::Info),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("skipped"),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            !checks
+                .iter()
+                .any(|check| check.message.contains("without a live fingerprint")),
+            "no orphan claim without a unit scan"
+        );
+        Ok(())
+    }
+}

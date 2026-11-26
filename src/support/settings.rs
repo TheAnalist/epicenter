@@ -1,0 +1,1724 @@
+//! Epicenter policy: presets, `epicenter.toml`, and safe auto-detection.
+//!
+//! Precedence is always **CLI > project file > global file > auto**:
+//!
+//! - project file: the nearest `epicenter.toml` walking up from the working
+//!   directory (never outside it);
+//! - global file: the OS config path (`$XDG_CONFIG_HOME`, Application Support
+//!   or `%APPDATA%`), independent of `CARGO_HOME`;
+//! - auto: `CI` selects the CI preset, otherwise the dev preset; memory and
+//!   cores come from the machine.
+//!
+//! `setup` writes the **global** files only (Cargo config + this global
+//! `epicenter.toml`); a project file is user-owned and read-only.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail, ensure};
+use ed25519_dalek::VerifyingKey;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::util::metadata_nofollow;
+
+pub use crate::paths::FILE_NAME;
+
+/// Conservative per-job memory footprint for the auto job cap. The measured
+/// 37-dep build used ~0.25 GiB/job; 2 GiB keeps a wide machine safe without
+/// starving the edit loop.
+pub const JOB_FOOTPRINT: u64 = 2 * 1024 * 1024 * 1024;
+
+/// A user intent, as written in `epicenter.toml` or passed to `setup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Preset {
+    Auto,
+    Dev,
+    Ci,
+}
+
+impl Preset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Preset::Auto => "auto",
+            Preset::Dev => "dev",
+            Preset::Ci => "ci",
+        }
+    }
+}
+
+/// The preset auto resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectivePreset {
+    Dev,
+    Ci,
+}
+
+impl EffectivePreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffectivePreset::Dev => "dev",
+            EffectivePreset::Ci => "ci",
+        }
+    }
+}
+
+/// Linker selection. `Auto` keeps the existing managed state (it never
+/// rewrites rustflags just because setup ran); the other values are explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkerChoice {
+    Auto,
+    System,
+    Lld,
+    Wild,
+    Mold,
+    Gold,
+}
+
+impl LinkerChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkerChoice::Auto => "auto",
+            LinkerChoice::System => "system",
+            LinkerChoice::Lld => "lld",
+            LinkerChoice::Wild => "wild",
+            LinkerChoice::Mold => "mold",
+            LinkerChoice::Gold => "gold",
+        }
+    }
+}
+
+/// How restore installs immutable artifacts into a view.
+///
+/// * `auto` — reflink when the filesystem supports it; hard-link only a
+///   read-only mount or a foreign immutable source; copy a writable store.
+/// * `copy` — never hard-link; reflink or copy.
+/// * `link` — force hard links (only valid in the global policy file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkPolicy {
+    Auto,
+    Copy,
+    Link,
+}
+
+impl LinkPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkPolicy::Auto => "auto",
+            LinkPolicy::Copy => "copy",
+            LinkPolicy::Link => "link",
+        }
+    }
+
+    /// Higher is stricter: a project file may tighten but never loosen the
+    /// global policy.
+    fn strictness(self) -> u8 {
+        match self {
+            LinkPolicy::Link => 0,
+            LinkPolicy::Auto => 1,
+            LinkPolicy::Copy => 2,
+        }
+    }
+}
+
+/// Remote artifact tier. `libraries` excludes executable build-script and
+/// proc-macro units; `full` includes them for a trusted, homogeneous fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteTier {
+    Libraries,
+    Full,
+}
+
+impl RemoteTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteTier::Libraries => "libraries",
+            RemoteTier::Full => "full",
+        }
+    }
+}
+
+/// Transport derived from the remote URL scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTransport {
+    /// Anonymous HTTPS GET; no credentials.
+    AnonymousHttps,
+    /// Authenticated S3-compatible access; credentials and region come from
+    /// the standard AWS environment.
+    S3,
+}
+
+impl RemoteTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteTransport::AnonymousHttps => "https",
+            RemoteTransport::S3 => "s3",
+        }
+    }
+}
+
+/// The `[remote]` table as written in one policy file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFileConfig {
+    pub tier: Option<RemoteTier>,
+    pub url: Option<String>,
+    /// Pinned Ed25519 publisher public key, 64 hex characters.
+    pub publisher_key: Option<String>,
+}
+
+impl RemoteFileConfig {
+    /// A project may only tighten the tier; the endpoint and publisher key are
+    /// machine-level trust anchors.
+    fn has_non_tier(&self) -> bool {
+        self.url.is_some() || self.publisher_key.is_some()
+    }
+}
+
+/// The validated effective remote policy.
+#[derive(Debug, Clone)]
+pub struct RemotePolicy {
+    pub tier: RemoteTier,
+    pub tier_source: Source,
+    pub enabled: bool,
+    pub url: Option<String>,
+    pub publisher_key: Option<String>,
+    /// Stable, short key id derived from the public-key fingerprint.
+    pub key_id: Option<String>,
+    /// Local import/cache directory; always the per-user OS default.
+    pub cache: PathBuf,
+    pub transport: RemoteTransport,
+    /// S3 region from the environment, when the transport is S3.
+    pub region: Option<String>,
+}
+
+impl RemotePolicy {
+    /// Endpoint suitable for logs: no query string, fragment or credentials.
+    pub fn redacted_url(&self) -> Option<String> {
+        let url = self.url.as_deref()?;
+        let end = url.find(['?', '#']).unwrap_or(url.len());
+        Some(url[..end].to_string())
+    }
+}
+
+/// Where an effective value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Cli,
+    Project,
+    Global,
+    Auto,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Cli => "cli",
+            Source::Project => "project epicenter.toml",
+            Source::Global => "global epicenter.toml",
+            Source::Auto => "auto",
+        }
+    }
+}
+
+/// A memory budget: integer MiB, or a string with a unit (`8GiB`, `500M`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Memory {
+    Text(String),
+    Number(u64),
+}
+
+impl Memory {
+    pub fn bytes(&self) -> Result<u64> {
+        match self {
+            Memory::Text(raw) => parse_memory(raw),
+            // A bare number in TOML is MiB: the least surprising unit for a
+            // budget, and still explicit in the docs.
+            Memory::Number(mib) => mib
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| anyhow::anyhow!("memory budget is too large")),
+        }
+    }
+}
+
+/// The handful of keys epicenter reads from `epicenter.toml`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FileConfig {
+    pub preset: Option<Preset>,
+    pub memory: Option<Memory>,
+    pub linker: Option<LinkerChoice>,
+    pub link: Option<LinkPolicy>,
+    pub store: Option<String>,
+    pub work: Option<String>,
+    pub cargo_home: Option<String>,
+    pub remote: Option<RemoteFileConfig>,
+}
+
+/// One resolved config file, with the directory used for relative paths.
+#[derive(Debug, Clone)]
+struct Loaded {
+    path: PathBuf,
+    preset: Option<Preset>,
+    memory: Option<u64>,
+    linker: Option<LinkerChoice>,
+    link: Option<LinkPolicy>,
+    store: Option<String>,
+    work: Option<String>,
+    cargo_home: Option<String>,
+    remote: Option<RemoteFileConfig>,
+}
+
+impl Loaded {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let meta = match crate::util::probe_kind(path)? {
+            // A missing project file is normal; a missing global file means
+            // "no explicit policy", not an error.
+            crate::util::Probed::Missing => return Ok(None),
+            crate::util::Probed::Reparse => {
+                anyhow::bail!(
+                    "configuration path {} is a symlink/reparse or not a regular file",
+                    path.display()
+                );
+            }
+            crate::util::Probed::Real(meta) => meta,
+        };
+        if !meta.is_file() {
+            anyhow::bail!(
+                "configuration path {} is a symlink/reparse or not a regular file",
+                path.display()
+            );
+        }
+        let text = crate::util::read_trusted_config(path, 1024 * 1024)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let config: FileConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            preset: config.preset,
+            memory: config.memory.map(|memory| memory.bytes()).transpose()?,
+            linker: config.linker,
+            link: config.link,
+            store: config.store,
+            work: config.work,
+            cargo_home: config.cargo_home,
+            remote: config.remote,
+        }))
+    }
+
+    fn base(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+}
+
+/// Project + global epicenter policy, already resolved to concrete values.
+#[derive(Debug, Clone, Default)]
+pub struct Settings {
+    project: Option<Loaded>,
+    global: Option<Loaded>,
+}
+
+/// Convenience loader used by the CLI.
+pub fn load(cwd: &Path) -> Result<Settings> {
+    Settings::load(cwd)
+}
+
+impl Settings {
+    /// Load the nearest project file and the global file. `cwd` is the
+    /// command's working directory (`exec --cwd` uses the child's directory).
+    /// The global path is resolved without consulting `CARGO_HOME`.
+    pub fn load(cwd: &Path) -> Result<Self> {
+        let global = crate::paths::global_config_path()?;
+        Self::load_at(cwd, Some(&global))
+    }
+
+    /// Testable loader: `global` may be `None` to exercise project/auto only.
+    pub fn load_at(cwd: &Path, global: Option<&Path>) -> Result<Self> {
+        let cwd = if cwd.is_absolute() {
+            cwd.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("resolving the working directory")?
+                .join(cwd)
+        };
+        let project = match find_project(&cwd) {
+            Some(path) => match Loaded::read(&path) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    // A malformed repository policy must not brick unrelated
+                    // commands. Keep the global fallback and say why.
+                    eprintln!(
+                        "warning: ignoring invalid project config {}: {err:#}",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let global = global.map(|path| Loaded::read(path)).transpose()?.flatten();
+        Ok(Self { project, global })
+    }
+
+    /// The highest-precedence file that sets `pick`, with its base path and
+    /// source. Project always wins over global; `None` means neither file set
+    /// the value.
+    fn layered<T>(&self, pick: impl Fn(&Loaded) -> Option<T>) -> Option<(&Loaded, T, Source)> {
+        if let Some(file) = self.project.as_ref()
+            && let Some(value) = pick(file)
+        {
+            return Some((file, value, Source::Project));
+        }
+        if let Some(file) = self.global.as_ref()
+            && let Some(value) = pick(file)
+        {
+            return Some((file, value, Source::Global));
+        }
+        None
+    }
+
+    pub fn preset(&self) -> (Preset, Source) {
+        self.layered(|file| file.preset)
+            .map(|(_, value, source)| (value, source))
+            .unwrap_or((Preset::Auto, Source::Auto))
+    }
+
+    pub fn linker(&self) -> (LinkerChoice, Source) {
+        self.layered(|file| file.linker)
+            .map(|(_, value, source)| (value, source))
+            .unwrap_or((LinkerChoice::Auto, Source::Auto))
+    }
+
+    /// How restore installs immutable artifacts.
+    ///
+    /// Precedence is by *strictness*: a project file may tighten a global
+    /// policy (`auto` -> `copy`) but cannot loosen it. `link` is only valid
+    /// in the global file: a repository must not force shared inodes.
+    pub fn link(&self) -> Result<(LinkPolicy, Source)> {
+        let project = self.project.as_ref().and_then(|file| file.link);
+        if project == Some(LinkPolicy::Link) {
+            bail!(
+                "`link = \"link\"` is only allowed in the global epicenter.toml; \
+                 a project may choose `auto` or `copy`"
+            );
+        }
+        let global = self.global.as_ref().and_then(|file| file.link);
+        let mut chosen = (LinkPolicy::Auto, Source::Auto);
+        if let Some(policy) = global {
+            chosen = (policy, Source::Global);
+        }
+        if let Some(policy) = project {
+            if policy.strictness() > chosen.0.strictness() {
+                chosen = (policy, Source::Project);
+            } else if policy == chosen.0 && chosen.1 == Source::Global {
+                chosen.1 = Source::Project;
+            }
+        }
+        Ok(chosen)
+    }
+
+    /// Memory budget: project > global > physical RAM.
+    pub fn memory_bytes(&self) -> (Option<u64>, Source) {
+        match self.layered(|file| file.memory) {
+            Some((_, value, source)) => (Some(value), source),
+            None => (physical_memory(), Source::Auto),
+        }
+    }
+
+    /// Store path: project > global > default (`<build>/../store`).
+    ///
+    /// A project file is repository input, so a project-selected store is
+    /// held to a stricter standard than the global one: it may not contain
+    /// `..`, may not be the project directory or an ancestor of it, and an
+    /// existing directory must already be a marked, private epicenter store.
+    pub fn store(&self) -> Result<Option<(PathBuf, Source)>> {
+        let Some((file, raw, source)) = self.layered(|file| file.store.clone()) else {
+            return Ok(None);
+        };
+        let path = resolve_path(&raw, file.base())?;
+        match source {
+            Source::Project => validate_project_store(&path, file.base())
+                .with_context(|| format!("project store in {}", file.path.display()))?,
+            _ => validate_store_path(&path)?,
+        }
+        Ok(Some((path, source)))
+    }
+
+    /// Effective Cargo home: global `cargo_home` > shell `CARGO_HOME` >
+    /// `~/.cargo`. A project file cannot set it: the same absolute path must
+    /// be used on every machine that shares remote units.
+    pub fn cargo_home(&self) -> Result<(PathBuf, Source)> {
+        if self
+            .project
+            .as_ref()
+            .and_then(|file| file.cargo_home.as_deref())
+            .is_some()
+        {
+            bail!(
+                "`cargo_home` is only allowed in the global epicenter.toml; \
+                 a project must not redirect Cargo's home"
+            );
+        }
+        if let Some((_, raw, source)) = self.layered(|file| file.cargo_home.clone()) {
+            return Ok((resolve_cargo_home(&raw)?, source));
+        }
+        Ok((crate::paths::ambient_cargo_home()?, Source::Auto))
+    }
+
+    /// Effective remote distribution policy. Only the tier may come from a
+    /// project file; the endpoint, publisher key and writable cache are
+    /// global-only trust anchors.
+    pub fn remote(&self) -> Result<RemotePolicy> {
+        let project = self.project.as_ref().and_then(|file| file.remote.as_ref());
+        if project.is_some_and(RemoteFileConfig::has_non_tier) {
+            bail!(
+                "`[remote]` endpoint/key/cache/auth fields are only allowed in the \
+                 global epicenter.toml; a project may only set `[remote] tier`"
+            );
+        }
+        let project_tier = project.and_then(|remote| remote.tier);
+        let global = self.global.as_ref().and_then(|file| file.remote.as_ref());
+        let global_tier = global.and_then(|remote| remote.tier);
+        let (tier, tier_source) = match project_tier {
+            Some(RemoteTier::Full) if global_tier != Some(RemoteTier::Full) => bail!(
+                "project `[remote] tier = \"full\"` requires the global \
+                 `[remote] tier = \"full\"`; a project cannot enable executable \
+                 build-script/proc-macro units on its own"
+            ),
+            Some(tier) => (tier, Source::Project),
+            None => global_tier
+                .map(|tier| (tier, Source::Global))
+                .unwrap_or((RemoteTier::Libraries, Source::Auto)),
+        };
+
+        let cache = crate::paths::default_remote_cache()?;
+        let Some(global) = global else {
+            return Ok(RemotePolicy {
+                tier,
+                tier_source,
+                enabled: false,
+                url: None,
+                publisher_key: None,
+                key_id: None,
+                cache,
+                transport: RemoteTransport::AnonymousHttps,
+                region: None,
+            });
+        };
+        let (url, transport) = match global.url.as_deref() {
+            Some(raw) => {
+                let (url, transport) = validate_remote_url(raw)?;
+                (Some(url), transport)
+            }
+            None => (None, RemoteTransport::AnonymousHttps),
+        };
+        let (publisher_key, key_id) = match global.publisher_key.as_deref() {
+            Some(raw) => {
+                let key = normalize_remote_publisher_key(raw)?;
+                let id = remote_key_id(&key)?;
+                (Some(key), Some(id))
+            }
+            None => (None, None),
+        };
+        if url.is_some() && publisher_key.is_none() {
+            bail!(
+                "`[remote] url` requires `publisher_key`; readers must pin the \
+                 publisher identity from a trusted CI/admin channel"
+            );
+        }
+        let region = if transport == RemoteTransport::S3 {
+            aws_region()
+        } else {
+            None
+        };
+        Ok(RemotePolicy {
+            tier,
+            tier_source,
+            enabled: url.is_some(),
+            url,
+            publisher_key,
+            key_id,
+            cache,
+            transport,
+            region,
+        })
+    }
+
+    /// Global-only local work root. A project file cannot redirect job dirs:
+    /// `exec` creates and removes directories there, so the same rule as
+    /// `store` applies. `None` means the per-user OS-local default.
+    pub fn work_root(&self) -> Result<Option<(PathBuf, Source)>> {
+        let Some((file, raw, source)) = self.layered(|file| file.work.clone()) else {
+            return Ok(None);
+        };
+        if source == Source::Project {
+            bail!(
+                "`work` is only allowed in the global epicenter.toml; \
+                 a project must not redirect the writable work root"
+            );
+        }
+        let path = resolve_policy_path(&raw, file.base(), "work")?;
+        Ok(Some((path, source)))
+    }
+
+    /// Configured work root, or the OS-local default.
+    pub fn work_root_or_default(&self) -> Result<(PathBuf, Source)> {
+        match self.work_root()? {
+            Some((path, source)) => Ok((path, source)),
+            None => Ok((crate::paths::default_work_root()?, Source::Auto)),
+        }
+    }
+
+    pub fn project_path(&self) -> Option<&Path> {
+        self.project.as_ref().map(|file| file.path.as_path())
+    }
+
+    pub fn global_path(&self) -> Option<&Path> {
+        self.global.as_ref().map(|file| file.path.as_path())
+    }
+
+    /// Raw global `[remote]` table, for setup to edit even when the existing
+    /// policy is invalid and `remote()` would reject it.
+    pub fn global_remote(&self) -> Option<&RemoteFileConfig> {
+        self.global.as_ref().and_then(|file| file.remote.as_ref())
+    }
+
+    /// `auto` is dev on a workstation and ci when the environment says so.
+    pub fn effective_preset(&self) -> (EffectivePreset, Preset, Source) {
+        let (preset, source) = self.preset();
+        (resolve_preset(preset, ci_environment()), preset, source)
+    }
+
+    /// `None` means "leave Cargo's own default alone".
+    pub fn incremental(&self) -> Option<bool> {
+        match self.effective_preset().0 {
+            EffectivePreset::Dev => Some(true),
+            EffectivePreset::Ci => Some(false),
+        }
+    }
+
+    pub fn check_tier(&self) -> bool {
+        self.effective_preset().0 == EffectivePreset::Ci
+    }
+
+    /// Copied artifacts are gzip-compressed at harvest; library outputs are
+    /// stored raw. `store harvest --no-compress` opts out for CPU-starved hosts.
+    pub fn compression(&self) -> bool {
+        true
+    }
+
+    pub fn restore(&self) -> bool {
+        true
+    }
+}
+
+/// Nearest `epicenter.toml`, but never above the workspace root. A shared
+/// parent directory can be written by a co-tenant; an ancestor policy file
+/// must not be able to redirect the store or the profile.
+/// Nearest real project policy. A symlink/reparse candidate is skipped so a
+/// repository cannot shadow an ancestor policy with a link.
+fn find_project(cwd: &Path) -> Option<PathBuf> {
+    let stop = workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    for dir in cwd.ancestors() {
+        let candidate = dir.join(FILE_NAME);
+        if metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_file()) {
+            return Some(candidate);
+        }
+        if dir == stop {
+            break;
+        }
+    }
+    None
+}
+
+/// The nearest directory with a real `.git` or `Cargo.toml` marker. A
+/// symlinked marker is ignored: it must not shorten the ancestor search and
+/// hide a real policy above it.
+fn workspace_root(cwd: &Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors() {
+        let git =
+            metadata_nofollow(&dir.join(".git")).is_ok_and(|meta| meta.is_file() || meta.is_dir());
+        let cargo = metadata_nofollow(&dir.join("Cargo.toml")).is_ok_and(|meta| meta.is_file());
+        if git || cargo {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Reject a project-selected store before any write/deletion can reach it.
+fn validate_project_store(path: &Path, project_dir: &Path) -> Result<()> {
+    validate_store_path(path)?;
+    // `store = ".."` / `"."` would make the sweep and chmod target the
+    // project or its parent. A store may live inside the project (a marked
+    // local vault) but never contain it.
+    if project_dir.starts_with(path) {
+        bail!(
+            "store {} must not be the project directory or an ancestor of it",
+            path.display()
+        );
+    }
+    if crate::util::check_trusted_path(
+        path,
+        crate::util::PathKind::Dir,
+        crate::util::TrustPolicy::OwnerOnly,
+        "project store",
+    )?
+    .is_some()
+    {
+        let marker = path.join(crate::paths::STORE_MARKER);
+        // A symlinked marker must not pass a plain `is_file()`: it would let a
+        // link to any regular file vouch for an unmarked directory.
+        let marked =
+            crate::util::probe(&marker, "store marker")?.is_some_and(|meta| meta.is_file());
+        if !marked {
+            // An empty directory is a fresh store: the writer creates and
+            // marks it. A non-empty unmarked directory is the dangerous
+            // case (`store = "~/.cargo"`, `store = "~/.config"`).
+            let empty = std::fs::read_dir(path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                bail!(
+                    "store {} is not an epicenter store (missing {}); use the global store or an empty directory",
+                    path.display(),
+                    crate::paths::STORE_MARKER
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Paths that must never be used as a store, regardless of source.
+fn validate_store_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("store path {} must be absolute", path.display());
+    }
+    crate::util::reject_protected_path(path, "store path")?;
+    // Reject a symlinked final component even when the target is benign: the
+    // store is a deletion root, so its identity must be the directory itself.
+    crate::util::probe_dir(path, "store path")?;
+    Ok(())
+}
+
+/// Resolve a configured path: `~`, absolute, or relative to the config file.
+fn resolve_policy_path(raw: &str, base: &Path, what: &str) -> Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("`{what}` must not be empty");
+    }
+    if Path::new(raw)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("`{what}` must not contain `..`; use an absolute or home-relative path");
+    }
+    Ok(normalize(crate::util::resolve_from(raw, base)?))
+}
+
+fn resolve_path(raw: &str, base: &Path) -> Result<PathBuf> {
+    resolve_policy_path(raw, base, "store")
+}
+
+/// Resolve a global `cargo_home` value. It must be an absolute path that is
+/// identical on every machine/VM: no `~`, no relative path and no `..`.
+pub fn resolve_cargo_home(raw: &str) -> Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("`cargo_home` must not be empty");
+    }
+    if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        bail!(
+            "`cargo_home` must be an absolute path, not `~` — the same path must exist on every machine/VM"
+        );
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        bail!(
+            "`cargo_home` {} must be an absolute path shared by every machine/VM",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("`cargo_home` must not contain `..`; use a normalized absolute path");
+    }
+    crate::util::reject_protected_path(&path, "`cargo_home`")?;
+    Ok(normalize(path))
+}
+
+const MAX_REMOTE_URL_BYTES: usize = 4096;
+const MAX_REMOTE_KEY_BYTES: usize = 80;
+const MAX_AWS_REGION_BYTES: usize = 64;
+
+fn validate_remote_text(raw: &str, what: &str, max_bytes: usize) -> Result<String> {
+    let raw = raw.trim();
+    ensure!(!raw.is_empty(), "`[remote] {what}` must not be empty");
+    ensure!(
+        !raw.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || crate::util::is_unsafe_format(ch)
+        }),
+        "`[remote] {what}` must not contain whitespace, control or formatting characters"
+    );
+    ensure!(
+        raw.len() <= max_bytes,
+        "`[remote] {what}` exceeds {max_bytes} bytes"
+    );
+    Ok(raw.to_string())
+}
+
+fn strip_scheme<'a>(raw: &'a str, scheme: &str) -> Option<&'a str> {
+    raw.get(..scheme.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        .map(|_| &raw[scheme.len()..])
+}
+
+fn validate_remote_url(raw: &str) -> Result<(String, RemoteTransport)> {
+    let raw = validate_remote_text(raw, "url", MAX_REMOTE_URL_BYTES)?;
+    if let Some(rest) = strip_scheme(&raw, "https://") {
+        validate_https_url(rest)?;
+        return Ok((raw, RemoteTransport::AnonymousHttps));
+    }
+    if let Some(rest) = strip_scheme(&raw, "s3://") {
+        validate_s3_url(rest)?;
+        return Ok((raw, RemoteTransport::S3));
+    }
+    bail!(
+        "`[remote] url` must be https:// for anonymous reads or s3://bucket/prefix \
+         for authenticated S3; TLS is mandatory"
+    )
+}
+
+fn validate_https_url(rest: &str) -> Result<()> {
+    ensure!(!rest.contains('\\'), "`[remote] url` must not contain `\\`");
+    ensure!(
+        !rest.contains(['?', '#']),
+        "`[remote] url` must not contain a query or fragment; do not put signed tokens \
+         or credentials in the config"
+    );
+    let authority = rest.split('/').next().unwrap_or_default();
+    ensure!(!authority.is_empty(), "`[remote] url` is missing a host");
+    ensure!(
+        !authority.contains('@'),
+        "`[remote] url` must not embed credentials; use the environment path"
+    );
+    let path = rest
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    // The raw prefix checks run first: the URL parser folds percent-encoded
+    // dot segments during normalization, so parsing first could hide a `..`.
+    validate_remote_prefix(path, "`[remote] url`")?;
+    // Let the parser validate what the raw checks cannot: host and port.
+    url::Url::parse(&format!("https://{rest}"))
+        .context("`[remote] url` is not a valid https URL")?;
+    Ok(())
+}
+
+fn validate_remote_prefix(path: &str, what: &str) -> Result<()> {
+    ensure!(
+        !path.starts_with('/'),
+        "{what} path must not begin with an empty component"
+    );
+    let path = path.strip_suffix('/').unwrap_or(path);
+    if path.is_empty() {
+        return Ok(());
+    }
+    for component in path.split('/') {
+        ensure!(
+            !component.is_empty() && component != "." && component != "..",
+            "{what} path must not contain empty, `.` or `..` components"
+        );
+        let lower = component.to_ascii_lowercase();
+        ensure!(
+            !lower.contains("%2e")
+                && !lower.contains("%2f")
+                && !lower.contains("%5c")
+                && !component
+                    .chars()
+                    .any(|ch| { ch.is_control() || crate::util::is_unsafe_format(ch) }),
+            "{what} path contains an encoded traversal or control character"
+        );
+    }
+    Ok(())
+}
+
+fn validate_s3_url(rest: &str) -> Result<()> {
+    ensure!(
+        !rest.contains(['?', '#', '@', '\\']),
+        "`[remote] url` must not embed credentials, a query, a fragment or `\\`; \
+         use AWS environment credentials"
+    );
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    ensure!(
+        !bucket.is_empty() && bucket != "." && bucket != "..",
+        "`[remote] url` s3:// URL is missing a valid bucket"
+    );
+    let custom = std::env::var_os("AWS_ENDPOINT_URL_S3").is_some_and(|value| !value.is_empty());
+    if custom {
+        ensure!(
+            bucket.len() <= 255
+                && bucket
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+            "`[remote] url` s3:// bucket {bucket:?} contains unsupported characters"
+        );
+    } else {
+        ensure!(
+            (3..=63).contains(&bucket.len())
+                && bucket.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'-')
+                })
+                && bucket
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && bucket
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && !bucket.contains(".."),
+            "`[remote] url` s3:// bucket {bucket:?} does not follow AWS bucket naming rules"
+        );
+    }
+
+    ensure!(
+        !prefix.starts_with('/'),
+        "`[remote] url` s3:// prefix must not begin with an empty component"
+    );
+    validate_remote_prefix(prefix, "`[remote] url` s3:// prefix")?;
+    Ok(())
+}
+
+/// Normalize and validate an `https://` or `s3://` remote endpoint.
+pub fn normalize_remote_url(raw: &str) -> Result<String> {
+    Ok(validate_remote_url(raw)?.0)
+}
+
+fn decode_key_hex(raw: &str, what: &str) -> Result<[u8; 32]> {
+    let bytes = crate::util::hex_decode(raw, what)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("`[remote] {what}` must be 32 bytes (64 hex characters)"))
+}
+
+/// Whether a setup argument is a hex key rather than a file path.
+pub fn is_publisher_key_hex(raw: &str) -> bool {
+    let raw = raw.trim();
+    let hex = raw.strip_prefix("ed25519:").unwrap_or(raw);
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Normalize and validate the pinned Ed25519 publisher public key.
+pub fn normalize_remote_publisher_key(raw: &str) -> Result<String> {
+    let raw = validate_remote_text(raw, "publisher_key", MAX_REMOTE_KEY_BYTES)?;
+    let hex = raw.strip_prefix("ed25519:").unwrap_or(&raw);
+    let bytes = decode_key_hex(hex, "publisher_key")?;
+    VerifyingKey::from_bytes(&bytes).map_err(|err| {
+        anyhow::anyhow!("`[remote] publisher_key` is not a valid Ed25519 key: {err}")
+    })?;
+    Ok(hex.to_ascii_lowercase())
+}
+
+/// Stable short id derived from the public-key fingerprint.
+pub fn remote_key_id(public_key: &str) -> Result<String> {
+    let bytes = decode_key_hex(public_key, "public key")?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("ed25519:{}", crate::util::hex_encode(&digest[..8])))
+}
+
+pub fn aws_region() -> Option<String> {
+    ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= MAX_AWS_REGION_BYTES
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        })
+}
+
+/// Create a missing Cargo home with private permissions, or validate an
+/// existing one. A dry run validates what exists but creates nothing.
+pub fn prepare_cargo_home(path: &Path, dry_run: bool) -> Result<()> {
+    match crate::util::probe_dir(path, "cargo home")? {
+        Some(_) => crate::util::validate_private_dir(path, "cargo home"),
+        None => {
+            if dry_run {
+                return Ok(());
+            }
+            crate::util::create_private_dir_all(path)?;
+            crate::util::validate_private_dir(path, "cargo home")
+        }
+    }
+}
+
+/// Lexically remove `.`/`..` so reported store paths are stable.
+fn normalize(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Parse `512MiB`, `8GiB`, `2T`, or `500M`; a bare number is MiB.
+pub fn parse_memory(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("memory value must not be empty");
+    }
+    let number: String = raw
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    if number.is_empty() {
+        bail!("memory value {raw:?} must start with a number");
+    }
+    let unit = raw[number.len()..].trim().to_ascii_lowercase();
+    let multiplier: u64 = match unit.as_str() {
+        "" | "mib" | "m" | "mb" => 1024 * 1024,
+        "gib" | "g" | "gb" => 1024 * 1024 * 1024,
+        "kib" | "k" | "kb" => 1024,
+        "tib" | "t" | "tb" => 1024u64 * 1024 * 1024 * 1024,
+        "b" => 1,
+        other => bail!("unknown memory unit {other:?} (use KiB/MiB/GiB/TiB)"),
+    };
+    let value: f64 = number
+        .parse()
+        .with_context(|| format!("parsing memory value {raw:?}"))?;
+    let bytes = value * multiplier as f64;
+    if !bytes.is_finite() || bytes < 0.0 || bytes > u64::MAX as f64 {
+        bail!("memory value {raw:?} is out of range");
+    }
+    Ok(bytes as u64)
+}
+
+/// Auto preset: CI when `CI` is truthy, dev otherwise.
+pub fn resolve_preset(preset: Preset, ci: bool) -> EffectivePreset {
+    match preset {
+        Preset::Dev => EffectivePreset::Dev,
+        Preset::Ci => EffectivePreset::Ci,
+        Preset::Auto if ci => EffectivePreset::Ci,
+        Preset::Auto => EffectivePreset::Dev,
+    }
+}
+
+/// Common CI markers (`CI=true`, `CI=1`, ...).
+pub fn ci_environment() -> bool {
+    std::env::var_os("CI")
+        .map(|value| {
+            !matches!(
+                value.to_string_lossy().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Logical cores, at least one.
+pub fn available_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Workers for vault file copies. One per core up to eight: a two-core laptop
+/// gets two, a many-core workstation gets eight without thrashing the disk.
+pub fn copy_workers() -> usize {
+    available_cores().clamp(1, 8)
+}
+
+/// Workers for CPU-bound scans (decompression, hashing, parsing). Copies stay
+/// at [`copy_workers`]: scanning is compute, not disk pressure.
+pub fn scan_workers() -> usize {
+    available_cores().clamp(1, 32)
+}
+
+static COPY_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// The process-wide pool for vault file copies, sized by [`copy_workers`].
+pub fn copy_pool() -> &'static rayon::ThreadPool {
+    COPY_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(copy_workers())
+            .thread_name(|index| format!("epicenter-copy-{index}"))
+            .build()
+            .expect("building the copy thread pool")
+    })
+}
+
+static SCAN_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// The process-wide pool for CPU-bound scans. One pool keeps parallel scans
+/// from nesting or oversubscribing the machine.
+pub fn scan_pool() -> &'static rayon::ThreadPool {
+    SCAN_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(scan_workers())
+            .thread_name(|index| format!("epicenter-scan-{index}"))
+            .build()
+            .expect("building the scan thread pool")
+    })
+}
+
+/// Jobs = cores, capped by the memory budget; 2 GiB per job.
+pub fn job_cap(cores: usize, memory: Option<u64>) -> usize {
+    let cores = cores.max(1);
+    let by_memory = memory
+        .map(|bytes| (bytes / JOB_FOOTPRINT).max(1) as usize)
+        .unwrap_or(usize::MAX);
+    cores.min(by_memory).max(1)
+}
+
+/// Physical RAM, or `None` when the platform has no cheap query.
+#[cfg(unix)]
+pub fn physical_memory() -> Option<u64> {
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages > 0 && page_size > 0 {
+        Some((pages as u64).saturating_mul(page_size as u64))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+pub fn physical_memory() -> Option<u64> {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.total_phys)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn physical_memory() -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn test_public_key() -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        key.verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn global_cargo_home_wins_and_is_global_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("cargo-home");
+        let global = dir.path().join("global.toml");
+        write(
+            &global,
+            &format!("cargo_home = {:?}\n", cargo.to_string_lossy()),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(
+            settings.cargo_home().unwrap(),
+            (cargo.clone(), Source::Global)
+        );
+
+        write(
+            &dir.path().join(FILE_NAME),
+            &format!("cargo_home = {:?}\n", cargo.to_string_lossy()),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.cargo_home().unwrap_err();
+        assert!(err.to_string().contains("global"), "{err}");
+    }
+
+    #[test]
+    fn cargo_home_rejects_relative_and_home_paths() {
+        assert!(resolve_cargo_home("relative/cargo").is_err());
+        assert!(resolve_cargo_home("~/cargo").is_err());
+        assert!(resolve_cargo_home("/").is_err());
+        if let Ok(home) = crate::paths::home() {
+            assert!(resolve_cargo_home(&home.to_string_lossy()).is_err());
+        }
+        let absolute = std::env::temp_dir().join("epicenter-cargo-home-test");
+        assert_eq!(
+            resolve_cargo_home(&absolute.to_string_lossy()).unwrap(),
+            absolute
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_must_be_private_and_real() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let cargo = dir.path().join("cargo");
+        std::fs::create_dir(&cargo)?;
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700))?;
+        prepare_cargo_home(&cargo, false)?;
+
+        let world = dir.path().join("world");
+        std::fs::create_dir(&world)?;
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o777))?;
+        assert!(prepare_cargo_home(&world, false).is_err());
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&cargo, &link)?;
+        assert!(prepare_cargo_home(&link, false).is_err());
+
+        let missing = dir.path().join("missing");
+        prepare_cargo_home(&missing, true)?;
+        assert!(!missing.exists(), "dry run must not create the directory");
+        prepare_cargo_home(&missing, false)?;
+        assert!(missing.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_policy_parses_the_minimal_nested_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let publisher_key = test_public_key();
+        write(
+            &global,
+            &format!(
+                "[remote]\n\
+                 tier = \"full\"\n\
+                 url = \"https://cache.example/root\"\n\
+                 publisher_key = \"{publisher_key}\"\n"
+            ),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.tier, RemoteTier::Full);
+        assert_eq!(remote.tier_source, Source::Global);
+        assert!(remote.enabled);
+        assert_eq!(remote.transport, RemoteTransport::AnonymousHttps);
+        assert_eq!(remote.region, None);
+        assert_eq!(
+            remote.publisher_key.as_deref(),
+            Some(publisher_key.as_str())
+        );
+        assert_eq!(
+            remote.key_id.as_deref(),
+            Some(remote_key_id(&publisher_key).unwrap().as_str())
+        );
+        assert_eq!(remote.cache, crate::paths::default_remote_cache().unwrap());
+        assert_eq!(
+            remote.redacted_url().as_deref(),
+            Some("https://cache.example/root")
+        );
+
+        write(
+            &global,
+            &format!(
+                "[remote]\n\
+                 tier = \"libraries\"\n\
+                 url = \"s3://bucket/prefix\"\n\
+                 publisher_key = \"{publisher_key}\"\n"
+            ),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.transport, RemoteTransport::S3);
+        assert_eq!(remote.redacted_url().as_deref(), Some("s3://bucket/prefix"));
+    }
+
+    #[test]
+    fn project_remote_may_only_tighten_a_global_full_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        write(&global, "[remote]\ntier = \"full\"\n");
+        write(
+            &dir.path().join(FILE_NAME),
+            "[remote]\ntier = \"libraries\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.tier, RemoteTier::Libraries);
+        assert_eq!(remote.tier_source, Source::Project);
+
+        write(&dir.path().join(FILE_NAME), "[remote]\ntier = \"full\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(settings.remote().unwrap().tier, RemoteTier::Full);
+
+        write(&global, "[remote]\ntier = \"libraries\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.remote().unwrap_err();
+        assert!(err.to_string().contains("requires the global"), "{err}");
+
+        write(
+            &dir.path().join(FILE_NAME),
+            "[remote]\nurl = \"https://evil.example/root\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.remote().unwrap_err();
+        assert!(err.to_string().contains("global"), "{err}");
+    }
+
+    #[test]
+    fn remote_defaults_are_disabled_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        write(&global, "");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let remote = settings.remote().unwrap();
+        assert_eq!(remote.tier, RemoteTier::Libraries);
+        assert_eq!(remote.tier_source, Source::Auto);
+        assert!(!remote.enabled);
+
+        write(&global, "[remote]\nurl = \"http://cache.example/root\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "TLS is mandatory");
+
+        write(
+            &global,
+            "[remote]\nurl = \"https://user:pass@cache.example/root\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "credentials in URL are refused");
+
+        write(
+            &global,
+            "[remote]\nurl = \"https://cache.example/root?token=secret\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "query tokens are refused");
+
+        write(&global, "[remote]\nurl = \"s3://bucket/prefix\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(
+            settings.remote().is_err(),
+            "a remote URL requires a pinned publisher key"
+        );
+
+        write(
+            &global,
+            "[remote]\nurl = \"https://cache.example/root\"\npublisher_key = \"nope\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.remote().is_err(), "publisher keys are validated");
+
+        let publisher_key = test_public_key();
+        for bad in [
+            "https://cache.example/root\\evil",
+            "https://cache.example/root#fragment",
+            "https://cache.example/../root",
+            "https://cache.example/%2e%2e/root",
+            "https://cache.example:not-a-port/root",
+            "https://cache.example:99999/root",
+            "https://:8080/root",
+            "https://[::1/root",
+            "s3://bucket/../prefix",
+            "s3://bucket//prefix",
+            "s3://bucket/%2e%2e/prefix",
+        ] {
+            write(
+                &global,
+                &format!("[remote]\nurl = '{bad}'\npublisher_key = \"{publisher_key}\"\n"),
+            );
+            let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+            assert!(settings.remote().is_err(), "{bad} must be refused");
+        }
+
+        write(
+            &global,
+            &format!(
+                "[remote]\nurl = \"s3://bucket/prefix/\"\npublisher_key = \"{publisher_key}\"\n"
+            ),
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(
+            settings.remote().unwrap().transport,
+            RemoteTransport::S3,
+            "one trailing slash is harmless"
+        );
+    }
+
+    #[test]
+    fn missing_global_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("missing.toml");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert!(settings.global_path().is_none());
+    }
+
+    #[test]
+    fn non_regular_global_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global-dir");
+        std::fs::create_dir(&global).unwrap();
+        let err = Settings::load_at(dir.path(), Some(&global)).unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_symlink_is_ignored_and_global_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        write(&real, "preset = \"ci\"\n");
+        let project_link = dir.path().join(FILE_NAME);
+        symlink(&real, &project_link).unwrap();
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        assert!(
+            settings.project_path().is_none(),
+            "a symlinked project policy must not be read"
+        );
+
+        let global_link = dir.path().join("global-link.toml");
+        symlink(&real, &global_link).unwrap();
+        let err = Settings::load_at(dir.path(), Some(&global_link)).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink/reparse"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_file_does_not_shadow_ancestor_policy() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        write(&root.path().join(FILE_NAME), "link = \"copy\"\n");
+
+        // A symlinked project file in the subdirectory must be skipped, not
+        // selected and then rejected: the real root policy still applies.
+        let target = sub.join("real.toml");
+        write(&target, "link = \"link\"\n");
+        symlink(&target, sub.join(FILE_NAME)).unwrap();
+        let settings = Settings::load_at(&sub, None).unwrap();
+        assert_eq!(
+            settings.project_path(),
+            Some(root.path().join(FILE_NAME).as_path())
+        );
+        assert_eq!(settings.link().unwrap().0, LinkPolicy::Copy);
+
+        // A symlinked workspace marker must not stop the search early either.
+        std::fs::remove_file(sub.join(FILE_NAME)).unwrap();
+        symlink(root.path().join(".git"), sub.join(".git")).unwrap();
+        let settings = Settings::load_at(&sub, None).unwrap();
+        assert_eq!(
+            settings.project_path(),
+            Some(root.path().join(FILE_NAME).as_path())
+        );
+        assert_eq!(settings.link().unwrap().0, LinkPolicy::Copy);
+    }
+
+    #[test]
+    fn global_config_path_is_absolute_and_named() {
+        let path = crate::paths::global_config_path().unwrap();
+        assert!(path.is_absolute(), "{} must be absolute", path.display());
+        assert_eq!(path.file_name(), Some(std::ffi::OsStr::new(FILE_NAME)));
+        assert_eq!(
+            path.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("epicenter"))
+        );
+    }
+
+    #[test]
+    fn memory_units_parse() {
+        assert_eq!(parse_memory("8GiB").unwrap(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("8192MiB").unwrap(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("8G").unwrap(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("512").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory("1.5GiB").unwrap(), 3 * 1024 * 1024 * 1024 / 2);
+        assert_eq!(parse_memory("2TiB").unwrap(), 2 * 1024u64.pow(4));
+        assert!(parse_memory("lots").is_err());
+        assert!(parse_memory("8XiB").is_err());
+        assert!(parse_memory("").is_err());
+    }
+
+    #[test]
+    fn project_file_wins_over_global() {
+        let project = tempfile::tempdir().unwrap();
+        write(
+            &project.path().join(FILE_NAME),
+            "preset = \"ci\"\nlinker = \"wild\"\nmemory = \"4GiB\"\nstore = \"vault\"\n",
+        );
+        let global = tempfile::tempdir().unwrap();
+        let global_file = global.path().join(FILE_NAME);
+        write(&global_file, "preset = \"dev\"\nlinker = \"lld\"\n");
+
+        let settings = Settings::load_at(project.path(), Some(&global_file)).unwrap();
+        assert_eq!(settings.preset(), (Preset::Ci, Source::Project));
+        assert_eq!(settings.linker(), (LinkerChoice::Wild, Source::Project));
+        assert_eq!(
+            settings.memory_bytes(),
+            (Some(4 * 1024 * 1024 * 1024), Source::Project)
+        );
+        let (store, source) = settings.store().unwrap().unwrap();
+        assert_eq!(store, project.path().join("vault"));
+        assert_eq!(source, Source::Project);
+        assert_eq!(settings.effective_preset().0, EffectivePreset::Ci);
+        assert_eq!(settings.incremental(), Some(false));
+        assert!(settings.check_tier());
+    }
+
+    #[test]
+    fn global_file_is_the_fallback() {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let global_file = global.path().join(FILE_NAME);
+        write(
+            &global_file,
+            "preset = \"dev\"\nlinker = \"lld\"\nmemory = 2048\n",
+        );
+
+        let settings = Settings::load_at(project.path(), Some(&global_file)).unwrap();
+        assert_eq!(settings.preset(), (Preset::Dev, Source::Global));
+        assert_eq!(settings.linker(), (LinkerChoice::Lld, Source::Global));
+        assert_eq!(
+            settings.memory_bytes(),
+            (Some(2 * 1024 * 1024 * 1024), Source::Global)
+        );
+        assert!(settings.store().unwrap().is_none());
+    }
+
+    #[test]
+    fn auto_preset_follows_ci() {
+        assert_eq!(resolve_preset(Preset::Auto, false), EffectivePreset::Dev);
+        assert_eq!(resolve_preset(Preset::Auto, true), EffectivePreset::Ci);
+        assert_eq!(resolve_preset(Preset::Dev, true), EffectivePreset::Dev);
+        assert_eq!(resolve_preset(Preset::Ci, false), EffectivePreset::Ci);
+    }
+
+    #[test]
+    fn copy_workers_is_bounded() {
+        let workers = copy_workers();
+        assert!(
+            (1..=8).contains(&workers),
+            "unexpected copy pool size {workers}"
+        );
+    }
+
+    #[test]
+    fn job_cap_is_conservative() {
+        assert_eq!(job_cap(16, Some(8 * 1024 * 1024 * 1024)), 4);
+        assert_eq!(job_cap(16, Some(32 * 1024 * 1024 * 1024)), 16);
+        assert_eq!(job_cap(4, Some(64 * 1024 * 1024 * 1024)), 4);
+        assert_eq!(job_cap(0, None), 1);
+        assert_eq!(job_cap(16, Some(1)), 1);
+    }
+
+    #[test]
+    fn work_root_is_global_only_and_resolves_from_the_global_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        write(&global, "work = \"local-work\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let (work, source) = settings.work_root().unwrap().unwrap();
+        assert_eq!(work, dir.path().join("local-work"));
+        assert_eq!(source, Source::Global);
+
+        write(
+            &dir.path().join(FILE_NAME),
+            "work = \"/tmp/project-work\"\n",
+        );
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        let err = settings.work_root().unwrap_err();
+        assert!(err.to_string().contains("global"), "{err}");
+    }
+
+    #[test]
+    fn relative_store_resolves_against_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE_NAME);
+        write(&file, "store = \"vault\"\n");
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        let (store, _) = settings.store().unwrap().unwrap();
+        assert_eq!(store, dir.path().join("vault"));
+    }
+
+    #[test]
+    fn link_policy_defaults_project_tightens_and_link_is_global_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        assert_eq!(settings.link().unwrap(), (LinkPolicy::Auto, Source::Auto));
+
+        let global = dir.path().join("global.toml");
+        write(&global, "link = \"link\"\n");
+        let project = dir.path().join("project.toml");
+        write(&project, "link = \"copy\"\n");
+        let settings = Settings::load_at(dir.path(), Some(&global)).unwrap();
+        assert_eq!(settings.link().unwrap(), (LinkPolicy::Link, Source::Global));
+        // A project file can tighten a global link policy to copy.
+        let project_file = Settings {
+            project: Some(Loaded::read(&project).unwrap().unwrap()),
+            global: Some(Loaded::read(&global).unwrap().unwrap()),
+        };
+        assert_eq!(
+            project_file.link().unwrap(),
+            (LinkPolicy::Copy, Source::Project)
+        );
+
+        // A project cannot loosen a global copy policy to auto.
+        write(&global, "link = \"copy\"\n");
+        write(&project, "link = \"auto\"\n");
+        let settings = Settings {
+            project: Some(Loaded::read(&project).unwrap().unwrap()),
+            global: Some(Loaded::read(&global).unwrap().unwrap()),
+        };
+        assert_eq!(settings.link().unwrap(), (LinkPolicy::Copy, Source::Global));
+
+        // Forcing links from a repository is refused.
+        write(&project, "link = \"link\"\n");
+        let settings = Settings {
+            project: Some(Loaded::read(&project).unwrap().unwrap()),
+            global: None,
+        };
+        assert!(settings.link().is_err());
+    }
+
+    #[test]
+    fn unknown_link_policy_is_rejected_in_global_but_project_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(FILE_NAME), "link = \"all\"\n");
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        assert!(settings.project_path().is_none());
+
+        let global = dir.path().join("global.toml");
+        write(&global, "link = \"all\"\n");
+        assert!(Settings::load_at(dir.path(), Some(&global)).is_err());
+    }
+
+    #[test]
+    fn project_store_rejects_parent_and_dot() {
+        for raw in ["..", "../vault", "."] {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join(FILE_NAME), &format!("store = \"{raw}\"\n"));
+            let settings = Settings::load_at(dir.path(), None).unwrap();
+            assert!(settings.store().is_err(), "store = {raw:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn project_store_requires_a_marker_for_a_nonempty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("vault");
+        std::fs::create_dir(&store).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write(&store.join("not-a-store"), "x");
+        write(&dir.path().join(FILE_NAME), "store = \"vault\"\n");
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        let err = settings.store().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not an epicenter store"),
+            "{err:#}"
+        );
+
+        write(
+            &store.join(crate::paths::STORE_MARKER),
+            "epicenter-store-v1\n",
+        );
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        assert!(settings.store().is_ok(), "a marked store is accepted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_store_marker_symlink_is_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("vault");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = dir.path().join("elsewhere");
+        write(&target, "not a store marker");
+        symlink(&target, store.join(crate::paths::STORE_MARKER)).unwrap();
+        write(&dir.path().join(FILE_NAME), "store = \"vault\"\n");
+
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        let err = settings.store().unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    #[test]
+    fn ancestor_policy_file_above_the_workspace_is_ignored() {
+        let parent = tempfile::tempdir().unwrap();
+        write(&parent.path().join(FILE_NAME), "store = \"vault\"\n");
+        let project = parent.path().join("repo");
+        std::fs::create_dir(&project).unwrap();
+        write(&project.join("Cargo.toml"), "[package]\nname = \"x\"\n");
+        let settings = Settings::load_at(&project, None).unwrap();
+        assert!(settings.project_path().is_none(), "ancestor file ignored");
+    }
+
+    #[test]
+    fn malformed_project_file_is_ignored_but_malformed_global_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(FILE_NAME), "preset = \"turbo\"\n");
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        assert!(settings.project_path().is_none());
+
+        let global = dir.path().join("global.toml");
+        write(&global, "preset = \"turbo\"\n");
+        let err = Settings::load_at(dir.path(), Some(&global)).unwrap_err();
+        assert!(err.to_string().contains("global.toml"), "{err:#}");
+    }
+}

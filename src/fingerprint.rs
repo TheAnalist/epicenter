@@ -38,9 +38,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use walkdir::WalkDir;
+
+use crate::util::metadata_nofollow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
@@ -199,6 +201,17 @@ pub fn has_new_layout_flag(args: &[String]) -> bool {
     false
 }
 
+/// One file in a unit's fingerprint directory. Captured by the read that
+/// parses that directory, so harvest does not have to visit it again.
+#[derive(Debug, Clone)]
+pub(crate) struct SeenFile {
+    pub name: String,
+    /// `memo` | `fingerprint` | `dep-info` | `extra`, as the manifest records it.
+    pub role: &'static str,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
 /// One parsed unit directory, in either build-dir layout.
 #[derive(Debug, Clone)]
 pub struct Unit {
@@ -225,8 +238,9 @@ pub struct Unit {
     pub memo_hash: Option<String>,
     pub json: Option<FingerprintJson>,
     pub dep_info: Option<PathBuf>,
-    /// Files inside the unit dir (for forensics completeness).
-    pub extra_files: Vec<String>,
+    /// Every regular file in the unit dir, with the metadata the parser
+    /// already read. Harvest builds its plan from this instead of re-reading.
+    pub(crate) files_seen: Vec<SeenFile>,
 }
 
 impl Unit {
@@ -405,24 +419,30 @@ pub fn parse_fingerprint(text: &str) -> Option<FingerprintJson> {
 /// one build dir, so this is shape-based rather than a single global mode.
 pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
     let mut units = Vec::new();
+    let mut budget = crate::util::ScanBudget::new("build units");
     for profile_entry in fs::read_dir(build_root)
         .with_context(|| format!("reading build dir {}", build_root.display()))?
     {
+        budget.spend()?;
         let profile_entry = profile_entry?;
-        if !profile_entry.file_type()?.is_dir() {
+        if !metadata_nofollow(&profile_entry.path()).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
         let profile = profile_entry.file_name().to_string_lossy().into_owned();
+        if crate::util::validate_component(&profile, "profile").is_err() {
+            continue;
+        }
         let profile_dir = profile_entry.path();
 
         // Classic layout: <profile>/.fingerprint/<pkg>-<hash>/
         let fp_root = profile_dir.join(".fingerprint");
-        if is_real_dir(&fp_root) {
+        if metadata_nofollow(&fp_root).is_ok_and(|meta| meta.is_dir()) {
             for unit_entry in
                 fs::read_dir(&fp_root).with_context(|| format!("reading {}", fp_root.display()))?
             {
+                budget.spend()?;
                 let unit_entry = unit_entry?;
-                if !unit_entry.file_type()?.is_dir() {
+                if !metadata_nofollow(&unit_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                     continue;
                 }
                 if let Some(unit) = read_classic_unit(&profile, &unit_entry.path()) {
@@ -433,27 +453,34 @@ pub fn read_units(build_root: &Path) -> Result<Vec<Unit>> {
 
         // New layout: <profile>/build/<pkg>/<hash>/fingerprint/
         let build_dir = profile_dir.join("build");
-        if is_real_dir(&build_dir) {
+        if metadata_nofollow(&build_dir).is_ok_and(|meta| meta.is_dir()) {
             for package_entry in fs::read_dir(&build_dir)
                 .with_context(|| format!("reading {}", build_dir.display()))?
             {
+                budget.spend()?;
                 let package_entry = package_entry?;
-                if !package_entry.file_type()?.is_dir() {
+                if !metadata_nofollow(&package_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                     continue;
                 }
                 let package = package_entry.file_name().to_string_lossy().into_owned();
+                if crate::util::validate_component(&package, "package").is_err() {
+                    continue;
+                }
                 for hash_entry in fs::read_dir(package_entry.path())
                     .with_context(|| format!("reading {}", package_entry.path().display()))?
                 {
+                    budget.spend()?;
                     let hash_entry = hash_entry?;
-                    if !hash_entry.file_type()?.is_dir() {
+                    if !metadata_nofollow(&hash_entry.path()).is_ok_and(|meta| meta.is_dir()) {
                         continue;
                     }
                     let hash = hash_entry.file_name().to_string_lossy().into_owned();
                     if !looks_like_hash(&hash) {
                         continue;
                     }
-                    if !is_real_dir(&hash_entry.path().join("fingerprint")) {
+                    if !metadata_nofollow(&hash_entry.path().join("fingerprint"))
+                        .is_ok_and(|meta| meta.is_dir())
+                    {
                         continue;
                     }
                     if let Some(unit) = read_new_unit(build_root, &profile, &package, &hash) {
@@ -505,17 +532,11 @@ pub fn dep_edges(units: &[Unit]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// A directory we may read: real, not a symlink or a Windows reparse point.
-fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|meta| {
-            meta.is_dir() && !meta.file_type().is_symlink() && !crate::util::is_reparse_point(&meta)
-        })
-        .unwrap_or(false)
-}
-
 fn read_classic_unit(profile: &str, unit_dir: &Path) -> Option<Unit> {
     let dir_name = unit_dir.file_name()?.to_string_lossy().into_owned();
+    if crate::util::validate_component(&dir_name, "unit name").is_err() {
+        return None;
+    }
     let (package, dir_suffix) = split_dir_name(&dir_name)?;
     let parsed = parse_unit_files(unit_dir)?;
     Some(Unit {
@@ -531,7 +552,7 @@ fn read_classic_unit(profile: &str, unit_dir: &Path) -> Option<Unit> {
         memo_hash: Some(parsed.memo_hash),
         json: parsed.json,
         dep_info: parsed.dep_info,
-        extra_files: parsed.extra_files,
+        files_seen: parsed.files,
     })
 }
 
@@ -552,7 +573,7 @@ fn read_new_unit(build_root: &Path, profile: &str, package: &str, hash: &str) ->
         memo_hash: Some(parsed.memo_hash),
         json: parsed.json,
         dep_info: parsed.dep_info,
-        extra_files: parsed.extra_files,
+        files_seen: parsed.files,
     })
 }
 
@@ -562,56 +583,100 @@ struct ParsedUnit {
     memo_hash: String,
     json: Option<FingerprintJson>,
     dep_info: Option<PathBuf>,
-    extra_files: Vec<String>,
+    files: Vec<SeenFile>,
 }
 
 /// Parse the contents of a fingerprint directory — identical in both layouts.
 fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
     let mut candidates: Vec<(String, String)> = Vec::new(); // (name, content)
     let mut dep_info: Option<PathBuf> = None;
-    let mut json_path: Option<PathBuf> = None;
+    let mut json_paths: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<SeenFile> = Vec::new();
 
     for entry in fs::read_dir(unit_dir).ok()? {
         let entry = entry.ok()?;
         // Only regular files: never read a FIFO/device/symlink planted by a
         // build script (harvest would otherwise hang or copy a secret).
-        let entry_meta = fs::symlink_metadata(entry.path()).ok()?;
-        if !entry_meta.is_file()
-            || entry_meta.file_type().is_symlink()
-            || crate::util::is_reparse_point(&entry_meta)
-        {
+        let entry_meta = match metadata_nofollow(&entry.path()) {
+            Ok(meta) => meta,
+            // A symlink/reparse entry was skipped before too.
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => continue,
+            // A metadata error used to abort parsing this unit.
+            Err(_) => return None,
+        };
+        if !entry_meta.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
+        let size = entry_meta.len();
+        let modified = entry_meta.modified().ok();
         if name.starts_with("dep-") {
             dep_info = Some(entry.path());
+            files.push(SeenFile {
+                name,
+                role: "dep-info",
+                size,
+                modified,
+            });
             continue;
         }
         if name.ends_with(".json") {
-            json_path = Some(entry.path());
+            json_paths.push(entry.path());
+            files.push(SeenFile {
+                name,
+                role: "fingerprint",
+                size,
+                modified,
+            });
             continue;
         }
         if name == "invoked.timestamp" {
             continue;
         }
-        if entry
-            .metadata()
-            .map(|meta| meta.len() > 4 * 1024 * 1024)
-            .unwrap_or(true)
-        {
+        // Only bounded files are memo candidates. Larger state is still a
+        // stored extra (`plan_unit` used to include it).
+        if size > 4 * 1024 * 1024 {
+            files.push(SeenFile {
+                name,
+                role: "extra",
+                size,
+                modified,
+            });
             continue;
         }
         let content = crate::util::read_small_text(&entry.path(), 4 * 1024 * 1024)
             .ok()?
             .trim()
             .to_string();
+        // Every hash-shaped file is a memo, exactly as the old planning pass
+        // classified them (a unit can hold more than one).
+        let role = if looks_like_hash(&content) {
+            "memo"
+        } else {
+            "extra"
+        };
+        files.push(SeenFile {
+            name: name.clone(),
+            role,
+            size,
+            modified,
+        });
         candidates.push((name, content));
     }
 
-    let ((memo_file, memo_hash), extra_files) = pick_memo(candidates)?;
+    let (memo_file, memo_hash) = pick_memo(candidates)?;
     let kind = classify_kind(&memo_file);
-    let json = json_path
-        .and_then(|path| crate::util::read_small_text(&path, 4 * 1024 * 1024).ok())
+    // Cargo always names the fingerprint `<memo>.json`. Taking any `.json`
+    // would let a hand-written unit pass a stray JSON as provenance.
+    let wanted = format!("{memo_file}.json");
+    let json = json_paths
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .map(|name| name == wanted.as_str())
+                .unwrap_or(false)
+        })
+        .and_then(|path| crate::util::read_small_text(path, 4 * 1024 * 1024).ok())
         .and_then(|text| parse_fingerprint(&text));
     Some(ParsedUnit {
         kind,
@@ -619,7 +684,7 @@ fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
         memo_hash,
         json,
         dep_info,
-        extra_files,
+        files,
     })
 }
 
@@ -628,7 +693,7 @@ fn parse_unit_files(unit_dir: &Path) -> Option<ParsedUnit> {
 /// directory (`output-*`) — those are state, not fingerprints. When nothing
 /// looks like a hash the first candidate is used anyway, so a corrupted unit
 /// still shows up in forensics instead of disappearing.
-fn pick_memo(mut candidates: Vec<(String, String)>) -> Option<((String, String), Vec<String>)> {
+fn pick_memo(mut candidates: Vec<(String, String)>) -> Option<(String, String)> {
     if candidates.is_empty() {
         return None;
     }
@@ -636,9 +701,7 @@ fn pick_memo(mut candidates: Vec<(String, String)>) -> Option<((String, String),
         .iter()
         .position(|(_, content)| looks_like_hash(content))
         .unwrap_or(0);
-    let (name, hash) = candidates.remove(index);
-    let extras = candidates.into_iter().map(|(name, _)| name).collect();
-    Some(((name, hash), extras))
+    Some(candidates.remove(index))
 }
 
 /// A fingerprint memo file holds exactly 16 hex characters.
@@ -665,27 +728,127 @@ pub(crate) fn build_anchor_dirs(build_root: &Path, unit: &Unit) -> Vec<PathBuf> 
     candidates
 }
 
+/// One artifact file: path, size, mtime.
+pub type StoredArtifact = (PathBuf, u64, Option<SystemTime>);
+
+/// One pass over a profile's `deps/`, keyed by the suffix Cargo derives from
+/// the unit's fingerprint hash. Artifact attach used to rescan the whole
+/// directory for every unit (O(units × deps files)); this makes it one
+/// directory read per profile.
+#[derive(Default)]
+pub(crate) struct DepsIndex {
+    by_suffix: HashMap<Box<str>, Vec<StoredArtifact>>,
+}
+
+impl DepsIndex {
+    /// Build the index for one profile. A missing, unreadable or symlinked
+    /// `deps/` yields an empty index — the same outcome as the old per-unit
+    /// probe. A hostile directory stops at the scan budget instead of walking
+    /// forever.
+    pub(crate) fn load(profile_dir: &Path) -> Self {
+        let mut index = Self::default();
+        let deps_dir = profile_dir.join("deps");
+        // Never read through a symlinked/reparse `deps/` (the old per-unit
+        // probe refused it the same way).
+        if !metadata_nofollow(&deps_dir).is_ok_and(|meta| meta.is_dir()) {
+            return index;
+        }
+        let Ok(entries) = fs::read_dir(&deps_dir) else {
+            return index;
+        };
+        let mut budget = crate::util::ScanBudget::new("deps index");
+        for entry in entries.flatten() {
+            if !budget.take() {
+                break;
+            }
+            // Regular files only; a symlink/FIFO here must not be copied.
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let name = entry.file_name();
+            let Some(stem) = Path::new(&name).file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some((_, key)) = stem.rsplit_once('-') else {
+                continue;
+            };
+            index.by_suffix.entry(key.into()).or_default().push((
+                entry.path(),
+                meta.len(),
+                meta.modified().ok(),
+            ));
+        }
+        index
+    }
+
+    /// Entries whose stem ends with `-<dir_suffix>` — the exact matcher the
+    /// old linear scan used.
+    fn matching(&self, dir_suffix: &str) -> impl Iterator<Item = StoredArtifact> + '_ {
+        // A Cargo hash has no dash, so the key is the suffix itself. A suffix
+        // that does contain one falls back to the last component plus a full
+        // stem comparison, so semantics never change.
+        let key = dir_suffix
+            .rsplit_once('-')
+            .map_or(dir_suffix, |(_, last)| last);
+        let suffix = format!("-{dir_suffix}");
+        self.by_suffix
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(move |entry| {
+                Path::new(&entry.0)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(&suffix))
+            })
+            .cloned()
+    }
+}
+
 /// Artifacts that belong to a unit, found by suffix (fingerprint dir hash
 /// == deps filename suffix) — `deps/*-{hex}.rlib|rmeta|so…` and, for build
 /// script units, the whole `build/{hex}/` subtree. Registry and workspace
 /// units look identical here.
 pub struct ArtifactInfo {
-    pub paths: Vec<(PathBuf, u64, Option<SystemTime>)>,
+    pub paths: Vec<StoredArtifact>,
     pub bytes: u64,
     pub newest: Option<SystemTime>,
 }
 
+/// Artifacts for one unit, building a throwaway `deps/` index. Callers that
+/// visit many units share one index through [`artifacts_for_indexed`].
 pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
+    let deps = DepsIndex::load(&build_root.join(&unit.profile));
+    artifacts_for_indexed(build_root, unit, &deps)
+}
+
+/// [`artifacts_for`] with a profile index the caller built once.
+pub(crate) fn artifacts_for_indexed(
+    build_root: &Path,
+    unit: &Unit,
+    deps: &DepsIndex,
+) -> ArtifactInfo {
     let mut paths = Vec::new();
+    // A hostile view can hold millions of files. Stop collecting at the
+    // budget: a truncated list leaves artifacts behind instead of walking
+    // forever, and eviction never removes more than it saw.
+    let mut budget = crate::util::ScanBudget::new("artifact scan");
     match unit.layout {
-        UnitLayout::Classic => collect_classic_artifacts(build_root, unit, &mut paths),
-        UnitLayout::New => collect_new_artifacts(unit, &mut paths),
+        UnitLayout::Classic => {
+            collect_classic_artifacts(build_root, unit, deps, &mut paths, &mut budget)
+        }
+        UnitLayout::New => collect_new_artifacts(unit, &mut paths, &mut budget),
     }
 
-    let mut bytes = 0;
+    let mut bytes = 0u64;
     let mut newest: Option<SystemTime> = None;
     for (_, size, mtime) in &paths {
-        bytes += size;
+        bytes = bytes.saturating_add(*size);
         if let Some(m) = mtime {
             if newest.map_or(true, |n| *m > n) {
                 newest = Some(*m);
@@ -702,45 +865,19 @@ pub fn artifacts_for(build_root: &Path, unit: &Unit) -> ArtifactInfo {
 fn collect_classic_artifacts(
     build_root: &Path,
     unit: &Unit,
-    paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>,
+    deps: &DepsIndex,
+    paths: &mut Vec<StoredArtifact>,
+    budget: &mut crate::util::ScanBudget,
 ) {
-    let profile_dir = build_root.join(&unit.profile);
-    let deps_dir = profile_dir.join("deps");
-    if is_real_dir(&deps_dir) {
-        let suffix = format!("-{}", unit.dir_suffix);
-        if let Ok(entries) = fs::read_dir(&deps_dir) {
-            for entry in entries.flatten() {
-                // Regular files only; a symlink/FIFO here must not be copied.
-                if !entry
-                    .file_type()
-                    .map(|kind| kind.is_file())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                // Compare on the STEM so extensions don't hide the match:
-                // `libserde-102a….rlib` → stem `libserde-102a…` ends with `-102a…`.
-                let stem = Path::new(&name)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or(name.clone());
-                if !stem.ends_with(&suffix) {
-                    continue;
-                }
-                if let Ok(meta) = entry.metadata() {
-                    paths.push((entry.path(), meta.len(), meta.modified().ok()));
-                }
-            }
-        }
-    }
+    paths.extend(deps.matching(&unit.dir_suffix));
 
     if unit.kind != UnitKind::Lib {
         for candidate in build_anchor_dirs(build_root, unit) {
-            if !is_real_dir(&candidate) {
+            if !metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
-            for entry in WalkDir::new(&candidate).min_depth(1) {
+            let mut walk = crate::util::SafeWalk::new(&candidate).walk_with(budget);
+            for entry in walk.by_ref() {
                 let Ok(entry) = entry else { continue };
                 if !entry.file_type().is_file() {
                     continue;
@@ -748,6 +885,9 @@ fn collect_classic_artifacts(
                 if let Ok(meta) = entry.metadata() {
                     paths.push((entry.path().to_path_buf(), meta.len(), meta.modified().ok()));
                 }
+            }
+            if walk.truncated() {
+                return;
             }
         }
     }
@@ -757,13 +897,18 @@ fn collect_classic_artifacts(
 /// build-script binaries), `run/` (run-build-script state) and at the unit
 /// root (`output`, `stderr`, `stdout`, `root-output`, …). `fingerprint/` is
 /// handled separately by the vault.
-fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>) {
+fn collect_new_artifacts(
+    unit: &Unit,
+    paths: &mut Vec<(PathBuf, u64, Option<SystemTime>)>,
+    budget: &mut crate::util::ScanBudget,
+) {
     for sub in ["out", "run"] {
         let dir = unit.unit_dir.join(sub);
-        if !is_real_dir(&dir) {
+        if !metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
-        for entry in WalkDir::new(&dir).min_depth(1) {
+        let mut walk = crate::util::SafeWalk::new(&dir).walk_with(budget);
+        for entry in walk.by_ref() {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() {
                 continue;
@@ -772,11 +917,17 @@ fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<Syst
                 paths.push((entry.path().to_path_buf(), meta.len(), meta.modified().ok()));
             }
         }
+        if walk.truncated() {
+            return;
+        }
     }
     let Ok(entries) = fs::read_dir(&unit.unit_dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if !budget.take() {
+            return;
+        }
         if !entry
             .file_type()
             .map(|kind| kind.is_file())
@@ -788,6 +939,40 @@ fn collect_new_artifacts(unit: &Unit, paths: &mut Vec<(PathBuf, u64, Option<Syst
             paths.push((entry.path(), meta.len(), meta.modified().ok()));
         }
     }
+}
+
+/// Read every unit's artifact list. One `deps/` index is built per profile
+/// and shared read-only with the per-unit scan, so artifact attach is a hash
+/// lookup instead of a directory rescan per unit.
+pub(crate) fn read_rows(
+    build_root: &Path,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<(Unit, ArtifactInfo)>> {
+    let units = read_units(build_root)?;
+    let mut deps: HashMap<String, DepsIndex> = HashMap::new();
+    for unit in &units {
+        if !deps.contains_key(&unit.profile) {
+            let index = DepsIndex::load(&build_root.join(&unit.profile));
+            deps.insert(unit.profile.clone(), index);
+        }
+    }
+    let scan = |unit: Unit| {
+        let index = &deps[&unit.profile];
+        let arts = artifacts_for_indexed(build_root, &unit, index);
+        (unit, arts)
+    };
+    Ok(match pool {
+        Some(pool) if units.len() > 1 => pool.install(|| units.into_par_iter().map(scan).collect()),
+        _ => units.into_iter().map(scan).collect(),
+    })
+}
+
+/// The rustc identity a unit was built with.
+pub(crate) fn rustc_of(unit: &Unit) -> String {
+    unit.json
+        .as_ref()
+        .map(|json| json.rustc.clone())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]
@@ -1004,7 +1189,13 @@ mod tests {
         let unit = &units[0];
         assert_eq!(unit.memo_file, "lib-serde", "the hash file wins");
         assert_eq!(unit.memo_hash.as_deref(), Some("5d82713a7f2d05e2"));
-        assert_eq!(unit.extra_files, vec!["output-lib-serde".to_string()]);
+        let roles: Vec<(&str, &str)> = unit
+            .files_seen
+            .iter()
+            .map(|file| (file.name.as_str(), file.role))
+            .collect();
+        assert!(roles.contains(&("lib-serde", "memo")), "{roles:?}");
+        assert!(roles.contains(&("output-lib-serde", "extra")), "{roles:?}");
         Ok(())
     }
 
@@ -1068,6 +1259,24 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_units_skips_a_symlinked_profile() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        let unit_dir = victim.path().join(".fingerprint/pkg-1111222233334444");
+        fs::create_dir_all(&unit_dir)?;
+        // A real memo: without it `pick_memo` returns `None` and the test
+        // would pass even if discovery followed the link.
+        fs::write(unit_dir.join("lib-pkg"), "1111222233334444")?;
+        let unit = read_classic_unit("debug", &unit_dir).expect("a valid memo parses");
+        assert_eq!(unit.memo_hash.as_deref(), Some("1111222233334444"));
+
+        std::os::unix::fs::symlink(victim.path(), build.path().join("debug"))?;
+        assert!(read_units(build.path())?.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn pick_memo_prefers_hash_content_and_falls_back() {
         let candidates = vec![
@@ -1077,18 +1286,63 @@ mod tests {
             ),
             ("lib-x".to_string(), "5d82713a7f2d05e2".to_string()),
         ];
-        let ((name, hash), extras) = pick_memo(candidates).expect("a memo exists");
+        let (name, hash) = pick_memo(candidates).expect("a memo exists");
         assert_eq!(name, "lib-x");
         assert_eq!(hash, "5d82713a7f2d05e2");
-        assert_eq!(extras, vec!["output-lib-x".to_string()]);
 
         // Nothing hash-shaped: the first candidate is the fallback, so a
         // corrupted unit still shows up in forensics instead of vanishing.
         let candidates = vec![("weird".to_string(), "not a hash".to_string())];
-        let ((name, _), extras) = pick_memo(candidates).expect("fallback");
+        let (name, _) = pick_memo(candidates).expect("fallback");
         assert_eq!(name, "weird");
-        assert!(extras.is_empty());
 
         assert!(pick_memo(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn deps_index_matches_the_linear_suffix_scan() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let deps = root.path().join("debug/deps");
+        fs::create_dir_all(&deps)?;
+        for name in [
+            "libfoo-1122334455667788.rlib",
+            "libfoo-1122334455667788.rmeta",
+            "libbar-8877665544332211.rlib",
+            "weird-abc-def.rlib",
+            "nohash.rlib",
+        ] {
+            fs::write(deps.join(name), [0u8; 4])?;
+        }
+        // A directory must never be indexed as an artifact.
+        fs::create_dir(deps.join("dir-1122334455667788.rlib"))?;
+
+        let index = DepsIndex::load(&root.path().join("debug"));
+        let found: Vec<_> = index
+            .matching("1122334455667788")
+            .map(|(path, _, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.contains(&"libfoo-1122334455667788.rlib".to_string()));
+
+        assert_eq!(index.matching("8877665544332211").count(), 1);
+        // The fallback path: a suffix that itself contains a dash.
+        assert_eq!(index.matching("abc-def").count(), 1);
+        // `-abc` is not the tail of `weird-abc-def`, exactly like `ends_with`.
+        assert_eq!(index.matching("abc").count(), 0);
+        assert_eq!(index.matching("0000000000000000").count(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deps_index_refuses_a_symlinked_deps_dir() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        fs::write(victim.path().join("libfoo-1122334455667788.rlib"), [0u8; 4])?;
+        fs::create_dir_all(root.path().join("debug"))?;
+        std::os::unix::fs::symlink(victim.path(), root.path().join("debug/deps"))?;
+        let index = DepsIndex::load(&root.path().join("debug"));
+        assert_eq!(index.matching("1122334455667788").count(), 0);
+        Ok(())
     }
 }

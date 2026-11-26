@@ -1,19 +1,84 @@
-//! Small formatting/parsing helpers shared by the other modules.
+//! Small formatting, parsing and filesystem helpers shared by the other
+//! modules.
+//!
+//! This parent module carries the terminal UI helpers (colors, glyphs, human
+//! formatting); the rest is split by concern across child modules: `time`
+//! (durations and ages), `proc` (tool discovery), `text` (textual validation
+//! and bounded reads), `platform` (identity, ownership, ACL, reparse and
+//! no-follow probes), `nofollow` (handle-based traversal), `fs` (path privacy,
+//! installs, hashing, copying), `scan` (bounded walks) and `lock` (file
+//! locks). The re-exports keep every item at its historical `crate::util::*`
+//! path.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{IsTerminal, Read, Write};
-use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::io::IsTerminal;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
+mod fs;
+mod lock;
+mod nofollow;
+mod platform;
+mod proc;
+mod scan;
+mod text;
+mod time;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(not(unix))]
+pub(crate) use self::fs::decompress_file_verified;
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-use walkdir::WalkDir;
+pub use self::fs::try_link_file_hashed;
+#[cfg(windows)]
+pub(crate) use self::fs::windows_file_identity;
+pub(crate) use self::fs::{
+    COMPRESS_MIN_BYTES, account_files, compress_file_hashed, copy_capped, copy_verified,
+    create_temp_dir, decompress_file_hashed, file_identity, link_temp, replace_file, temp_nonce,
+    verify_file_hash, with_temp_file,
+};
+pub use self::fs::{
+    Privacy, check_private_dir, check_regular_chain, copy_file_hashed, copy_file_verified,
+    copy_file_verified_unowned, create_private_dir_all, expand_tilde, force_remove_dir,
+    reject_protected_path, resolve_from, sha256_file, validate_private_dir, validate_state_root,
+    write_atomic_private,
+};
+#[cfg(unix)]
+pub(crate) use self::fs::{copy_fd_verified, link_fallback, sha256_file_fd};
 
-// ── terminal colors ─────────────────────────────────────────────────────────
+pub use self::lock::FileLock;
+pub(crate) use self::lock::open_lock_file;
+
+pub use self::nofollow::{DirChainGuard, create_dir_chain_nofollow};
+#[cfg(unix)]
+pub(crate) use self::nofollow::{open_dir_chain_at, open_file_nofollow, set_stamp_fd};
+pub(crate) use self::nofollow::{open_regular, remove_empty_dir, remove_file, remove_tree};
+
+pub(crate) use self::platform::{
+    PathKind, Probed, TrustPolicy, check_trusted_path, probe_dir, probe_file, probe_kind,
+    probe_lenient,
+};
+pub use self::platform::{
+    ensure_windows_user_path, euid, io_error, is_not_found, is_reparse_point, is_windows_reserved,
+    metadata_nofollow, owned_by_us, probe,
+};
+#[cfg(windows)]
+pub use self::platform::{windows_acl_is_private, windows_acl_is_secret};
+
+pub use self::proc::{command_for, on_path, tool_path, which, which_path};
+
+pub use self::scan::MAX_FILE_BYTES;
+pub(crate) use self::scan::{MAX_SCAN_FILES, SafeWalk, ScanBudget, has_reparse_component};
+
+pub(crate) use self::text::{hex_decode, hex_encode, is_unsafe_format};
+pub use self::text::{
+    read_private_text, read_small_text, read_text_prefix, read_trusted_config, validate_component,
+    validate_rel,
+};
+
+pub use self::time::{human_age, now_secs, parse_duration};
+
+// ── ui: terminal colors, status glyphs and human formatting ────────────────
 //
 // Palette: one brand green (#92D293) for headers/accents, dim gray for labels,
 // amber strictly for warnings, red only for failures — calm by default, loud
@@ -79,7 +144,7 @@ pub fn dim(text: &str) -> String {
     paint(colors_enabled(), DIM, text)
 }
 
-// ── status glyphs ───────────────────────────────────────────────────────────
+// ── status glyphs ──────────────────────────────────────────────────────────
 //
 // Geometric, single-width, emoji-free: ✓ pass · ▲ warning · ✕ failure · ◆ info.
 
@@ -92,13 +157,13 @@ pub const GLYPH_FAIL: &str = "✕";
 /// `◆`
 pub const GLYPH_INFO: &str = "◆";
 
-/// `1234567` -> `"1.2 MiB"` style, compact.
+/// `1234567` -> `"1.2 MB"` style, compact decimal units.
 pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
@@ -108,36 +173,19 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Parse `"30d"`, `"2w"`, `"12h"`, `"90m"`, `"45s"` or plain seconds `"45"`.
-pub fn parse_duration(text: &str) -> Result<Duration> {
-    let text = text.trim();
-    let split = text
-        .find(|c: char| c.is_ascii_alphabetic())
-        .unwrap_or(text.len());
-    let (num, unit) = text.split_at(split);
-    // Build the message explicitly: the raw integer-parse error ("cannot parse
-    // integer from empty string") is noise for a CLI user.
-    let n: u64 = num
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid duration {text:?} (expected e.g. 30d, 2w, 12h)"))?;
-    let secs = match unit.to_ascii_lowercase().as_str() {
-        "" | "s" => Some(n),
-        "m" => n.checked_mul(60),
-        "h" => n.checked_mul(3_600),
-        "d" => n.checked_mul(86_400),
-        "w" => n.checked_mul(604_800),
-        other => anyhow::bail!("unknown time unit {other:?} in {text:?} (use s, m, h, d or w)"),
-    }
-    .with_context(|| format!("duration {text:?} is too large"))?;
-    Ok(Duration::from_secs(secs))
-}
-
-/// Age of a timestamp, human-readable ("3.4 days").
-pub fn human_age(at: SystemTime) -> String {
-    match SystemTime::now().duration_since(at) {
-        Ok(age) => human_duration(age),
-        Err(_) => "in the future".to_string(),
-    }
+/// Render an untrusted name for a terminal without ANSI/control injection.
+pub fn safe_display(value: &std::ffi::OsStr) -> String {
+    value
+        .to_string_lossy()
+        .chars()
+        .flat_map(|ch| {
+            if ch.is_control() {
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
 }
 
 /// One failure rendered in the tool's visual language: a red `✕` line, the
@@ -187,1210 +235,57 @@ pub fn human_duration(duration: Duration) -> String {
     }
 }
 
-/// Candidate executables for `program`. Cargo installs `kache` as
-/// `kache.exe` on Windows, so the suffix must be considered there.
-fn exe_candidates(program: &str) -> Vec<String> {
-    let mut names = vec![program.to_string()];
-    if cfg!(windows) {
-        names.push(format!("{program}.exe"));
-    }
-    names
-}
-
-/// Is `program` reachable through `PATH`? (bare `which`, no extra crate)
-pub fn on_path(program: &str) -> bool {
-    let names = exe_candidates(program);
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
-}
-
-/// Absolute path of `program` if discoverable — first on `PATH`, then as a
-/// fallback in Cargo's own bin dir (`$CARGO_HOME/bin`, e.g.
-/// `C:\Users\<user>\.cargo\bin`), which rustup tools live in but isn't on
-/// PATH in every shell. Returns `None` when not found anywhere.
-pub fn which_path(program: &str) -> Option<PathBuf> {
-    let names = exe_candidates(program);
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            // Never let an empty/relative PATH element (or `.`) make the
-            // process search the current directory before the real tool.
-            if dir.as_os_str().is_empty() || !dir.is_absolute() {
-                continue;
-            }
-            for name in &names {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    let cargo_bin = crate::paths::cargo_home().ok()?.join("bin");
-    if !cargo_bin.is_absolute() {
-        return None;
-    }
-    names
-        .iter()
-        .map(|name| cargo_bin.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-/// Is `program` installed at all (PATH or cargo bin dir)?
-pub fn which(program: &str) -> bool {
-    which_path(program).is_some()
-}
-
-/// Remove a tree robustly: read-only files (a wrapper's store, copies that
-/// inherited the read-only attribute) block `remove_dir_all` on Windows, so
-/// clear the flag and retry once; report the original error if it still fails.
-pub fn force_remove_dir(path: &Path) -> std::io::Result<()> {
-    let first = match std::fs::remove_dir_all(path) {
-        Ok(()) => return Ok(()),
-        Err(err) => err,
-    };
-    for entry in WalkDir::new(path) {
-        let Ok(entry) = entry else { continue };
-        // Never follow a symlink here: `set_permissions` on a symlink path
-        // changes the *target* (possibly outside this tree).
-        if entry.file_type().is_symlink() {
-            continue;
-        }
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(entry.path(), perms);
-        }
-    }
-    fs::remove_dir_all(path).map_err(|_| first)
-}
-
-// ── security: identity, paths, private dirs, hashes ────────────────────────
-
-/// Effective uid. Only meaningful on Unix; 0 elsewhere (permission checks
-/// are skipped there and documented as such).
-#[cfg(unix)]
-pub fn euid() -> u32 {
-    // SAFETY: geteuid(2) has no preconditions and never fails.
-    unsafe { libc::geteuid() }
-}
-
-#[cfg(not(unix))]
-pub fn euid() -> u32 {
-    0
-}
-
-/// Is this file owned by the current effective user? (always true off Unix)
-pub fn owned_by_us(meta: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.uid() == euid()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        true
-    }
-}
-
-/// Windows reserved device names (case-insensitive, before the first dot).
-/// `CON`, `NUL`, `COM1`, `CON.txt`, `LPT9.log`, ...
-pub fn is_windows_reserved(value: &str) -> bool {
-    let stem = value
-        .trim_end_matches([' ', '.'])
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit())
-}
-
-/// Windows single-user policy: the cache/store/work must live under the
-/// current `%USERPROFILE%`, and no path component may be a reparse point.
-/// This does not inspect the DACL, but it rejects the shared `C:\Users\Public`
-/// class of cache and junction redirection. No-op off Windows.
-#[cfg(windows)]
-fn strip_verbatim(path: &str) -> String {
-    let path = path.replace('/', "\\");
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        path
-    }
-}
-
-#[cfg(windows)]
-fn normalize_windows_path_text(path: &str) -> String {
-    strip_verbatim(path)
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
-}
-
-#[cfg(windows)]
-pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
-    let profile = std::env::var_os("USERPROFILE")
-        .with_context(|| format!("{what}: USERPROFILE is not set"))?;
-    let profile = fs::canonicalize(&profile).unwrap_or_else(|_| PathBuf::from(profile));
-    let profile_text = normalize_windows_path_text(&profile.to_string_lossy());
-
-    let full = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolving the current directory")?
-            .join(path)
-    };
-    // `..` must never be allowed to look like an in-profile path lexically and
-    // resolve outside after creation. Reject it before prefix/canonical checks.
-    for component in full.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            anyhow::bail!(
-                "{what} {} contains `..`; use a normalized path",
-                full.display()
-            );
-        }
-    }
-
-    // Reparse check BEFORE canonicalize: canonicalize resolves a junction to
-    // its target, which would hide the junction from the component loop.
-    let mut current = PathBuf::new();
-    for component in full.components() {
-        current.push(component.as_os_str());
-        if let Ok(meta) = fs::symlink_metadata(&current) {
-            if is_reparse_point(&meta) {
-                anyhow::bail!(
-                    "{what} path contains a reparse point: {}",
-                    current.display()
-                );
-            }
-        }
-    }
-
-    let full_text = normalize_windows_path_text(&full.to_string_lossy());
-    let inside = |candidate: &str| {
-        candidate == profile_text || candidate.starts_with(&format!("{profile_text}\\"))
-    };
-    if !inside(&full_text) {
-        anyhow::bail!(
-            "{what} {} is outside %USERPROFILE% ({}); Windows shared caches are unsupported — use a per-user cache root",
-            full.display(),
-            profile.display()
-        );
-    }
-    // A path that already exists can contain a junction deeper than the
-    // lexical components; the canonical target must also stay inside.
-    let canonical = fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
-    let canonical_text = normalize_windows_path_text(&canonical.to_string_lossy());
-    if !inside(&canonical_text) {
-        anyhow::bail!(
-            "{what} {} resolves outside %USERPROFILE% ({}); Windows shared caches are unsupported",
-            full.display(),
-            profile.display()
-        );
-    }
-    // The profile itself is not a cache root. Compare both the lexical and
-    // canonical forms: `%USERPROFILE%\`, `%USERPROFILE%\.`, and
-    // `%USERPROFILE%\.\.` all resolve to the profile even though their raw
-    // strings differ.
-    if full_text == profile_text || canonical_text == profile_text {
-        anyhow::bail!(
-            "{what} {} is %USERPROFILE% itself — choose a dedicated subdirectory",
-            full.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
-    let _ = (path, what);
-    Ok(())
-}
-
-/// Is this a Windows reparse point (symlink/junction/mount point)? On Unix
-/// symlinks are handled by `file_type().is_symlink`.
-pub fn is_reparse_point(meta: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        meta.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-        false
-    }
-}
-
-/// One path component: no separators, no `.`/`..`, no NUL, no Windows
-/// drive/ADS separator, no trailing dot/space, no reserved device stem.
-/// Use for manifest fields that must be one directory or file name
-/// (`name`, `profile`, `memo`, parity keys).
-pub fn validate_component(value: &str, what: &str) -> Result<()> {
-    if value.is_empty()
-        || value != value.trim_end_matches([' ', '.'])
-        || value.trim_end_matches([' ', '.']) == "."
-        || value.trim_end_matches([' ', '.']) == ".."
-        || value.contains(['/', '\\', '\0', ':'])
-        || is_windows_reserved(value)
-    {
-        anyhow::bail!("invalid {what} {value:?}: expected one plain path component");
-    }
-    Ok(())
-}
-
-/// A **relative** path with only normal components. Rejects absolute paths,
-/// `..`, `.`, NUL, drive prefixes, and backslash/forward-slash tricks. This is
-/// the single gate for every manifest path that reaches the filesystem.
-pub fn validate_rel(value: &str, what: &str) -> Result<PathBuf> {
-    if value.is_empty() || value.contains('\0') || value.ends_with(['/', '\\']) {
-        anyhow::bail!("invalid {what} {value:?}: empty or trailing separator");
-    }
-    let normalized = value.replace('\\', "/");
-    let mut out = PathBuf::new();
-    for component in Path::new(&normalized).components() {
-        match component {
-            Component::Normal(part) => {
-                let part = part.to_string_lossy();
-                validate_component(&part, what)?;
-                out.push(&*part);
-            }
-            _ => anyhow::bail!("invalid {what} {value:?}: only relative components are allowed"),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        anyhow::bail!("invalid {what} {value:?}: empty path");
-    }
-    Ok(out)
-}
-
-/// Directories this process must never chmod as a "private cache": the
-/// filesystem root, the user's home, and the system temp directory. A
-/// mistyped `--cache-root /tmp` must not turn /tmp into 0700.
-fn refuse_destructive_chmod(path: &Path) -> Result<()> {
-    let is_root = path.parent().is_none() || path == Path::new("/");
-    let is_home = crate::paths::home()
-        .map(|home| home == path)
-        .unwrap_or(false);
-    let is_temp = std::env::temp_dir() == path;
-    if is_root || is_home || is_temp {
-        anyhow::bail!(
-            "refusing to change permissions of protected directory {} — choose a dedicated cache subdirectory",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// Create a directory tree with mode 0700 (Unix), refusing a symlinked or
-/// foreign-owned final directory. Existing directories are tightened to 0700.
-pub fn create_private_dir_all(path: &Path) -> Result<()> {
-    refuse_destructive_chmod(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .with_context(|| format!("creating private directory {}", path.display()))?;
-        let meta =
-            fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
-        if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
-            anyhow::bail!("{} is not a real directory", path.display());
-        }
-        if !owned_by_us(&meta) {
-            anyhow::bail!(
-                "{} is owned by uid {} — refusing to use a cache directory not owned by uid {}",
-                path.display(),
-                std::os::unix::fs::MetadataExt::uid(&meta),
-                euid()
-            );
-        }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("securing {}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
-            .with_context(|| format!("creating private directory {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Verify (and, when possible, repair) an existing private directory.
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    refuse_destructive_chmod(path)?;
-    let meta =
-        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
-        anyhow::bail!("{} is not a real directory", path.display());
-    }
-    if !owned_by_us(&meta) {
-        anyhow::bail!(
-            "{} is owned by another user — refusing a shared/untrusted cache",
-            path.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.mode() & 0o077 != 0 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("securing {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Check that `base/rel` is a chain of real directories ending in a regular
-/// file, with no symlink at any component. Read-only; used before hashing or
-/// restoring a store file.
-pub fn check_regular_chain(base: &Path, rel: &Path) -> Result<()> {
-    let base_meta =
-        fs::symlink_metadata(base).with_context(|| format!("inspecting {}", base.display()))?;
-    if !base_meta.is_dir() || base_meta.file_type().is_symlink() || is_reparse_point(&base_meta) {
-        anyhow::bail!("{} is not a real directory", base.display());
-    }
-    let mut current = base.to_path_buf();
-    let components: Vec<_> = rel.components().collect();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(part) = component else {
-            anyhow::bail!("refusing non-normal path component in {}", rel.display());
-        };
-        current.push(part);
-        let meta = fs::symlink_metadata(&current)
-            .with_context(|| format!("inspecting {}", current.display()))?;
-        if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-            anyhow::bail!("symlink/reparse in store path: {}", current.display());
-        }
-        if index + 1 == components.len() {
-            if !meta.is_file() {
-                anyhow::bail!("not a regular file: {}", current.display());
-            }
-        } else if !meta.is_dir() {
-            anyhow::bail!("not a directory: {}", current.display());
-        }
-    }
-    Ok(())
-}
-
-/// Create a directory chain under an existing `base` without following any
-/// symlink component. `rel` must already have been validated (only normal
-/// components). New components are 0700.
-pub fn create_dir_chain_nofollow(base: &Path, rel: &Path) -> Result<()> {
-    let base_meta =
-        fs::symlink_metadata(base).with_context(|| format!("inspecting {}", base.display()))?;
-    if !base_meta.is_dir() || base_meta.file_type().is_symlink() || is_reparse_point(&base_meta) {
-        anyhow::bail!("{} is not a real directory", base.display());
-    }
-    let mut current = base.to_path_buf();
-    for component in rel.components() {
-        let Component::Normal(part) = component else {
-            anyhow::bail!("refusing non-normal path component in {}", rel.display());
-        };
-        current.push(part);
-        match fs::symlink_metadata(&current) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-                    anyhow::bail!("symlink/reparse in destination path: {}", current.display());
-                }
-                if !meta.is_dir() {
-                    anyhow::bail!("not a directory: {}", current.display());
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(&current)
-                        .with_context(|| format!("creating {}", current.display()))?;
-                }
-                #[cfg(not(unix))]
-                fs::create_dir(&current)
-                    .with_context(|| format!("creating {}", current.display()))?;
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("inspecting {}", current.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Capability-style directory handle for Unix restore. All child lookups
-/// use openat()/mkdirat() with O_NOFOLLOW, and final installs use linkat(),
-/// so a directory swapped for a symlink between a path check and the write
-/// cannot redirect the operation.
-#[cfg(unix)]
-pub(crate) struct AtDir {
-    file: File,
-}
-
-#[cfg(unix)]
-impl AtDir {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::io::FromRawFd;
-        let name = CString::new(path.as_os_str().as_bytes())
-            .with_context(|| format!("path contains NUL: {}", path.display()))?;
-        let fd = unsafe {
-            libc::open(
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("opening directory {}", path.display()));
-        }
-        Ok(Self {
-            file: unsafe { File::from_raw_fd(fd) },
-        })
-    }
-
-    pub(crate) fn open_or_create_child(&self, name: &std::ffi::OsStr) -> Result<Self> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::io::FromRawFd;
-        let cname = CString::new(name.as_bytes())
-            .with_context(|| format!("path component contains NUL: {:?}", name))?;
-        loop {
-            let fd = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
+/// Minimal line diff for `setup --dry-run`: unchanged lines are prefixed with
+/// two spaces, removals with `- `, additions with `+ `.
+///
+/// Config files are tiny, so the O(n·m) LCS is simpler than pulling in a diff
+/// dependency and produces stable, readable output.
+pub fn line_diff(before: &str, after: &str) -> String {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
             };
-            if fd >= 0 {
-                return Ok(Self {
-                    file: unsafe { File::from_raw_fd(fd) },
-                });
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err).with_context(|| format!("opening child {:?}", name));
-            }
-            let made = unsafe { libc::mkdirat(self.file.as_raw_fd(), cname.as_ptr(), 0o700) };
-            if made != 0 {
-                let mkerr = std::io::Error::last_os_error();
-                // Another process may have created it; retry the open.
-                if mkerr.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(mkerr).with_context(|| format!("creating child {:?}", name));
-                }
-            }
         }
     }
 
-    /// Does `name` exist? A symlink/reparse is an error, never "existing".
-    pub(crate) fn exists(&self, name: &std::ffi::OsStr) -> Result<bool> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::io::FromRawFd;
-        let cname = CString::new(name.as_bytes())
-            .with_context(|| format!("path component contains NUL: {:?}", name))?;
-        #[cfg(target_os = "linux")]
-        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        #[cfg(not(target_os = "linux"))]
-        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(self.file.as_raw_fd(), cname.as_ptr(), flags) };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Ok(false);
-            }
-            return Err(err).with_context(|| format!("inspecting child {:?}", name));
-        }
-        let file = unsafe { File::from_raw_fd(fd) };
-        let meta = file
-            .metadata()
-            .with_context(|| format!("inspecting child {:?}", name))?;
-        if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-            anyhow::bail!("symlink/reparse in destination path: {:?}", name);
-        }
-        Ok(true)
-    }
-
-    /// Portable fallback for platforms without /proc/self/fd: linkat with a
-    /// source path but a held destination directory fd. The destination is
-    /// still race-free; the source is store-owned and pre-checked.
-    pub(crate) fn link_path(&self, source: &Path, dst_name: &std::ffi::OsStr) -> Result<()> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let src = CString::new(source.as_os_str().as_bytes())
-            .with_context(|| format!("source path contains NUL: {}", source.display()))?;
-        let dst = CString::new(dst_name.as_bytes())
-            .with_context(|| format!("destination name contains NUL: {:?}", dst_name))?;
-        let rc = unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                src.as_ptr(),
-                self.file.as_raw_fd(),
-                dst.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("linking {:?}", dst_name));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn create_excl(&self, name: &std::ffi::OsStr, mode: u32) -> Result<File> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::io::FromRawFd;
-        let cname = CString::new(name.as_bytes())
-            .with_context(|| format!("temporary name contains NUL: {:?}", name))?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                cname.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                mode as libc::c_uint,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("creating temporary {:?}", name));
-        }
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-
-    pub(crate) fn unlink(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let cname = CString::new(name.as_bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?;
-        let rc = unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn open_dir_chain_at(base: &Path, rel: &Path) -> Result<AtDir> {
-    let mut current = AtDir::open(base)?;
-    for component in rel.components() {
-        let Component::Normal(name) = component else {
-            anyhow::bail!(
-                "refusing non-normal destination component in {}",
-                rel.display()
-            );
-        };
-        current = current.open_or_create_child(name)?;
-    }
-    Ok(current)
-}
-
-#[cfg(unix)]
-pub(crate) fn open_file_nofollow(path: &Path) -> Result<File> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::FromRawFd;
-    let name = CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("path contains NUL: {}", path.display()))?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("opening {}", path.display()));
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-pub(crate) fn set_stamp_fd(file: &File, stamp: u64) -> std::io::Result<()> {
-    let times = [
-        libc::timespec {
-            tv_sec: stamp as libc::time_t,
-            tv_nsec: 0,
-        },
-        libc::timespec {
-            tv_sec: stamp as libc::time_t,
-            tv_nsec: 0,
-        },
-    ];
-    let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-pub(crate) fn sha256_file_fd(file: &mut File) -> std::io::Result<String> {
-    use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-#[cfg(unix)]
-pub(crate) fn copy_fd_verified(
-    src: &mut File,
-    dst: &mut File,
-    expected_size: u64,
-    expected_hash: &str,
-) -> Result<(u64, String)> {
-    use std::io::{Seek, SeekFrom};
-    src.seek(SeekFrom::Start(0))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut size = 0u64;
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        dst.write_all(&buf[..n])?;
-        size += n as u64;
-    }
-    dst.flush()?;
-    let hash = format!("{:x}", hasher.finalize());
-    if size != expected_size || hash != expected_hash {
-        anyhow::bail!(
-            "integrity check failed (recorded {expected_size} bytes/{}, found {size} bytes/{})",
-            &expected_hash[..expected_hash.len().min(12)],
-            &hash[..hash.len().min(12)]
-        );
-    }
-    Ok((size, hash))
-}
-
-/// SHA-256 of a regular file (lowercase hex). Callers that accept untrusted
-/// paths must reject symlinks with `symlink_metadata` first.
-pub fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    if is_reparse_point(&file.metadata()?) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "reparse point refused",
-        ));
-    }
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// Like [`read_small_text`] but follows a user's config symlink (dotfiles);
-/// still refuses FIFOs/devices and oversized inputs.
-pub fn read_small_text_follow(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let meta = fs::metadata(path)?;
-    if !meta.is_file() || meta.len() > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a small regular file",
-        ));
-    }
-    fs::read_to_string(path)
-}
-
-/// Read a small regular file without following a symlink and without
-/// blocking on FIFOs/devices. Returns an error on non-regular or oversized
-/// inputs.
-pub fn read_small_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || is_reparse_point(&meta) || meta.len() > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a small regular file",
-        ));
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    Ok(text)
-}
-
-/// Read a global config file from an already-open-like trusted path:
-/// O_NOFOLLOW, regular-file-only, owned by the current euid, and not
-/// group/world-writable. The ownership/mode checks use fstat on the opened
-/// descriptor, so a symlink/file swap between a path check and this read
-/// cannot redirect the trust anchor.
-pub fn read_trusted_config(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || is_reparse_point(&meta) || meta.len() > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a small regular config file",
-        ));
-    }
-    if !owned_by_us(&meta) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "config file is owned by another user",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.mode() & 0o022 != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "config file is group/world-writable",
-            ));
+    let mut out = String::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push_str("  ");
+            out.push_str(a[i]);
+            out.push('\n');
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push_str("- ");
+            out.push_str(a[i]);
+            out.push('\n');
+            i += 1;
+        } else {
+            out.push_str("+ ");
+            out.push_str(b[j]);
+            out.push('\n');
+            j += 1;
         }
     }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    Ok(text)
-}
-
-/// Atomically replace a private config file. The temp is created with
-/// `O_EXCL` and mode 0600 in the same directory, then renamed over the
-/// target. Renaming replaces a planted symlink instead of following it (on
-/// Unix); on Windows a pre-existing symlink is removed first, never followed.
-pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
-    create_private_dir_all(parent)?;
-    let base = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config".to_string());
-    let mut last_error = None;
-    for attempt in 0..100u32 {
-        let tmp = parent.join(format!(".{base}.tmp-{}-{attempt}", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&tmp) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("creating {}", tmp.display()));
-            }
-        };
-        if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("writing {}", tmp.display()));
-        }
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("securing {}", tmp.display()))?;
-        }
-        match fs::rename(&tmp, path) {
-            Ok(()) => return Ok(()),
-            #[cfg(windows)]
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                // Windows does not replace an existing file with rename().
-                // Removing the link itself (never following it) is safe; the
-                // subsequent rename replaces whatever appears next.
-                let _ = fs::remove_file(path);
-                if let Err(err2) = fs::rename(&tmp, path) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(err2).with_context(|| format!("installing {}", path.display()));
-                }
-                return Ok(());
-            }
-            Err(err) => {
-                last_error = Some(err);
-                let _ = fs::remove_file(&tmp);
-                if attempt < 99 {
-                    continue;
-                }
-            }
-        }
+    while i < a.len() {
+        out.push_str("- ");
+        out.push_str(a[i]);
+        out.push('\n');
+        i += 1;
     }
-    Err(last_error
-        .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow::anyhow!("could not atomically write {}", path.display())))
-    .with_context(|| format!("writing {}", path.display()))
-}
-
-/// Copy a regular file into a **new** destination (`O_EXCL`) while hashing it.
-/// Refuses symlinks/FIFOs/devices and never follows a destination symlink.
-/// Returns (bytes, sha256).
-pub fn copy_file_hashed(src: &Path, dst: &Path) -> Result<(u64, String)> {
-    let meta = fs::symlink_metadata(src)
-        .with_context(|| format!("inspecting source {}", src.display()))?;
-    if !meta.file_type().is_file() || is_reparse_point(&meta) {
-        anyhow::bail!(
-            "{} is not a regular file (symlink/special file refused)",
-            src.display()
-        );
+    while j < b.len() {
+        out.push_str("+ ");
+        out.push_str(b[j]);
+        out.push('\n');
+        j += 1;
     }
-    if !owned_by_us(&meta) {
-        anyhow::bail!(
-            "{} is owned by another user — refusing to copy it into the vault",
-            src.display()
-        );
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut input = options
-        .open(src)
-        .with_context(|| format!("opening source {}", src.display()))?;
-    if !input.metadata()?.is_file() {
-        anyhow::bail!("{} changed type while opening", src.display());
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dst)
-        .with_context(|| format!("creating {}", dst.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut size = 0u64;
-    loop {
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        output.write_all(&buf[..n])?;
-        size += n as u64;
-    }
-    output.flush()?;
-    Ok((size, format!("{:x}", hasher.finalize())))
-}
-
-/// Copy + verify a recorded size/hash. On mismatch the new destination is
-/// removed and the operation fails (never installs unverified bytes).
-pub fn copy_file_verified(
-    src: &Path,
-    dst: &Path,
-    expected_size: u64,
-    expected_hash: &str,
-) -> Result<(u64, String)> {
-    if expected_hash.is_empty() {
-        anyhow::bail!(
-            "{} has no recorded SHA-256 (re-harvest the vault before restoring)",
-            src.display()
-        );
-    }
-    let (size, hash) = copy_file_hashed(src, dst)?;
-    if size != expected_size || hash != expected_hash {
-        let _ = fs::remove_file(dst);
-        anyhow::bail!(
-            "integrity check failed for {} (recorded {} bytes/{}, found {} bytes/{})",
-            src.display(),
-            expected_size,
-            &expected_hash[..expected_hash.len().min(12)],
-            size,
-            &hash[..hash.len().min(12)]
-        );
-    }
-    Ok((size, hash))
-}
-
-/// Resolve an executable to an **absolute** path. This is the Windows
-/// CWD-search fix: `Command::new("cargo")` must never be used directly.
-pub fn tool_path(program: &str) -> Result<PathBuf> {
-    let path = which_path(program)
-        .with_context(|| format!("{program} not found on PATH or in the cargo bin directory"))?;
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Ok(fs::canonicalize(&path).unwrap_or(path))
-    }
-}
-
-/// A `Command` for a trusted tool (`cargo`, `rustc`) or a user program:
-/// relative names are resolved through [`tool_path`] to an absolute path.
-pub fn command_for(program: &str) -> Result<Command> {
-    let path = if program.contains(['/', '\\']) {
-        PathBuf::from(program)
-    } else {
-        tool_path(program)?
-    };
-    let mut command = Command::new(path);
-    // Windows CreateProcess otherwise searches the CWD before PATH. The
-    // variable is ignored on Unix but harmless and keeps the code uniform.
-    command.env("NoDefaultCurrentDirectoryInExePath", "1");
-    Ok(command)
-}
-
-/// Advisory exclusive lock on a file. Held for the lifetime of the value.
-pub struct FileLock {
-    file: File,
-}
-
-impl FileLock {
-    pub fn acquire(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            create_private_dir_all(parent)?;
-        }
-        if fs::symlink_metadata(path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("refusing symlinked lock file {}", path.display());
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .with_context(|| format!("opening lock {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("locking {}", path.display()))?;
-        Ok(Self { file })
-    }
-
-    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        if let Some(parent) = path.parent() {
-            create_private_dir_all(parent)?;
-        }
-        if fs::symlink_metadata(path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("refusing symlinked lock file {}", path.display());
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .with_context(|| format!("opening lock {}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { file })),
-            // Contention (or an unsupported lock): fail closed as "in use".
-            Err(_) => Ok(None),
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Context;
-
-    #[test]
-    fn parses_time_units() {
-        assert_eq!(
-            parse_duration("30d").unwrap(),
-            Duration::from_secs(30 * 86_400)
-        );
-        assert_eq!(
-            parse_duration("2w").unwrap(),
-            Duration::from_secs(2 * 604_800)
-        );
-        assert_eq!(
-            parse_duration("12h").unwrap(),
-            Duration::from_secs(12 * 3_600)
-        );
-        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
-        assert!(parse_duration("abc").is_err());
-        assert!(parse_duration("5x").is_err());
-    }
-
-    #[test]
-    fn human_sizes() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1023), "1023 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(3 * 1_048_576 + 200_000), "3.2 MiB");
-    }
-
-    #[test]
-    fn exe_candidates_is_platform_aware() {
-        let names = exe_candidates("kache");
-        assert!(names.contains(&"kache".to_string()));
-        #[cfg(windows)]
-        assert!(names.contains(&"kache.exe".to_string()));
-        #[cfg(not(windows))]
-        assert_eq!(names.len(), 1);
-    }
-
-    #[test]
-    fn paint_is_pure() {
-        assert_eq!(paint(false, "38;2;146;210;147", "hi"), "hi");
-        assert_eq!(paint(true, "1", "hi"), "\x1b[1mhi\x1b[0m");
-    }
-
-    #[test]
-    fn manifest_paths_stay_relative_and_normal() {
-        assert!(validate_rel("deps/libx-abc.rlib", "path").is_ok());
-        assert!(validate_rel(".fingerprint/x-abc/lib-x", "path").is_ok());
-        assert!(validate_rel("/etc/passwd", "path").is_err());
-        assert!(validate_rel("../escape", "path").is_err());
-        assert!(validate_rel("deps/../../escape", "path").is_err());
-        assert!(validate_rel("C:\\Windows\\x", "path").is_err());
-        assert!(validate_rel("deps\\x", "path").is_ok());
-        assert!(validate_rel("", "path").is_err());
-        assert!(validate_component("debug", "profile").is_ok());
-        assert!(validate_component("..", "profile").is_err());
-        assert!(validate_component("a/b", "profile").is_err());
-        assert!(validate_component("a\\b", "profile").is_err());
-        // Windows aliases / device stems must never pass a manifest.
-        assert!(validate_component(".. ", "profile").is_err());
-        assert!(validate_component("...", "profile").is_err());
-        assert!(validate_component("foo.", "profile").is_err());
-        assert!(validate_component("foo ", "profile").is_err());
-        assert!(validate_component("CON", "profile").is_err());
-        assert!(validate_component("CON.txt", "profile").is_err());
-        assert!(validate_component("COM1.log", "profile").is_err());
-        assert!(validate_component("foo.bar", "profile").is_ok());
-        assert!(validate_rel(".. /x", "path").is_err());
-    }
-
-    #[test]
-    fn copies_are_hashed_and_verified() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        fs::write(&src, b"hello")?;
-        let (size, hash) = copy_file_hashed(&src, &dst)?;
-        assert_eq!(size, 5);
-        assert_eq!(hash, sha256_file(&src)?);
-        assert_eq!(fs::read(&dst)?, b"hello");
-        let bad = dir.path().join("bad");
-        assert!(copy_file_verified(&src, &bad, 5, "00").is_err());
-        assert!(
-            !bad.exists(),
-            "a failed verify must not leave the destination"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn duration_overflow_is_rejected() {
-        assert!(parse_duration("18446744073709551615d").is_err());
-        assert!(parse_duration("18446744073709551615s").is_ok());
-    }
-
-    #[test]
-    fn error_blocks_render_a_glyph_indent_and_causes() {
-        let plain =
-            anyhow::anyhow!("nothing selected — pass one selector:\n--stale   older toolchains");
-        let block = error_block_with(false, &plain);
-        assert_eq!(
-            block,
-            "✕ nothing selected — pass one selector:\n  --stale   older toolchains"
-        );
-        let colored = error_block_with(true, &plain);
-        assert!(colored.contains("\u{1b}[38;2;224;108;117m✕\u{1b}[0m"));
-
-        let chained = Err::<(), _>(anyhow::anyhow!("inner detail")).context("outer headline");
-        let block = error_block_with(false, &chained.unwrap_err());
-        assert_eq!(block, "✕ outer headline\n  caused by: inner detail");
-    }
-}
-
-#[cfg(all(test, windows))]
-mod windows_path_tests {
-    use super::*;
-
-    #[test]
-    fn non_existent_in_profile_paths_are_accepted() {
-        // tempdir is under %TEMP% (inside %USERPROFILE%); these children do
-        // not exist yet, which is exactly the fresh setup/harvest/exec case.
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("cache").join("build");
-        ensure_windows_user_path(&target, "cache root").unwrap();
-    }
-
-    #[test]
-    fn profile_aliases_are_rejected() {
-        let profile = std::env::var_os("USERPROFILE").expect("USERPROFILE");
-        let profile = std::path::PathBuf::from(profile);
-        let mut trailing = profile.as_os_str().to_os_string();
-        trailing.push("\\");
-        for target in [
-            std::path::PathBuf::from(trailing),
-            profile.join("."),
-            profile.join(".").join("."),
-            profile.join(".").join(".."),
-        ] {
-            assert!(
-                ensure_windows_user_path(&target, "cache root").is_err(),
-                "profile alias was accepted: {:?}",
-                target
-            );
-        }
-    }
-
-    #[test]
-    fn parent_dir_cannot_lexically_escape_the_profile() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("..").join("Public").join("ec");
-        assert!(ensure_windows_user_path(&target, "cache root").is_err());
-    }
+    out
 }

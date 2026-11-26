@@ -1,0 +1,1542 @@
+//! CI-only publisher: turn one stored generation into a signed local index
+//! tree and an ordered upload plan.
+//!
+//! This module deliberately stops before the network. It verifies the store,
+//! selects publishable units, reuses the vault's stored blobs, signs the index
+//! and writes a private staging tree. The transport layer only consumes the
+//! returned [`Upload`] list.
+
+use anyhow::{Context, Result, ensure};
+use ed25519_dalek::SigningKey;
+use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use super::{
+    BlobRef, Compression, FileRole, IndexBody, IndexPointer, LocalEnvironment,
+    MAX_INDEX_VALIDITY_SECS, PublisherMetadata, RemoteFile, RemotePointer, RemoteUnit,
+    RemoteUnitKind, SCHEMA_VERSION, SignedIndex, SourceKind, UnitSource, Upload, make_index,
+    now_secs, read_capped, sha256_hex, upload_plan, write_index_tree,
+};
+use crate::fingerprint;
+use crate::lockfile::{LockIndex, LockSource};
+use crate::settings::{self, RemoteTier};
+use crate::vault::{self, StoredUnit};
+
+const MAX_PUBLISHER_KEY_BYTES: u64 = 1024;
+
+/// Everything one publish invocation needs. Paths are borrowed so the CLI can
+/// keep its argument struct small.
+pub struct PublishRequest<'a> {
+    pub store_root: &'a Path,
+    pub cwd: &'a Path,
+    pub url: &'a str,
+    pub tier: RemoteTier,
+    pub generation: Option<&'a str>,
+    pub profile: Option<&'a str>,
+    /// Rustup selector used for the build (`nightly`, `1.91.0`, ...).
+    pub selector: Option<&'a str>,
+    pub sequence: Option<u64>,
+    /// The current remote pointer fetched by the transport. Local staging
+    /// reads its own `index.json` when this is absent.
+    pub current: Option<&'a RemotePointer>,
+    /// Explicitly allow a missing remote index when the publisher state or a
+    /// prior `publisher.json` says this bucket was published before.
+    pub reset_sequence: bool,
+    /// Local-only mode: read the last pointer from the private staging tree
+    /// when the caller did not fetch a remote one. Network publishers must set
+    /// this to false so a deleted remote index is never masked by stale staging.
+    pub allow_staged_pointer: bool,
+    pub valid_for: Duration,
+    pub source_commit: &'a str,
+    pub ci_job: &'a str,
+    pub notes: &'a str,
+    pub expect_key_id: Option<&'a str>,
+    pub rotate_key: bool,
+    pub publisher_state: Option<&'a Path>,
+    pub out_dir: Option<&'a Path>,
+    pub lockfile: Option<&'a Path>,
+}
+
+/// A completed local publish. `uploads` is the P3.6 transport input.
+pub struct PublishOutcome {
+    pub url: String,
+    pub tier: RemoteTier,
+    pub generation: String,
+    pub units: usize,
+    pub files: usize,
+    pub bytes: u64,
+    pub blobs: usize,
+    pub skipped_workspace: usize,
+    pub skipped_tier: usize,
+    pub public_key: String,
+    pub identity_created: bool,
+    /// A staged `--rotate-key` candidate, promoted only once the remote
+    /// pointer confirms the index it signed. `None` for ordinary publishes.
+    rotation: Option<PendingRotation>,
+    pub publisher_state: PathBuf,
+    pub out_dir: PathBuf,
+    pub index: SignedIndex,
+    pub uploads: Vec<Upload>,
+}
+
+struct PublisherIdentity {
+    key: SigningKey,
+    public_key: String,
+    key_id: String,
+    created: bool,
+    rotation: Option<PendingRotation>,
+}
+
+/// A candidate identity written beside the active key but not yet trusted.
+#[derive(Clone)]
+struct PendingRotation {
+    staged: PathBuf,
+    active: PathBuf,
+    key_id: String,
+}
+
+struct PublishUnit {
+    remote: RemoteUnit,
+    sources: Vec<PathBuf>,
+}
+
+/// Publish one store generation into a private local staging tree.
+pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
+    let url = settings::normalize_remote_url(request.url)?;
+    ensure!(
+        url.split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("s3")),
+        "the publisher requires an `s3://bucket/prefix` URL; `https://` is reader-only"
+    );
+    let valid_secs = request.valid_for.as_secs();
+    ensure!(
+        (1..=MAX_INDEX_VALIDITY_SECS).contains(&valid_secs),
+        "index validity must be between 1 second and {MAX_INDEX_VALIDITY_SECS} seconds"
+    );
+
+    let bucket = bucket_name(&url)?.to_string();
+    let out_dir = match request.out_dir {
+        Some(path) => path.to_path_buf(),
+        None => crate::paths::state_dir()?
+            .join("remote-publish")
+            .join(staging_id(&url)),
+    };
+    ensure!(
+        !out_dir.starts_with(request.store_root) && !request.store_root.starts_with(&out_dir),
+        "publisher staging {} must be outside the store {}",
+        out_dir.display(),
+        request.store_root.display()
+    );
+    crate::util::create_private_dir_all(&out_dir)?;
+    let out_real = fs::canonicalize(&out_dir).unwrap_or_else(|_| out_dir.clone());
+    let store_real =
+        fs::canonicalize(request.store_root).unwrap_or_else(|_| request.store_root.to_path_buf());
+    ensure!(
+        !out_real.starts_with(&store_real) && !store_real.starts_with(&out_real),
+        "publisher staging {} resolves inside the store {}",
+        out_dir.display(),
+        request.store_root.display()
+    );
+
+    let _publish_lock = crate::util::FileLock::acquire(&out_dir.join(".publish.lock"))?;
+    let current = match request.current {
+        Some(remote) => {
+            remote.pointer.validate_shape()?;
+            Some(remote.pointer.clone())
+        }
+        None if request.allow_staged_pointer => read_current_pointer(&out_dir)?,
+        None => None,
+    };
+    let current_key_id = current.as_ref().map(|pointer| pointer.key_id.as_str());
+    let state_dir = publisher_state_dir(request.publisher_state)?;
+    crate::util::create_private_dir_all(&state_dir)?;
+    let state_real = fs::canonicalize(&state_dir).unwrap_or_else(|_| state_dir.clone());
+    ensure!(
+        !state_real.starts_with(&store_real),
+        "publisher identity directory {} must be outside the store {}",
+        state_dir.display(),
+        request.store_root.display()
+    );
+    ensure!(
+        state_real != out_real,
+        "publisher identity directory and staging directory must be different"
+    );
+    let previous = PublisherState::load(&state_dir, &url)?;
+    if !request.reset_sequence
+        && let Some(previous) = &previous
+    {
+        if let Some(current) = &current {
+            ensure!(
+                current.sequence >= previous.sequence,
+                "remote index sequence {} is older than the publisher state sequence {}; \
+                 refusing a rollback (use --reset-sequence only after investigating)",
+                current.sequence,
+                previous.sequence
+            );
+            ensure!(
+                current.sequence != previous.sequence
+                    || current.body_sha256 == previous.body_sha256,
+                "remote index reuses sequence {} with different bytes; refusing equivocation",
+                current.sequence
+            );
+        } else {
+            anyhow::bail!(
+                "the remote index is missing but publisher state records sequence {}; \
+                 refusing to restart at 1 (use --reset-sequence only after investigating)",
+                previous.sequence
+            );
+        }
+    }
+    let identity = resolve_identity(
+        &state_dir,
+        &bucket,
+        current_key_id,
+        request.expect_key_id,
+        request.rotate_key,
+    )?;
+    let rotation = identity.rotation.clone();
+    if let Some(pointer) = &current
+        && !request.rotate_key
+    {
+        pointer
+            .verify_signature(&identity.public_key)
+            .context("the existing staging index does not match the publisher identity")?;
+    }
+    let sequence = choose_sequence(request.sequence, current.as_ref())?;
+
+    let lock = match request.lockfile {
+        Some(path) => LockIndex::parse(path)
+            .with_context(|| format!("reading Cargo.lock {}", path.display()))?,
+        None => LockIndex::load(request.cwd, None).context(
+            "publishing requires a Cargo.lock; run from the workspace or pass --lockfile",
+        )?,
+    };
+    let generation = match request.generation {
+        Some(generation) => generation.to_string(),
+        None => vault::parity_key_of(request.selector)?,
+    };
+    let selection = select_units(
+        vault::stored_units(request.store_root)?,
+        &generation,
+        request.profile,
+        request.tier,
+        &lock,
+    )?;
+    ensure!(
+        !selection.units.is_empty(),
+        "no publishable units in generation {generation}; run `epicenter exec --harvest` first, \
+         check the Cargo.lock, or try --tier full"
+    );
+
+    let unit_count = selection.units.len();
+    let files = selection
+        .units
+        .iter()
+        .map(|unit| unit.remote.files.len())
+        .sum();
+    let bytes = selection
+        .units
+        .iter()
+        .flat_map(|unit| &unit.remote.files)
+        .map(|file| file.size)
+        .sum();
+    stage_blobs(&out_dir, &selection.units)?;
+
+    let units: Vec<RemoteUnit> = selection
+        .units
+        .into_iter()
+        .map(|unit| unit.remote)
+        .collect();
+    let compatibility =
+        super::Compatibility::from_local(&LocalEnvironment::gather_for(request.selector)?, &units)?;
+    let now = now_secs();
+    let body = IndexBody {
+        schema: SCHEMA_VERSION,
+        key_id: identity.key_id.clone(),
+        sequence,
+        created: now,
+        expires: now.saturating_add(valid_secs),
+        tier: request.tier,
+        publisher: PublisherMetadata {
+            tool: format!("epicenter-cli {}", env!("CARGO_PKG_VERSION")),
+            source_commit: request.source_commit.to_string(),
+            built_at: now,
+            ci_job: request.ci_job.to_string(),
+            notes: request.notes.to_string(),
+        },
+        compatibility,
+        units,
+    };
+    let index = make_index(body, &identity.key, now)?;
+
+    write_index_tree(&out_dir, &index)?;
+    // Read our own output through the reader path before declaring success.
+    super::read_index_tree(&out_dir, &identity.public_key, request.tier, now)?;
+    let uploads = upload_plan(&out_dir, &index)?;
+
+    let blobs = uploads
+        .iter()
+        .filter(|upload| upload.key.starts_with("blobs/"))
+        .count();
+
+    Ok(PublishOutcome {
+        url,
+        tier: request.tier,
+        generation,
+        units: unit_count,
+        files,
+        bytes,
+        blobs,
+        skipped_workspace: selection.skipped_workspace,
+        skipped_tier: selection.skipped_tier,
+        public_key: identity.public_key,
+        identity_created: identity.created,
+        rotation,
+        publisher_state: state_dir,
+        out_dir,
+        index,
+        uploads,
+    })
+}
+
+fn bucket_name(url: &str) -> Result<&str> {
+    let (_, rest) = url.split_once("://").context("remote URL has no scheme")?;
+    let bucket = rest.split('/').next().unwrap_or(rest);
+    ensure!(!bucket.is_empty(), "remote URL has no bucket");
+    Ok(bucket)
+}
+
+fn bucket_id(bucket: &str) -> String {
+    sha256_hex(bucket.as_bytes())[..16].to_string()
+}
+
+fn staging_id(url: &str) -> String {
+    sha256_hex(url.as_bytes())[..16].to_string()
+}
+
+fn publisher_state_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("EPICENTER_PUBLISHER_STATE")
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(crate::paths::state_dir()?.join("publisher"))
+}
+
+fn key_path(state_dir: &Path, bucket: &str) -> PathBuf {
+    state_dir.join(format!("publisher-{}.key", bucket_id(bucket)))
+}
+
+fn rotation_path(path: &Path) -> PathBuf {
+    let mut staged = path.as_os_str().to_os_string();
+    staged.push(".next");
+    PathBuf::from(staged)
+}
+
+fn resolve_identity(
+    state_dir: &Path,
+    bucket: &str,
+    current_key_id: Option<&str>,
+    expected_key_id: Option<&str>,
+    rotate: bool,
+) -> Result<PublisherIdentity> {
+    crate::util::create_private_dir_all(state_dir)?;
+    let path = key_path(state_dir, bucket);
+
+    if rotate {
+        ensure!(
+            expected_key_id.is_none(),
+            "`--rotate-key` and `--expect-key-id` are mutually exclusive; rotate first, then \
+             update the pin"
+        );
+        let mut identity = new_identity()?;
+        let staged = rotation_path(&path);
+        write_key(&staged, &identity.key, true)?;
+        let key_id = identity.key_id.clone();
+        identity.rotation = Some(PendingRotation {
+            staged,
+            active: path,
+            key_id,
+        });
+        return Ok(identity);
+    }
+
+    match read_key(&path) {
+        Ok(key) => {
+            let identity = identity_from_key(key, false);
+            validate_identity_pin(&identity, &path, current_key_id, expected_key_id)?;
+            Ok(identity)
+        }
+        Err(err) if crate::util::is_not_found(&err) => {
+            ensure!(
+                current_key_id.is_none() && expected_key_id.is_none(),
+                "publisher identity {} is missing, but {}; mount the publisher state directory \
+                 on persistent private storage, set EPICENTER_PUBLISHER_STATE, or pass \
+                 --rotate-key and re-pin readers",
+                path.display(),
+                current_key_id
+                    .map(|key| format!("the existing index is signed by {key}"))
+                    .or_else(|| expected_key_id.map(|key| format!("readers pin {key}")))
+                    .unwrap_or_else(|| "a publisher identity is required".to_string())
+            );
+            let identity = new_identity()?;
+            let created = write_key(&path, &identity.key, false)?;
+            // If another publisher won the create race, its key is the
+            // identity that the index must use.
+            let key = read_key(&path)?;
+            let identity = identity_from_key(key, created);
+            validate_identity_pin(&identity, &path, current_key_id, expected_key_id)?;
+            Ok(identity)
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("reading publisher identity {}", path.display()))
+        }
+    }
+}
+
+fn validate_identity_pin(
+    identity: &PublisherIdentity,
+    path: &Path,
+    current_key_id: Option<&str>,
+    expected_key_id: Option<&str>,
+) -> Result<()> {
+    if let Some(expected) = expected_key_id {
+        ensure!(
+            identity.key_id == expected,
+            "publisher key {} is {}, but the configured pin is {expected}; refusing to sign \
+             with an unexpected identity",
+            path.display(),
+            identity.key_id
+        );
+    }
+    if let Some(current) = current_key_id {
+        ensure!(
+            identity.key_id == current,
+            "publisher key {} is {}, but the existing index is signed by {current}; restore the \
+             publisher state directory or pass --rotate-key and re-pin readers",
+            path.display(),
+            identity.key_id
+        );
+    }
+    Ok(())
+}
+
+fn identity_from_key(key: SigningKey, created: bool) -> PublisherIdentity {
+    let public_key = crate::vault::hex_encode(&key.verifying_key().to_bytes());
+    let key_id = settings::remote_key_id(&public_key).expect("valid Ed25519 public key");
+    PublisherIdentity {
+        key,
+        public_key,
+        key_id,
+        created,
+        rotation: None,
+    }
+}
+
+fn new_identity() -> Result<PublisherIdentity> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed)
+        .map_err(|err| anyhow::anyhow!("generating the publisher key: {err}"))?;
+    let key = SigningKey::from_bytes(&seed);
+    let public_key = crate::vault::hex_encode(&key.verifying_key().to_bytes());
+    let key_id = settings::remote_key_id(&public_key)?;
+    Ok(PublisherIdentity {
+        key,
+        public_key,
+        key_id,
+        created: true,
+        rotation: None,
+    })
+}
+
+fn read_key(path: &Path) -> Result<SigningKey> {
+    let text = crate::util::read_private_text(path, MAX_PUBLISHER_KEY_BYTES)?;
+    let bytes = crate::vault::hex_decode(text.trim(), "publisher private key")?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("publisher private key must be 32 bytes"))?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+fn write_key(path: &Path, key: &SigningKey, replace: bool) -> Result<bool> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    crate::util::create_private_dir_all(parent)?;
+    let text = format!("{}\n", crate::vault::hex_encode(&key.to_bytes()));
+    if replace {
+        crate::util::write_atomic_private(path, text.as_bytes())?;
+        return Ok(true);
+    }
+    // A fresh identity is only ever a complete, fsynced file: write a private
+    // temp in the same directory, then publish it with an atomic no-overwrite
+    // link. A concurrent creator that wins the race keeps its key.
+    let (tmp, ()) = crate::util::with_temp_file(parent, "publisher-key", ".tmp", 0o600, |file| {
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing publisher identity {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing publisher identity {}", path.display()))?;
+        Ok(())
+    })?;
+    let created = match fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("creating publisher identity {}", path.display()))
+        }
+    };
+    let _ = fs::remove_file(&tmp);
+    created
+}
+
+/// Promote a staged `--rotate-key` candidate after the remote pointer carries
+/// it. Renaming over the active key is atomic; if the staged file is already
+/// gone, the promotion happened earlier and only the identity is re-checked.
+fn promote_rotation(rotation: &PendingRotation) -> Result<()> {
+    match fs::symlink_metadata(&rotation.staged) {
+        Ok(meta) if meta.is_file() => {
+            // Never install a candidate other than the one this pointer was
+            // signed with; a replaced staged file must not hijack the identity.
+            let staged = identity_from_key(read_key(&rotation.staged)?, false);
+            ensure!(
+                staged.key_id == rotation.key_id,
+                "staged publisher identity {} is {}, but the confirmed rotation signed with {}",
+                rotation.staged.display(),
+                staged.key_id,
+                rotation.key_id
+            );
+            crate::util::replace_file(&rotation.staged, &rotation.active).with_context(|| {
+                format!(
+                    "promoting staged publisher identity {}",
+                    rotation.staged.display()
+                )
+            })?;
+        }
+        Ok(_) => anyhow::bail!(
+            "staged publisher identity {} is not a regular file",
+            rotation.staged.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspecting staged publisher identity {}",
+                    rotation.staged.display()
+                )
+            });
+        }
+    }
+    let active = identity_from_key(read_key(&rotation.active)?, false);
+    ensure!(
+        active.key_id == rotation.key_id,
+        "active publisher identity {} is {}, but the confirmed rotation signed with {}",
+        rotation.active.display(),
+        active.key_id,
+        rotation.key_id
+    );
+    Ok(())
+}
+
+fn read_current_pointer(out_dir: &Path) -> Result<Option<IndexPointer>> {
+    let path = out_dir.join(super::INDEX_FILE);
+    if crate::util::probe_file(&path, "staged index")?.is_none() {
+        return Ok(None);
+    }
+    let bytes = read_capped(&path, super::MAX_INDEX_POINTER_BYTES, "index pointer")?;
+    let pointer: IndexPointer =
+        serde_json::from_slice(&bytes).context("parsing the staged index pointer")?;
+    pointer.validate_shape()?;
+    Ok(Some(pointer))
+}
+
+/// Publisher-side rollback protection. This is not a reader trust anchor; it
+/// prevents a lost/deleted remote pointer from silently restarting at 1.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublisherState {
+    schema: u32,
+    endpoint: String,
+    key_id: String,
+    sequence: u64,
+    pointer_etag: Option<String>,
+    body_sha256: String,
+    updated: u64,
+}
+
+impl PublisherState {
+    fn path(state_dir: &Path, url: &str) -> Result<PathBuf> {
+        let id = sha256_hex(url.as_bytes());
+        Ok(state_dir.join(format!("publish-{}.json", &id[..16])))
+    }
+
+    fn load(state_dir: &Path, url: &str) -> Result<Option<Self>> {
+        let path = Self::path(state_dir, url)?;
+        if crate::util::probe_file(&path, "publisher state")?.is_none() {
+            return Ok(None);
+        }
+        let bytes = read_capped(&path, 8 * 1024, "publisher state")?;
+        let state: Self = serde_json::from_slice(&bytes)
+            .context("parsing the publisher state; remove it only after investigating")?;
+        ensure!(
+            state.schema == 1,
+            "publisher state schema {} is not supported",
+            state.schema
+        );
+        ensure!(
+            state.endpoint == url,
+            "publisher state belongs to a different endpoint"
+        );
+        ensure!(state.sequence > 0, "publisher state has no sequence");
+        Ok(Some(state))
+    }
+
+    fn record(
+        state_dir: &Path,
+        url: &str,
+        pointer: &IndexPointer,
+        pointer_etag: Option<String>,
+    ) -> Result<()> {
+        let state = Self {
+            schema: 1,
+            endpoint: url.to_string(),
+            key_id: pointer.key_id.clone(),
+            sequence: pointer.sequence,
+            pointer_etag,
+            body_sha256: pointer.body_sha256.clone(),
+            updated: now_secs(),
+        };
+        let path = Self::path(state_dir, url)?;
+        // Serialize read-compare-write per endpoint. A publisher that staged
+        // sequence 8 and paused must never lower the checkpoint another
+        // writer advanced to 9, or the remote rollback guard regresses.
+        let _lock = crate::util::FileLock::acquire(&path.with_extension("json.lock"))?;
+        if let Some(existing) = Self::load(state_dir, url)? {
+            ensure!(
+                state.sequence >= existing.sequence,
+                "publisher state is already at sequence {}; refusing to record older sequence {} — the remote index may have rolled back",
+                existing.sequence,
+                state.sequence
+            );
+            ensure!(
+                state.sequence != existing.sequence || state.body_sha256 == existing.body_sha256,
+                "publisher state already records sequence {} with a different body; refusing equivocation",
+                existing.sequence
+            );
+        }
+        let bytes = serde_json::to_vec_pretty(&state)?;
+        crate::util::write_atomic_private(&path, &bytes)
+    }
+}
+
+/// Record a successful upload after the pointer was replaced. A staged
+/// `--rotate-key` candidate is promoted first, because the confirmed pointer
+/// is what makes it the active identity.
+pub fn record_publish_state(outcome: &PublishOutcome, pointer_etag: Option<String>) -> Result<()> {
+    if let Some(rotation) = &outcome.rotation {
+        promote_rotation(rotation)?;
+    }
+    PublisherState::record(
+        &outcome.publisher_state,
+        &outcome.url,
+        outcome.index.pointer(),
+        pointer_etag,
+    )
+}
+
+fn choose_sequence(explicit: Option<u64>, current: Option<&IndexPointer>) -> Result<u64> {
+    let next = current
+        .map(|pointer| {
+            pointer
+                .sequence
+                .checked_add(1)
+                .context("remote index sequence overflow")
+        })
+        .transpose()?
+        .unwrap_or(1);
+    match explicit {
+        Some(sequence) => {
+            ensure!(sequence > 0, "sequence must start at 1");
+            if let Some(current) = current {
+                ensure!(
+                    sequence > current.sequence,
+                    "sequence {sequence} would not advance past the staged sequence {}",
+                    current.sequence
+                );
+            }
+            Ok(sequence)
+        }
+        None => Ok(next),
+    }
+}
+
+struct Selection {
+    units: Vec<PublishUnit>,
+    skipped_workspace: usize,
+    skipped_tier: usize,
+}
+
+fn select_units(
+    stored_units: Vec<StoredUnit>,
+    generation: &str,
+    profile: Option<&str>,
+    tier: RemoteTier,
+    lock: &LockIndex,
+) -> Result<Selection> {
+    let mut units = Vec::new();
+    let mut skipped_workspace = 0usize;
+    let mut skipped_tier = 0usize;
+    let mut profiles = HashSet::new();
+
+    for stored in stored_units {
+        if stored.generation != generation {
+            continue;
+        }
+        let store_root = stored.store_root.as_path();
+        if let Some(profile) = profile
+            && stored.entry.profile != profile
+        {
+            continue;
+        }
+        let unit_dir = crate::util::metadata_nofollow(&stored.dir)
+            .with_context(|| format!("inspecting stored unit {}", stored.dir.display()))?;
+        ensure!(
+            unit_dir.is_dir(),
+            "stored unit {} is not a real directory",
+            stored.dir.display()
+        );
+
+        let kind = RemoteUnitKind::from(fingerprint::classify_kind(&stored.entry.memo));
+        if kind == RemoteUnitKind::Other
+            || (tier == RemoteTier::Libraries && kind != RemoteUnitKind::Lib)
+        {
+            skipped_tier += 1;
+            continue;
+        }
+
+        let package = stored
+            .entry
+            .name
+            .rsplit_once('-')
+            .map(|(package, _)| package)
+            .unwrap_or(stored.entry.name.as_str());
+        let source = match lock.resolve(package, stored.entry.version.as_deref())? {
+            Some(LockSource::Registry { index, checksum }) => UnitSource {
+                kind: SourceKind::Registry,
+                id: index,
+                checksum: Some(checksum),
+            },
+            Some(LockSource::Git { id }) => UnitSource {
+                kind: SourceKind::Git,
+                id,
+                checksum: None,
+            },
+            Some(LockSource::Path) | None => {
+                skipped_workspace += 1;
+                continue;
+            }
+        };
+
+        let json_name = format!("{}.json", stored.entry.memo);
+        let json_path = stored.dir.join(&json_name);
+        let json_rel = Path::new(&stored.generation)
+            .join("units")
+            .join(&stored.entry.name)
+            .join(&json_name);
+        crate::util::check_regular_chain(store_root, &json_rel)?;
+        let text = crate::util::read_small_text(&json_path, 1024 * 1024)
+            .with_context(|| format!("reading stored fingerprint {}", json_path.display()))?;
+        let fingerprint = fingerprint::parse_fingerprint(&text)
+            .with_context(|| format!("parsing stored fingerprint {}", json_path.display()))?;
+        let compat = super::UnitCompatibility::from_fingerprint(&fingerprint);
+
+        let mut files = Vec::new();
+        for file in &stored.entry.files {
+            let role = FileRole::try_from(file.role.as_str())
+                .with_context(|| format!("unit {}", stored.entry.name))?;
+            let (source_path, blob) = blob_for_file(store_root, &stored, file)?;
+            files.push((
+                RemoteFile {
+                    path: file.path.clone(),
+                    dest: file.dest.clone(),
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                    role,
+                    blob: blob.blob,
+                    blob_size: blob.blob_size,
+                    compression: blob.compression,
+                },
+                source_path,
+            ));
+        }
+        files.sort_by(|left, right| left.0.path.cmp(&right.0.path));
+
+        let (files, sources): (Vec<_>, Vec<_>) = files.into_iter().unzip();
+        let remote = RemoteUnit {
+            name: stored.entry.name.clone(),
+            package: package.to_string(),
+            version: stored.entry.version.clone(),
+            profile: stored.entry.profile.clone(),
+            memo: stored.entry.memo.clone(),
+            hash: stored.entry.hash.clone(),
+            stamp: stored.entry.stamp,
+            layout: stored.entry.layout(),
+            kind,
+            source,
+            compat,
+            files,
+        };
+        if tier == RemoteTier::Libraries && remote.is_executable() {
+            skipped_tier += 1;
+            continue;
+        }
+        profiles.insert(remote.profile.clone());
+        units.push(PublishUnit { remote, sources });
+    }
+
+    ensure!(
+        profiles.len() <= 1,
+        "generation {generation} has multiple profiles ({}); pass --profile to publish one",
+        profiles.into_iter().collect::<Vec<_>>().join(", ")
+    );
+    units.sort_by(|left, right| left.remote.name.cmp(&right.remote.name));
+    Ok(Selection {
+        units,
+        skipped_workspace,
+        skipped_tier,
+    })
+}
+
+fn blob_for_file(
+    store_root: &Path,
+    stored: &StoredUnit,
+    file: &vault::FileEntry,
+) -> Result<(PathBuf, BlobRef)> {
+    if let Some(object) = &file.object {
+        let source = store_root.join(&stored.generation).join(object);
+        let object_rel = Path::new(&stored.generation).join(object);
+        crate::util::check_regular_chain(store_root, &object_rel)?;
+        let (decoded_size, decoded_hash) =
+            crate::util::decompress_file_hashed(&source, false, file.size)
+                .with_context(|| format!("verifying stored blob {}", source.display()))?;
+        ensure!(
+            decoded_size == file.size && decoded_hash == file.sha256,
+            "stored blob {} does not match its recorded decoded size/hash",
+            source.display()
+        );
+        let blob = crate::util::sha256_file(&source)?;
+        let blob_size = crate::util::metadata_nofollow(&source)?.len();
+        ensure!(
+            blob_size > 0 && blob_size < file.size,
+            "stored gzip blob {} is not smaller than its decoded size",
+            source.display()
+        );
+        Ok((
+            source,
+            BlobRef {
+                blob,
+                blob_size,
+                sha256: file.sha256.clone(),
+                size: file.size,
+                compression: Compression::Gzip,
+            },
+        ))
+    } else {
+        let source = stored.dir.join(&file.path);
+        let rel = Path::new(&stored.generation)
+            .join("units")
+            .join(&stored.entry.name)
+            .join(&file.path);
+        crate::util::check_regular_chain(store_root, &rel)?;
+        crate::util::verify_file_hash(&source, file.size, &file.sha256, "stored file")?;
+        Ok((
+            source,
+            BlobRef {
+                blob: file.sha256.clone(),
+                blob_size: file.size,
+                sha256: file.sha256.clone(),
+                size: file.size,
+                compression: Compression::Raw,
+            },
+        ))
+    }
+}
+
+fn stage_blobs(out_dir: &Path, units: &[PublishUnit]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for unit in units {
+        for (file, source) in unit.remote.files.iter().zip(&unit.sources) {
+            if !seen.insert(file.blob.as_str()) {
+                continue;
+            }
+            let destination = super::blob_path(out_dir, &file.blob)?;
+            stage_object(source, &destination, file.blob_size, &file.blob)?;
+        }
+    }
+    Ok(())
+}
+
+fn stage_object(src: &Path, dst: &Path, size: u64, hash: &str) -> Result<()> {
+    if crate::util::probe_file(dst, "staged blob")?.is_some() {
+        return verify_object(dst, size, hash);
+    }
+    if let Some(parent) = dst.parent() {
+        crate::util::create_private_dir_all(parent)?;
+    }
+    match fs::hard_link(src, dst) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => match crate::util::copy_file_verified_unowned(src, dst, size, hash) {
+            Ok(_) => {}
+            Err(err)
+                if crate::util::io_error(&err)
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("staging blob {} -> {}", src.display(), dst.display())
+                });
+            }
+        },
+    }
+    verify_object(dst, size, hash)
+}
+
+fn verify_object(path: &Path, size: u64, hash: &str) -> Result<()> {
+    crate::util::verify_file_hash(path, size, hash, "staged blob")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::UnitLayout;
+    use std::fs;
+
+    fn package_dir(root: &Path, generation: &str, name: &str) -> PathBuf {
+        root.join(generation).join("units").join(name)
+    }
+
+    fn write_unit(root: &Path, generation: &str, name: &str, memo: &str) -> PathBuf {
+        let dir = package_dir(root, generation, name);
+        fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::json!({
+            "rustc": "1",
+            "features": "[]",
+            "declared_features": "[]",
+            "target": "2",
+            "profile": "3",
+            "path": "4",
+            "config": "5",
+            "deps": [],
+            "rustflags": [],
+            "compile_kind": "0"
+        });
+        fs::write(dir.join(format!("{memo}.json")), json.to_string()).unwrap();
+        fs::write(dir.join(memo), b"aabbccddeeff0011").unwrap();
+        dir
+    }
+
+    fn file_entry(path: &str, role: &str, bytes: &[u8]) -> vault::FileEntry {
+        vault::FileEntry {
+            path: path.to_string(),
+            dest: format!("deps/{path}"),
+            size: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+            role: role.to_string(),
+            object: None,
+        }
+    }
+
+    fn stored_unit(
+        root: &Path,
+        generation: &str,
+        name: &str,
+        memo: &str,
+        files: Vec<vault::FileEntry>,
+    ) -> StoredUnit {
+        StoredUnit {
+            generation: generation.to_string(),
+            entry: vault::UnitEntry {
+                name: name.to_string(),
+                profile: "debug".to_string(),
+                memo: memo.to_string(),
+                hash: "aabbccddeeff0011".to_string(),
+                version: Some("1.0.0".to_string()),
+                stamp: 1,
+                layout: Some(UnitLayout::Classic),
+                files,
+            },
+            dir: package_dir(root, generation, name),
+            store_root: root.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn select_units_skips_workspace_and_respects_tiers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let generation = "gen";
+        let lib_name = "serde-0011223344556677";
+        let lib_dir = write_unit(root, generation, lib_name, "lib-serde");
+        fs::write(lib_dir.join("libserde.rlib"), b"rlib")?;
+        let lib = stored_unit(
+            root,
+            generation,
+            lib_name,
+            "lib-serde",
+            vec![file_entry("libserde.rlib", "artifact", b"rlib")],
+        );
+
+        let build_name = "serde-8899aabbccddeeff";
+        let build_dir = write_unit(root, generation, build_name, "build-script-build");
+        fs::write(build_dir.join("build-script-build"), b"bin")?;
+        let mut build = stored_unit(
+            root,
+            generation,
+            build_name,
+            "build-script-build",
+            vec![file_entry("build-script-build", "artifact", b"bin")],
+        );
+        build.entry.version = lib.entry.version.clone();
+
+        let local_name = "local-1111222233334444";
+        let local_dir = write_unit(root, generation, local_name, "lib-local");
+        fs::write(local_dir.join("liblocal.rlib"), b"local")?;
+        let local = stored_unit(
+            root,
+            generation,
+            local_name,
+            "lib-local",
+            vec![file_entry("liblocal.rlib", "artifact", b"local")],
+        );
+
+        let lock_path = root.join("Cargo.lock");
+        fs::write(
+            &lock_path,
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
+        )?;
+        let lock = LockIndex::parse(&lock_path).expect("lock parses");
+
+        let libraries = select_units(
+            vec![lib.clone(), build.clone(), local.clone()],
+            generation,
+            None,
+            RemoteTier::Libraries,
+            &lock,
+        )?;
+        assert_eq!(libraries.units.len(), 1);
+        assert_eq!(libraries.units[0].remote.name, lib_name);
+        assert_eq!(libraries.skipped_tier, 1);
+        assert_eq!(libraries.skipped_workspace, 1);
+
+        let full = select_units(
+            vec![lib, build, local],
+            generation,
+            None,
+            RemoteTier::Full,
+            &lock,
+        )?;
+        assert_eq!(full.units.len(), 2);
+        assert_eq!(full.skipped_workspace, 1);
+        assert!(
+            full.units
+                .iter()
+                .any(|unit| unit.remote.kind == RemoteUnitKind::BuildScript)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_is_created_once_and_refuses_silent_rotation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = resolve_identity(dir.path(), "bucket", None, None, false)?;
+        assert!(first.created);
+        let second = resolve_identity(dir.path(), "bucket", Some(&first.key_id), None, false)?;
+        assert!(!second.created);
+        assert_eq!(first.key_id, second.key_id);
+
+        let rotated = resolve_identity(dir.path(), "bucket", Some(&first.key_id), None, true)?;
+        assert!(rotated.created);
+        assert_ne!(rotated.key_id, first.key_id);
+        // The rotation is only staged: the previous identity still signs.
+        let still_first = resolve_identity(dir.path(), "bucket", Some(&first.key_id), None, false)?;
+        assert_eq!(still_first.key_id, first.key_id);
+        promote_rotation(rotated.rotation.as_ref().expect("staged rotation"))?;
+        let third = resolve_identity(dir.path(), "bucket", Some(&rotated.key_id), None, false)?;
+        assert_eq!(third.key_id, rotated.key_id);
+
+        let other = tempfile::tempdir()?;
+        let err = resolve_identity(other.path(), "bucket", Some(&first.key_id), None, false)
+            .err()
+            .expect("a missing identity with an existing pin must fail");
+        assert!(format!("{err:#}").contains("missing"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_rotation_keeps_the_active_key_until_promoted() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let active_path = key_path(dir.path(), "bucket");
+        let active = resolve_identity(dir.path(), "bucket", None, None, false)?;
+        let original = fs::read(&active_path)?;
+
+        // A dry run or a failed upload stages the candidate and returns
+        // without touching the identity readers already accept.
+        let staged = resolve_identity(dir.path(), "bucket", Some(&active.key_id), None, true)?;
+        assert!(staged.created);
+        assert_ne!(staged.key_id, active.key_id);
+        assert_eq!(fs::read(&active_path)?, original);
+        assert!(rotation_path(&active_path).is_file());
+
+        // Retrying the ordinary publish still signs with the active identity.
+        let retry = resolve_identity(dir.path(), "bucket", Some(&active.key_id), None, false)?;
+        assert_eq!(retry.key_id, active.key_id);
+
+        // Confirming the pointer promotes the candidate exactly once; the
+        // second call is a no-op that only verifies the active identity.
+        let rotation = staged.rotation.as_ref().expect("staged rotation");
+        promote_rotation(rotation)?;
+        assert!(!rotation_path(&active_path).exists());
+        assert_ne!(fs::read(&active_path)?, original);
+        promote_rotation(rotation)?;
+        assert_eq!(
+            resolve_identity(dir.path(), "bucket", Some(&staged.key_id), None, false)?.key_id,
+            staged.key_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn promotion_refuses_a_replaced_candidate() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let active_path = key_path(dir.path(), "bucket");
+        let active = resolve_identity(dir.path(), "bucket", None, None, false)?;
+        let original = fs::read(&active_path)?;
+        let staged = resolve_identity(dir.path(), "bucket", Some(&active.key_id), None, true)?;
+
+        // A different key at the staged path must never become the active
+        // identity, even though the outcome believes the pointer confirmed it.
+        let other = new_identity()?;
+        write_key(&rotation_path(&active_path), &other.key, true)?;
+        let err = promote_rotation(staged.rotation.as_ref().expect("staged rotation"))
+            .expect_err("a replaced candidate must not be promoted");
+        assert!(format!("{err:#}").contains("signed with"), "{err:#}");
+        assert_eq!(fs::read(&active_path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_identity_creation_converges() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_identity(&root, "bucket", None, None, false)
+                })
+            })
+            .collect();
+
+        let mut created = 0usize;
+        let mut key_id = None;
+        for handle in handles {
+            let identity = handle.join().expect("identity thread panicked")?;
+            created += usize::from(identity.created);
+            match &key_id {
+                Some(existing) => assert_eq!(identity.key_id, *existing),
+                None => key_id = Some(identity.key_id),
+            }
+        }
+        assert_eq!(created, 1, "exactly one publisher writes the identity");
+        assert!(key_path(&root, "bucket").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_advances_or_refuses_rollback() {
+        let pointer = IndexPointer {
+            schema: SCHEMA_VERSION,
+            key_id: "ed25519:0000000000000000".to_string(),
+            sequence: 7,
+            created: 1,
+            expires: 2,
+            body_sha256: "00".repeat(32),
+            body_size: 1,
+            signature: String::new(),
+        };
+        assert_eq!(choose_sequence(None, Some(&pointer)).unwrap(), 8);
+        assert!(choose_sequence(Some(7), Some(&pointer)).is_err());
+        assert_eq!(choose_sequence(Some(9), Some(&pointer)).unwrap(), 9);
+    }
+
+    #[test]
+    fn raw_blob_is_the_decoded_hash_and_gzip_reuses_the_store_object() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let generation = "gen";
+        let name = "serde-0011223344556677";
+        let unit_dir = write_unit(root, generation, name, "lib-serde");
+        fs::write(unit_dir.join("libserde.rlib"), b"rlib")?;
+        let entry = stored_unit(
+            root,
+            generation,
+            name,
+            "lib-serde",
+            vec![file_entry("libserde.rlib", "artifact", b"rlib")],
+        );
+        let (source, blob) = blob_for_file(root, &entry, &entry.entry.files[0])?;
+        assert_eq!(blob.compression, Compression::Raw);
+        assert_eq!(blob.blob, sha256_hex(b"rlib"));
+        assert_eq!(source, unit_dir.join("libserde.rlib"));
+
+        use flate2::Compression as GzipLevel;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let payload = vec![b'a'; 8192];
+        let mut encoder = GzEncoder::new(Vec::new(), GzipLevel::fast());
+        encoder.write_all(&payload)?;
+        let gz = encoder.finish()?;
+        let object = "blobs/aa/0011223344556677.gz";
+        let object_path = root.join(generation).join(object);
+        fs::create_dir_all(object_path.parent().unwrap())?;
+        fs::write(&object_path, &gz)?;
+        let compressed = stored_unit(
+            root,
+            generation,
+            "zip-0011223344556677",
+            "lib-zip",
+            vec![vault::FileEntry {
+                path: "libzip.rlib".to_string(),
+                dest: "deps/libzip.rlib".to_string(),
+                size: payload.len() as u64,
+                sha256: sha256_hex(&payload),
+                role: "artifact".to_string(),
+                object: Some(object.to_string()),
+            }],
+        );
+        let (source, blob) = blob_for_file(root, &compressed, &compressed.entry.files[0])?;
+        assert_eq!(blob.compression, Compression::Gzip);
+        assert_eq!(blob.sha256, sha256_hex(&payload));
+        assert_eq!(blob.blob, sha256_hex(&gz));
+        assert_eq!(blob.blob_size, gz.len() as u64);
+        assert_eq!(source, object_path);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_json_is_available_from_the_store_copy() {
+        let json = r#"{"rustc":1,"features":"[]","declared_features":"[]","target":2,
+            "profile":3,"path":4,"config":5,"deps":[],"rustflags":[],"compile_kind":0}"#;
+        assert!(fingerprint::parse_fingerprint(json).is_some());
+    }
+
+    #[test]
+    fn publisher_state_records_sequence_and_endpoint() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pointer = IndexPointer {
+            schema: SCHEMA_VERSION,
+            key_id: "ed25519:0123456789abcdef".into(),
+            sequence: 7,
+            created: 1,
+            expires: 2,
+            body_sha256: "ab".repeat(32),
+            body_size: 1,
+            signature: "00".repeat(64),
+        };
+        PublisherState::record(
+            dir.path(),
+            "s3://bucket/prefix",
+            &pointer,
+            Some("etag".into()),
+        )?;
+        let loaded =
+            PublisherState::load(dir.path(), "s3://bucket/prefix")?.expect("publisher state");
+        assert_eq!(loaded.sequence, 7);
+        assert_eq!(loaded.pointer_etag.as_deref(), Some("etag"));
+        assert!(PublisherState::load(dir.path(), "s3://bucket/other")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn publisher_state_never_regresses_or_equivocates() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pointer = |sequence: u64, body: &str| IndexPointer {
+            schema: SCHEMA_VERSION,
+            key_id: "ed25519:0123456789abcdef".into(),
+            sequence,
+            created: 1,
+            expires: 2,
+            body_sha256: body.repeat(32),
+            body_size: 1,
+            signature: "00".repeat(64),
+        };
+        PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(9, "ab"), None)?;
+        PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(9, "ab"), None)?;
+
+        let err = PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(8, "ab"), None)
+            .expect_err("an older sequence must not replace the checkpoint");
+        assert!(format!("{err:#}").contains("older sequence"), "{err:#}");
+        let err = PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(9, "cd"), None)
+            .expect_err("a different body at one sequence is equivocation");
+        assert!(format!("{err:#}").contains("equivocation"), "{err:#}");
+        let loaded = PublisherState::load(dir.path(), "s3://bucket/prefix")?.expect("state");
+        assert_eq!(loaded.sequence, 9);
+        assert_eq!(loaded.body_sha256, "ab".repeat(32));
+
+        PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(10, "cd"), None)?;
+        assert_eq!(
+            PublisherState::load(dir.path(), "s3://bucket/prefix")?
+                .expect("state")
+                .sequence,
+            10
+        );
+        Ok(())
+    }
+
+    fn store_fixture(temp: &Path) -> Result<(PathBuf, PathBuf)> {
+        let store = temp.join("store");
+        let generation = "gen";
+        let name = "serde-0011223344556677";
+        let unit_dir = package_dir(&store, generation, name);
+        fs::create_dir_all(&unit_dir)?;
+
+        let json = br#"{"rustc":1,"features":"[]","declared_features":"[]","target":2,"profile":3,"path":4,"config":5,"deps":[],"rustflags":[],"compile_kind":0}"#;
+        let memo = b"aabbccddeeff0011";
+        let rlib = b"rlib";
+        fs::write(unit_dir.join("lib-serde.json"), json)?;
+        fs::write(unit_dir.join("lib-serde"), memo)?;
+        fs::write(unit_dir.join("libserde.rlib"), rlib)?;
+
+        let files = vec![
+            vault::FileEntry {
+                path: "lib-serde.json".to_string(),
+                dest: format!(".fingerprint/{name}/lib-serde.json"),
+                size: json.len() as u64,
+                sha256: sha256_hex(json),
+                role: "fingerprint".to_string(),
+                object: None,
+            },
+            vault::FileEntry {
+                path: "lib-serde".to_string(),
+                dest: format!(".fingerprint/{name}/lib-serde"),
+                size: memo.len() as u64,
+                sha256: sha256_hex(memo),
+                role: "memo".to_string(),
+                object: None,
+            },
+            vault::FileEntry {
+                path: "libserde.rlib".to_string(),
+                dest: "deps/libserde.rlib".to_string(),
+                size: rlib.len() as u64,
+                sha256: sha256_hex(rlib),
+                role: "artifact".to_string(),
+                object: None,
+            },
+        ];
+        let manifest = vault::Manifest {
+            parity_key: generation.to_string(),
+            toolchain: "rustc 1.91.0 (test)".to_string(),
+            created: 1,
+            updated: 1,
+            units: vec![vault::UnitEntry {
+                name: name.to_string(),
+                profile: "debug".to_string(),
+                memo: "lib-serde".to_string(),
+                hash: "aabbccddeeff0011".to_string(),
+                version: Some("1.0.0".to_string()),
+                stamp: 1,
+                layout: Some(UnitLayout::Classic),
+                files,
+            }],
+            mac: String::new(),
+            signature: String::new(),
+        };
+        vault::save_manifest(&store, generation, &manifest)?;
+
+        let lock_path = temp.join("Cargo.lock");
+        fs::write(
+            &lock_path,
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abababababababababababababababababababababababababababababababab\"\n",
+        )?;
+        Ok((store, lock_path))
+    }
+
+    #[test]
+    fn publishes_a_store_generation_end_to_end() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (store, lock_path) = store_fixture(temp.path())?;
+        let generation = "gen";
+
+        let out_dir = temp.path().join("out");
+        let publisher_state = temp.path().join("publisher");
+        let request = PublishRequest {
+            store_root: &store,
+            cwd: temp.path(),
+            url: "s3://bucket/prefix",
+            tier: RemoteTier::Libraries,
+            generation: Some(generation),
+            profile: Some("debug"),
+            selector: None,
+            sequence: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: true,
+            valid_for: Duration::from_secs(3_600),
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            ci_job: "ci/test",
+            notes: "",
+            expect_key_id: None,
+            rotate_key: false,
+            publisher_state: Some(&publisher_state),
+            out_dir: Some(&out_dir),
+            lockfile: Some(&lock_path),
+        };
+        let first = publish(&request)?;
+        assert_eq!(first.units, 1);
+        assert_eq!(first.files, 3);
+        assert_eq!(first.index.pointer().sequence, 1);
+        assert_eq!(
+            first.uploads.last().map(|upload| upload.key.as_str()),
+            Some("index.json")
+        );
+        assert!(first.identity_created);
+
+        let second = publish(&request)?;
+        assert_eq!(second.index.pointer().sequence, 2);
+        assert_eq!(second.index.pointer().key_id, first.index.pointer().key_id);
+        assert!(!second.identity_created);
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_signs_with_the_candidate_and_promotes_after_confirmation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (store, lock_path) = store_fixture(temp.path())?;
+        let out_dir = temp.path().join("out");
+        let publisher_state = temp.path().join("publisher");
+        let request = PublishRequest {
+            store_root: &store,
+            cwd: temp.path(),
+            url: "s3://bucket/prefix",
+            tier: RemoteTier::Libraries,
+            generation: Some("gen"),
+            profile: Some("debug"),
+            selector: None,
+            sequence: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: false,
+            valid_for: Duration::from_secs(3_600),
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            ci_job: "ci/test",
+            notes: "",
+            expect_key_id: None,
+            rotate_key: true,
+            publisher_state: Some(&publisher_state),
+            out_dir: Some(&out_dir),
+            lockfile: Some(&lock_path),
+        };
+
+        let staged = publish(&request)?;
+        let active_path = key_path(&publisher_state, "bucket");
+        assert!(
+            !active_path.exists(),
+            "a rotation must not commit the active key before the pointer"
+        );
+        let candidate = identity_from_key(read_key(&rotation_path(&active_path))?, true);
+        assert_eq!(staged.index.pointer().key_id, candidate.key_id);
+        assert_eq!(staged.public_key, candidate.public_key);
+
+        record_publish_state(&staged, None)?;
+        assert!(active_path.is_file());
+        assert!(!rotation_path(&active_path).exists());
+        // A repeated finalize (for example after a state write retry) must not
+        // promote again or rewrite the committed identity.
+        let committed = fs::read(&active_path)?;
+        record_publish_state(&staged, None)?;
+        assert_eq!(fs::read(&active_path)?, committed);
+        assert_eq!(
+            resolve_identity(
+                &publisher_state,
+                "bucket",
+                Some(&candidate.key_id),
+                None,
+                false
+            )?
+            .key_id,
+            candidate.key_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_record_failure_keeps_the_confirmed_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (store, lock_path) = store_fixture(temp.path())?;
+        let out_dir = temp.path().join("out");
+        let publisher_state = temp.path().join("publisher");
+        let request = PublishRequest {
+            store_root: &store,
+            cwd: temp.path(),
+            url: "s3://bucket/prefix",
+            tier: RemoteTier::Libraries,
+            generation: Some("gen"),
+            profile: Some("debug"),
+            selector: None,
+            sequence: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: false,
+            valid_for: Duration::from_secs(3_600),
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            ci_job: "ci/test",
+            notes: "",
+            expect_key_id: None,
+            rotate_key: true,
+            publisher_state: Some(&publisher_state),
+            out_dir: Some(&out_dir),
+            lockfile: Some(&lock_path),
+        };
+        let staged = publish(&request)?;
+        let active_path = key_path(&publisher_state, "bucket");
+        let candidate = identity_from_key(read_key(&rotation_path(&active_path))?, true);
+
+        // A checkpoint ahead of this publish makes the state write fail after
+        // the pointer was confirmed and the candidate promoted.
+        let mut ahead = staged.index.pointer().clone();
+        ahead.sequence += 1;
+        ahead.body_sha256 = "cd".repeat(32);
+        PublisherState::record(&publisher_state, &staged.url, &ahead, None)?;
+
+        let err = record_publish_state(&staged, None).expect_err("state write must fail");
+        assert!(format!("{err:#}").contains("older sequence"), "{err:#}");
+        assert!(active_path.is_file());
+        assert!(!rotation_path(&active_path).exists());
+        assert_eq!(
+            identity_from_key(read_key(&active_path)?, false).key_id,
+            candidate.key_id
+        );
+
+        // Retrying the same finalize cannot repromote or rewrite the identity.
+        let committed = fs::read(&active_path)?;
+        let err = record_publish_state(&staged, None).expect_err("state write must still fail");
+        assert!(format!("{err:#}").contains("older sequence"), "{err:#}");
+        assert_eq!(fs::read(&active_path)?, committed);
+        Ok(())
+    }
+}
