@@ -307,14 +307,9 @@ fn remove_file_and_empty_dir_stay_under_the_root() -> Result<()> {
 
 #[cfg(windows)]
 fn make_junction(link: &Path, target: &Path) -> Result<()> {
-    let script = format!(
-        "New-Item -ItemType Junction -Path '{}' -Target '{}' -ErrorAction Stop | Out-Null",
-        link.display(),
-        target.display()
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command"])
-        .arg(script)
+    let script = format!(r#"mklink /J "{}" "{}""#, link.display(), target.display());
+    let status = std::process::Command::new("cmd")
+        .args(["/C", &script])
         .status()?;
     if !status.success() {
         anyhow::bail!("mklink /J failed for {}", link.display());
@@ -499,6 +494,23 @@ fn manifest_paths_stay_relative_and_normal() {
     assert!(validate_rel("C:\\Windows\\x", "path").is_err());
     assert!(validate_rel("deps\\x", "path").is_ok());
     assert!(validate_rel("", "path").is_err());
+    // Non-canonical spellings are rejected before `Path` can normalize them:
+    // an interior `.` and an empty component would otherwise reach the same
+    // destination as the canonical path (duplicate manifest entries).
+    for bad in [
+        ".",
+        "./x",
+        "deps/./x",
+        "deps//x",
+        "deps\\\\./x",
+        "deps\\\\x",
+        "\\\\deps",
+        ".//x",
+        "deps/.",
+        "deps/.hidden/./x",
+    ] {
+        assert!(validate_rel(bad, "path").is_err(), "accepted {bad:?}");
+    }
     assert!(validate_component("debug", "profile").is_ok());
     assert!(validate_component("..", "profile").is_err());
     assert!(validate_component("a/b", "profile").is_err());
@@ -518,6 +530,39 @@ fn manifest_paths_stay_relative_and_normal() {
     assert!(validate_component("COM1.log", "profile").is_err());
     assert!(validate_component("foo.bar", "profile").is_ok());
     assert!(validate_rel(".. /x", "path").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_reads_refuse_group_readers_while_config_accepts_them() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("secret");
+    fs::write(&file, b"secret")?;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640))?;
+    let err = read_private_text(&file, 1024).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        read_trusted_config(&file, 1024)?,
+        "secret",
+        "config files only refuse foreign mutation"
+    );
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(read_private_text(&file, 1024)?, "secret");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn whole_file_reads_enforce_the_cap_on_the_bytes_read() -> Result<()> {
+    // Procfs reports a zero length for these files, so the cap cannot come
+    // from metadata: it must be enforced while the content is read.
+    let path = Path::new("/proc/self/status");
+    let err = read_small_text(path, 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let err = read_trusted_config(path, 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -595,11 +640,28 @@ mod windows_path_tests {
 
     #[test]
     fn non_existent_in_profile_paths_are_accepted() {
-        // tempdir is under %TEMP% (inside %USERPROFILE%); these children do
-        // not exist yet, which is exactly the fresh setup/harvest/exec case.
-        let root = tempfile::tempdir().unwrap();
+        // The fixture must live under %USERPROFILE% itself: a tempdir can be
+        // redirected to another volume, which this policy rejects.
+        let profile = std::env::var_os("USERPROFILE").expect("USERPROFILE");
+        let root = tempfile::Builder::new()
+            .prefix("epicenter-profile")
+            .tempdir_in(profile)
+            .expect("profile temp dir");
         let target = root.path().join("cache").join("build");
         ensure_windows_user_path(&target, "cache root").unwrap();
+    }
+
+    #[test]
+    fn differently_cased_in_profile_paths_are_accepted() {
+        // The identity check compares directory objects, not spellings, so a
+        // case variant of the profile path still resolves to the profile.
+        let profile = std::env::var_os("USERPROFILE").expect("USERPROFILE");
+        let root = tempfile::Builder::new()
+            .prefix("epicenter-profile")
+            .tempdir_in(&profile)
+            .expect("profile temp dir");
+        let spelled: std::path::PathBuf = root.path().to_string_lossy().to_ascii_uppercase().into();
+        ensure_windows_user_path(&spelled, "cache root").unwrap();
     }
 
     #[test]
@@ -628,4 +690,51 @@ mod windows_path_tests {
         let target = root.path().join("..").join("Public").join("ec");
         assert!(ensure_windows_user_path(&target, "cache root").is_err());
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_private_reads_refuse_a_foreign_reader_while_config_accepts_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("secret");
+    fs::write(&file, b"secret")?;
+    let status = std::process::Command::new("icacls")
+        .arg(&file)
+        .args(["/grant", "*S-1-5-32-545:(R)"])
+        .status()
+        .context("running icacls")?;
+    assert!(status.success(), "icacls could not add the test ACE");
+    let err = read_private_text(&file, 1024).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        read_trusted_config(&file, 1024)?,
+        "secret",
+        "config files only refuse foreign mutation"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_secret_acl_rejects_a_read_only_foreign_grant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("secret");
+    fs::write(&file, b"secret")?;
+    let status = std::process::Command::new("icacls")
+        .arg(&file)
+        .args(["/grant", "*S-1-5-32-545:(R)"])
+        .status()
+        .context("running icacls")?;
+    assert!(status.success(), "icacls could not add the test ACE");
+    assert_eq!(
+        windows_acl_is_secret(&file),
+        Some(false),
+        "a foreign read grant must fail the secret policy"
+    );
+    assert_eq!(
+        windows_acl_is_private(&file),
+        Some(true),
+        "a read-only grant is not a mutation and stays valid for config"
+    );
+    Ok(())
 }

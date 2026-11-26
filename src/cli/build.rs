@@ -120,7 +120,7 @@ pub(super) fn cmd_prune(args: &PruneArgs) -> Result<()> {
         println!("no shared cache at {} — nothing to prune", root.display());
         return Ok(());
     }
-    let delete = !args.dry_run && args.yes || args.y;
+    let delete = super::confirmed_delete(args.dry_run, args.yes, args.y);
     let opts = prune::Options {
         keep_latest: args.keep_latest,
         incremental: args.incremental,
@@ -181,16 +181,8 @@ pub(super) fn cmd_overlap(args: &OverlapArgs) -> Result<()> {
     let build = config::cache_root()?;
     let store = vault::store_root(&build);
     metadata_nofollow(&store)?;
-    let active = match epicenter_cli::who::active_unit_names(&build) {
-        Ok(active) => active,
-        Err(err) => {
-            eprintln!(
-                "  {} could not read the active build view: {err:#}",
-                util::warn(util::GLYPH_WARN)
-            );
-            Default::default()
-        }
-    };
+    let active =
+        epicenter_cli::who::active_unit_names(&build).context("reading the active build view")?;
     let packages = vault::overlap(&store, &active)?;
 
     if args.json {
@@ -384,9 +376,28 @@ pub(super) fn cmd_compact(args: &CompactArgs) -> Result<()> {
 
 /// `epicenter doctor` printing: group checks under their section header,
 /// icons colored by severity.
+/// Policy checks, with a policy error folded into the report instead of
+/// aborting before the cache checks are rendered. The profile is optional
+/// because it cannot be summarized when the policy itself is invalid.
+pub(super) fn read_policy_checks(
+    settings: &settings::Settings,
+) -> (Vec<doctor::Check>, Option<doctor::ProfileSummary>) {
+    match doctor::policy_checks(settings) {
+        Ok((checks, profile)) => (checks, Some(profile)),
+        Err(err) => (
+            vec![doctor::Check {
+                section: doctor::SEC_CONFIG,
+                level: doctor::Level::Fail,
+                message: format!("could not evaluate the policy: {err:#}"),
+            }],
+            None,
+        ),
+    }
+}
+
 pub(super) fn cmd_doctor(args: &DoctorArgs, settings: &settings::Settings) -> Result<()> {
     let mut checks = doctor::run()?;
-    let (policy, profile) = doctor::policy_checks(settings)?;
+    let (policy, profile) = read_policy_checks(settings);
     checks.extend(policy);
     let failed = checks
         .iter()
@@ -402,7 +413,7 @@ pub(super) fn cmd_doctor(args: &DoctorArgs, settings: &settings::Settings) -> Re
                     "message": &check.message,
                 }))
                 .collect::<Vec<_>>(),
-            "profile": profile.to_json(),
+            "profile": profile.as_ref().map(|profile| profile.to_json()),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -434,13 +445,32 @@ pub(super) fn cmd_doctor(args: &DoctorArgs, settings: &settings::Settings) -> Re
 /// job exits the process directly — the wrapper must not turn a failure into
 /// a success. Nothing is buffered at this point: the command owns stdout and
 /// epicenter's frame owns stderr.
+/// Whether a compiler wrapper is effective. Cargo lets the environment win
+/// over config files: `RUSTC_WRAPPER` is the direct override and
+/// `CARGO_BUILD_RUSTC_WRAPPER` overrides `build.rustc-wrapper`.
+pub(super) fn wrapper_configured(
+    env: &[Option<std::ffi::OsString>; 2],
+    config: Option<&str>,
+) -> bool {
+    env.iter().flatten().any(|value| !value.is_empty())
+        || config.is_some_and(|name| !name.is_empty())
+}
+
+fn effective_wrapper() -> bool {
+    let env = [
+        std::env::var_os("RUSTC_WRAPPER"),
+        std::env::var_os("CARGO_BUILD_RUSTC_WRAPPER"),
+    ];
+    let configured = config::cargo_configured_in("build", "rustc-wrapper")
+        .ok()
+        .flatten();
+    wrapper_configured(&env, configured.as_deref())
+}
+
 fn exec_incremental(settings: &settings::Settings) -> Option<bool> {
     let (preset, _) = settings.preset();
     let (effective, _, _) = settings.effective_preset();
-    let wrapper = config::cargo_configured_in("build", "rustc-wrapper")
-        .ok()
-        .flatten()
-        .is_some();
+    let wrapper = effective_wrapper();
     match (preset, effective) {
         (settings::Preset::Ci, _) => Some(false),
         // A wrapper cache and incremental state fight; never force it on.

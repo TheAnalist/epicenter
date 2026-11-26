@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
 
-use epicenter_cli::remote::RemoteSource as _;
-use epicenter_cli::util::metadata_nofollow;
 use epicenter_cli::{config, lockfile, remote, settings, util, vault};
 
 use super::args::{FetchArgs, PublishArgs};
@@ -30,6 +28,11 @@ pub(super) fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> 
         None if args.rotate_key => None,
         None => policy.key_id.clone(),
     };
+    // Validate and quote every reader handoff value before staging starts: an
+    // invalid --reader-url must fail before any object is uploaded, not after
+    // the signed pointer is already live.
+    let reader_url = resolve_reader_url(args.reader_url.as_deref(), &url)?;
+    let reader_arg = shell_quote(&reader_url);
     let valid_for = util::parse_duration(&args.valid_for)?;
     let source_commit = detect_source_commit(args.source_commit.as_deref())?;
     let ci_job = detect_ci_job(args.ci_job.as_deref());
@@ -50,31 +53,15 @@ pub(super) fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> 
         .expect_key_id
         .as_deref()
         .filter(|raw| settings::is_publisher_key_hex(raw));
-    let mut current: Option<remote::RemotePointer> = None;
-    if let Some(fetched) = source.fetch_pointer_optional()? {
-        let pointer: remote::IndexPointer =
-            serde_json::from_slice(&fetched.bytes).context("parsing the remote index pointer")?;
-        let verify_key = expected_public_key
-            .or(policy.publisher_key.as_deref())
-            .context(
-                "a remote index exists; verifying it needs the full publisher public key \
-                 (64 hex, not a short key id) via --expect-key-id or `setup --remote-key`",
-            )?;
-        pointer.verify_signature(verify_key)?;
-        current = Some(remote::RemotePointer {
-            pointer,
-            etag: fetched.etag,
-        });
-    }
-    if current.is_none()
-        && !args.reset_sequence
-        && sink.head_lenient(remote::PUBLISHER_FILE)?.is_some()
-    {
-        anyhow::bail!(
-            "remote publisher.json exists but index.json is missing; \
-             refusing to restart at sequence 1 (use --reset-sequence only after investigating)"
-        );
-    }
+    // The publisher state loaded by `remote::publish` is the only authority on
+    // whether a missing pointer is a rollback. A bare `publisher.json` is the
+    // residue of an upload interrupted before the pointer committed, so it
+    // must not refuse a retry on its own.
+    let current = fetch_remote_pointer(
+        &source,
+        expected_public_key,
+        policy.publisher_key.as_deref(),
+    )?;
 
     let outcome = remote::publish(&remote::PublishRequest {
         store_root: &store_root,
@@ -170,16 +157,12 @@ pub(super) fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> 
             util::green(&util::human_bytes(report.bytes))
         );
     }
-    let reader_url = match args.reader_url.as_deref() {
-        Some(raw) => settings::normalize_remote_url(raw)?,
-        None => outcome.url.clone(),
-    };
     println!();
     println!("  {}", util::dim("handoff for readers:"));
     println!(
-        "  epicenter setup --remote-url '{}' --remote-key '{}' --remote-tier {}",
-        reader_url,
-        outcome.public_key,
+        "  epicenter setup --remote-url {} --remote-key {} --remote-tier {}",
+        reader_arg,
+        shell_quote(&outcome.public_key),
         outcome.tier.as_str()
     );
     println!(
@@ -190,6 +173,56 @@ pub(super) fn cmd_publish(args: &PublishArgs, settings: &settings::Settings) -> 
         )
     );
     Ok(())
+}
+
+/// Normalize the reader-facing URL before staging. The printed handoff is only
+/// produced for a URL that passed the same validation as the publisher
+/// endpoint.
+fn resolve_reader_url(raw: Option<&str>, published: &str) -> Result<String> {
+    match raw {
+        Some(raw) => settings::normalize_remote_url(raw),
+        None => settings::normalize_remote_url(published),
+    }
+}
+
+/// POSIX single-quote escaping so the printed handoff can be pasted verbatim,
+/// even when the value contains a single quote.
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// Read the current pointer when the bucket has one. A clean miss is `None`
+/// (a first publish or an interrupted upload); `publisher.json` is never
+/// consulted here because it does not prove that a pointer committed.
+fn fetch_remote_pointer(
+    source: &dyn remote::RemoteSource,
+    expected_public_key: Option<&str>,
+    pinned_key: Option<&str>,
+) -> Result<Option<remote::RemotePointer>> {
+    let Some(fetched) = source.fetch_pointer_optional()? else {
+        return Ok(None);
+    };
+    let pointer: remote::IndexPointer =
+        serde_json::from_slice(&fetched.bytes).context("parsing the remote index pointer")?;
+    let verify_key = expected_public_key.or(pinned_key).context(
+        "a remote index exists; verifying it needs the full publisher public key \
+         (64 hex, not a short key id) via --expect-key-id or `setup --remote-key`",
+    )?;
+    pointer.verify_signature(verify_key)?;
+    Ok(Some(remote::RemotePointer {
+        pointer,
+        etag: fetched.etag,
+    }))
 }
 
 fn detect_source_commit(explicit: Option<&str>) -> Result<String> {
@@ -350,6 +383,13 @@ fn print_remote_summary(report: &remote::FetchReport) {
     );
 }
 
+/// A missing restore destination is a cold start; anything else that the
+/// no-follow probe refuses stays fatal.
+fn ensure_restore_root(path: &std::path::Path, what: &str) -> Result<()> {
+    let _ = util::probe(path, what)?;
+    Ok(())
+}
+
 pub(super) fn cmd_restore(
     link: settings::LinkPolicy,
     into: Option<&std::path::Path>,
@@ -368,8 +408,9 @@ pub(super) fn cmd_restore(
     let view = into
         .map(std::path::Path::to_path_buf)
         .unwrap_or(root.clone());
-    // ensure view dir is not a symlink/reparse point
-    metadata_nofollow(&view)?;
+    // A missing view or store is a cold start; symlinks, reparse points and
+    // every other inspection failure stay fatal.
+    ensure_restore_root(&view, "restore view")?;
     if into.is_none() && root.is_dir() {
         util::check_private_dir(&root, util::Privacy::Repair)?;
     }
@@ -388,8 +429,7 @@ pub(super) fn cmd_restore(
         );
     }
     let store = vault::store_root(&config::cache_root()?);
-    // ensure store is not a symlink/reparse point
-    metadata_nofollow(&store)?;
+    ensure_restore_root(&store, "restore store")?;
     let packages = std::env::current_dir()
         .ok()
         .and_then(|cwd| lockfile::LockIndex::load(&cwd, None));
@@ -526,4 +566,184 @@ pub(super) fn cmd_restore(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    struct EmptySource;
+
+    impl remote::RemoteSource for EmptySource {
+        fn fetch_pointer(&self) -> Result<Vec<u8>> {
+            anyhow::bail!("no pointer")
+        }
+
+        fn fetch_pointer_optional(&self) -> Result<Option<remote::FetchedPointer>> {
+            Ok(None)
+        }
+
+        fn fetch_body(&self, _sha256: &str, _max_bytes: u64) -> Result<Vec<u8>> {
+            unreachable!("the publisher never fetches an index body here")
+        }
+
+        fn fetch_blob(
+            &self,
+            _sha256: &str,
+            _max_bytes: u64,
+            _out: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            unreachable!("the publisher never fetches blobs here")
+        }
+    }
+
+    fn publish_request<'a>(
+        store: &'a Path,
+        cwd: &'a Path,
+        url: &'a str,
+        state: &'a Path,
+        out: &'a Path,
+    ) -> remote::PublishRequest<'a> {
+        remote::PublishRequest {
+            store_root: store,
+            cwd,
+            url,
+            tier: settings::RemoteTier::Libraries,
+            generation: Some("gen"),
+            profile: None,
+            selector: None,
+            sequence: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: false,
+            valid_for: std::time::Duration::from_secs(3_600),
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            ci_job: "test",
+            notes: "",
+            expect_key_id: None,
+            rotate_key: false,
+            publisher_state: Some(state),
+            out_dir: Some(out),
+            lockfile: None,
+        }
+    }
+
+    fn write_publisher_state(dir: &Path, url: &str, sequence: u64) -> Result<()> {
+        let id = remote::sha256_hex(url.as_bytes());
+        let state = serde_json::json!({
+            "schema": 1,
+            "endpoint": url,
+            "key_id": "ed25519:0123456789abcdef",
+            "sequence": sequence,
+            "pointer_etag": null,
+            "body_sha256": "ab".repeat(32),
+            "updated": 1,
+        });
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(
+            dir.join(format!("publish-{}.json", &id[..16])),
+            serde_json::to_vec(&state)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(
+            shell_quote("https://cache.example/prefix"),
+            "'https://cache.example/prefix'"
+        );
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn reader_url_is_validated_before_staging() {
+        assert_eq!(
+            resolve_reader_url(None, "s3://bucket/prefix").unwrap(),
+            "s3://bucket/prefix"
+        );
+        assert_eq!(
+            resolve_reader_url(Some("https://cache.example/prefix"), "s3://bucket/prefix").unwrap(),
+            "https://cache.example/prefix"
+        );
+        for invalid in [
+            "http://cache.example/prefix",
+            "not a url",
+            "https://user:pass@cache.example/prefix",
+        ] {
+            assert!(
+                resolve_reader_url(Some(invalid), "s3://bucket/prefix").is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_restore_roots_are_cold_starts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        ensure_restore_root(&dir.path().join("missing"), "restore view")?;
+        ensure_restore_root(dir.path(), "restore store")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_restore_root_stays_fatal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target)?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+        assert!(ensure_restore_root(&link, "restore view").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_pointer_is_a_first_publish() -> Result<()> {
+        // A clean miss is `None` so an interrupted first upload (which leaves
+        // `publisher.json` but no `index.json`) retries at sequence 1. Only
+        // `remote::publish` consults the committed publisher state.
+        assert!(fetch_remote_pointer(&EmptySource, None, None)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_state_refuses_a_missing_pointer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = temp.path().join("store");
+        let state = temp.path().join("publisher");
+        let out = temp.path().join("out");
+        let url = "s3://bucket/prefix";
+        write_publisher_state(&state, url, 3)?;
+        let request = publish_request(&store, temp.path(), url, &state, &out);
+        let err = match remote::publish(&request) {
+            Ok(_) => panic!("committed state must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("publisher state records sequence 3"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_state_does_not_refuse_a_restart() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = temp.path().join("store");
+        let state = temp.path().join("publisher");
+        let out = temp.path().join("out");
+        let url = "s3://bucket/prefix";
+        let request = publish_request(&store, temp.path(), url, &state, &out);
+        let err = match remote::publish(&request) {
+            Ok(_) => panic!("no Cargo.lock in the fixture"),
+            Err(err) => err,
+        };
+        let text = format!("{err:#}");
+        assert!(!text.contains("publisher state records"), "{text}");
+        assert!(text.contains("Cargo.lock"), "{text}");
+        Ok(())
+    }
 }

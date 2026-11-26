@@ -6,6 +6,7 @@
 //! terminal.
 
 use anyhow::{Result, ensure};
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::util::validate_component;
@@ -68,9 +69,16 @@ pub(crate) fn decimal(value: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// A relative path with normal components only, bounded in total and per
-/// component.
+/// A relative path with normal, canonical components only, bounded in total
+/// and per component. Repeated separators and `.` components are rejected so
+/// two spellings can never denote one destination.
 pub(crate) fn relative_path(value: &str, what: &str, max_bytes: usize) -> Result<()> {
+    ensure!(
+        !normalized(value)
+            .split('/')
+            .any(|part| part.is_empty() || part == "."),
+        "{what} {value:?} is not a canonical relative path"
+    );
     let path = crate::util::validate_rel(value, what)?;
     ensure!(value.len() <= max_bytes, "{what} exceeds {max_bytes} bytes");
     for component in path.components() {
@@ -85,6 +93,26 @@ pub(crate) fn relative_path(value: &str, what: &str, max_bytes: usize) -> Result
         );
     }
     Ok(())
+}
+
+/// Stable duplicate key for a relative path. Separators fold only on Windows
+/// and case folds as Cargo's destinations are case-insensitive.
+pub(crate) fn relative_key(value: &str) -> String {
+    let mut key = normalized(value)
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    key.make_ascii_lowercase();
+    key
+}
+
+fn normalized(value: &str) -> Cow<'_, str> {
+    if cfg!(windows) {
+        Cow::Owned(value.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 /// A bounded list of non-empty single-line strings.
@@ -134,17 +162,19 @@ pub(crate) use crate::util::is_unsafe_format;
 
 /// Reject URL userinfo unless it is the conventional SSH `git` user. A
 /// registry/git URL is published in the index; credentials must stay in the
-/// Cargo credential provider.
+/// Cargo credential provider. Every URL-like substring is inspected, not just
+/// the first, because notes can carry more than one link.
 pub(crate) fn no_url_credentials(value: &str, what: &str) -> Result<()> {
-    let Some((_, rest)) = value.split_once("://") else {
-        return Ok(());
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    if let Some((userinfo, _)) = authority.rsplit_once('@') {
-        ensure!(
-            userinfo == "git",
-            "{what} must not embed credentials; use the environment/credential provider"
-        );
+    let mut rest = value;
+    while let Some((_, after)) = rest.split_once("://") {
+        let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            ensure!(
+                userinfo == "git",
+                "{what} must not embed credentials; use the environment/credential provider"
+            );
+        }
+        rest = after;
     }
     Ok(())
 }

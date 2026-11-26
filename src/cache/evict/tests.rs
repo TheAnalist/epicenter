@@ -623,8 +623,8 @@ fn store_tier_drops_groups_and_prunes_the_manifest() -> Result<()> {
         "the emptied parity-key store is removed"
     );
     assert!(
-        !store.join(format!(".lock-{parity}")).exists(),
-        "its generation lock is removed too"
+        store.join(format!(".lock-{parity}")).is_file(),
+        "the lock file outlives its generation so a waiting writer cannot lock an unlinked inode"
     );
     assert!(
         build
@@ -642,7 +642,7 @@ fn store_tier_drops_groups_and_prunes_the_manifest() -> Result<()> {
 }
 
 #[test]
-fn generation_selector_deletes_the_parity_dir_and_lock() -> Result<()> {
+fn generation_selector_deletes_the_parity_dir_and_keeps_its_lock() -> Result<()> {
     let (home, build) = harvested_home()?;
     let store = home.path().join("store");
     let parity = crate::vault::parity_key()?;
@@ -661,7 +661,10 @@ fn generation_selector_deletes_the_parity_dir_and_lock() -> Result<()> {
     };
     run(&build, &opts)?;
     assert!(!generation.exists(), "parity-key store deleted");
-    assert!(!lock.exists(), "generation lock deleted");
+    assert!(
+        lock.is_file(),
+        "the lock file survives so waiters cannot race a fresh inode"
+    );
     assert!(crate::vault::generations(&store)?.is_empty());
     Ok(())
 }
@@ -719,7 +722,7 @@ fn generation_evict_refuses_a_read_only_store() -> Result<()> {
 }
 
 #[test]
-fn debris_sweep_removes_orphan_locks_and_empty_generations() -> Result<()> {
+fn debris_sweep_keeps_locks_and_removes_empty_generations() -> Result<()> {
     let (home, _build) = harvested_home()?;
     let store = home.path().join("store");
     let parity = crate::vault::parity_key()?;
@@ -734,7 +737,10 @@ fn debris_sweep_removes_orphan_locks_and_empty_generations() -> Result<()> {
     fs::write(unrelated.join("precious.txt"), b"keep")?;
 
     crate::vault::sweep_store_debris(&store);
-    assert!(!store.join(".lock-9.9.9-deadbeef").exists());
+    assert!(
+        store.join(".lock-9.9.9-deadbeef").is_file(),
+        "lock files are never unlinked"
+    );
     assert!(!store.join("9.9.9-deadbeef").exists());
     assert!(
         unrelated.join("precious.txt").is_file(),
@@ -911,5 +917,152 @@ fn accounting_frees_only_inodes_whose_last_link_goes() -> Result<()> {
     // Only the view's links are removed → `b` is released, not freed.
     let (nominal, freed, released, count) = util::account_files(&[a, b]);
     assert_eq!((nominal, freed, released, count), (300, 100, 200, 2));
+    Ok(())
+}
+
+#[test]
+fn truncated_scan_and_clock_skew_never_select_a_job_dir() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let old = dir.path().join("a-old");
+    fs::write(&old, [0u8; 8])?;
+    let now = std::time::SystemTime::now();
+    let week = std::time::Duration::from_secs(7 * 24 * 3600);
+    let past = now.checked_sub(week * 4).expect("far enough in the past");
+    fs::File::open(&old)?.set_modified(past)?;
+    for i in 0..4 {
+        fs::write(dir.path().join(format!("b{i}")), [0u8; 8])?;
+    }
+
+    let mut budget = crate::util::ScanBudget::with_limit(1, "test");
+    let truncated = tree_stats_with(dir.path(), &mut budget);
+    assert!(truncated.truncated, "one entry must exhaust the budget");
+    assert!(
+        !collectible(truncated.newest, false, truncated.truncated, now, week),
+        "a truncated scan can never authorize collection"
+    );
+
+    let mut budget = crate::util::ScanBudget::with_limit(64, "test");
+    let full = tree_stats_with(dir.path(), &mut budget);
+    assert!(!full.truncated);
+    assert!(full.newest.is_some());
+    assert!(
+        collectible(Some(past), false, false, now, week),
+        "a tree older than the window is collectible"
+    );
+    assert!(
+        !collectible(Some(now), false, false, now, week),
+        "a freshly written tree is not"
+    );
+    let future = now.checked_add(week).expect("future clock");
+    assert!(
+        !collectible(Some(future), false, false, now, week),
+        "a clock error reads as fresh, never as old"
+    );
+    assert!(
+        collectible(None, true, false, now, week),
+        "an empty dir is collectible"
+    );
+    assert!(!collectible(None, false, false, now, week));
+    Ok(())
+}
+
+/// Every path under `root`, sorted — a cheap before/after filesystem snapshot.
+fn snapshot(root: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = crate::util::SafeWalk::new(root)
+        .walk()
+        .flatten()
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn a_future_mtime_reads_as_fresh_and_is_never_collected() -> Result<()> {
+    let home = tier_home()?;
+    let debug = home.path().join("work/future-job/debug");
+    fs::create_dir_all(&debug)?;
+    let artifact = debug.join("libjob.rlib");
+    fs::write(&artifact, [0u8; 64])?;
+    let future = SystemTime::now() + Duration::from_secs(2 * 86_400);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&artifact)?
+        .set_modified(future)?;
+
+    let report = evict_work_dirs(&home.path().join("build"), None, false)?;
+    assert_eq!(
+        (report.scanned, report.eligible, report.young),
+        (1, 0, 1),
+        "a timestamp ahead of the clock is fresh, never old enough"
+    );
+    assert!(artifact.is_file(), "the skewed job is not selected");
+    Ok(())
+}
+
+#[test]
+fn work_dir_dry_run_leaves_the_filesystem_untouched() -> Result<()> {
+    let home = tier_home()?;
+    let job = aged_job(home.path(), "dry-job", 0)?;
+    let before = snapshot(home.path());
+
+    let opts = Options {
+        work_dir: Some("dry-job"),
+        ..no_selectors()
+    };
+    run(&home.path().join("build"), &opts)?;
+
+    assert_eq!(
+        before,
+        snapshot(home.path()),
+        "a dry run must not create lock files or any other artifact"
+    );
+    assert!(job.join("debug/libjob.rlib").is_file());
+    assert!(!home.path().join("work/.lock-dry-job").exists());
+    assert!(!job.join("debug/.cargo-build-lock").exists());
+    Ok(())
+}
+
+#[test]
+fn a_lock_scan_failure_skips_only_that_view() {
+    assert!(
+        view_locks("build", Ok::<_, anyhow::Error>(Some(Vec::new()))).is_some(),
+        "held locks pass through"
+    );
+    assert!(
+        view_locks("busy", Ok(None)).is_none(),
+        "a live build skips that view"
+    );
+    assert!(
+        view_locks("broken", Err(anyhow::anyhow!("read failed"))).is_none(),
+        "a scan error skips the view instead of aborting the loop"
+    );
+}
+
+#[test]
+fn both_links_inside_one_job_count_as_freed() -> Result<()> {
+    let home = tier_home()?;
+    let debug = home.path().join("work/twin-job/debug");
+    fs::create_dir_all(&debug)?;
+    let first = debug.join("a.rlib");
+    let second = debug.join("b.rlib");
+    fs::write(&first, [0u8; 128])?;
+    fs::hard_link(&first, &second)?;
+    let when = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    for path in [&first, &second] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_modified(when)?;
+    }
+
+    let report = evict_work_dirs(&home.path().join("build"), None, false)?;
+    assert_eq!(report.eligible, 1);
+    assert_eq!(
+        report.unique_bytes, 128,
+        "every link of the inode is in the selection, so its bytes are freed"
+    );
+    assert_eq!(report.shared_bytes, 0);
+    assert_eq!(report.nominal_bytes, 256, "two names, one inode");
     Ok(())
 }

@@ -134,10 +134,13 @@ pub fn harvest_with_trust(
         None
     } else {
         ensure_store_root(store_root)?;
+        // Take the generation lock before any generation state exists: the
+        // lock file lives outside the generation dir, so a concurrent
+        // remover can serialize with this writer from the first write on.
+        let lock = FileLock::acquire(&store_lock_path(store_root, &parity))?;
         util::create_private_dir_all(&store_root.join(&parity))?;
         write_marker(&store_root.join(&parity).join(GENERATION_MARKER))?;
         util::create_private_dir_all(&units_dir(store_root, &parity))?;
-        let lock = FileLock::acquire(&store_lock_path(store_root, &parity))?;
         // Self-heal debris from a crashed or failed store run (dot-dirs whose
         // copies may have inherited read-only sources) before planning.
         sweep_staging(&units_dir(store_root, &parity))?;
@@ -321,12 +324,14 @@ pub fn harvest_with_trust(
         pending.push(at);
     }
 
+    let units = units_dir(store_root, &parity);
+    let mut retired: Vec<(PathBuf, PathBuf)> = Vec::new();
     let changed = !pending.is_empty();
     if changed {
-        let store_one = |at: usize| -> Result<Vec<FileEntry>> {
+        let store_one = |at: usize| -> Result<(Vec<FileEntry>, Option<PathBuf>)> {
             let plan = &plans[at];
             let mut entries = Vec::with_capacity(plan.files.len());
-            store_group(
+            let old = store_group(
                 store_root,
                 &parity,
                 &plan.unit.dir_name,
@@ -336,18 +341,49 @@ pub fn harvest_with_trust(
                 &mut entries,
             )
             .with_context(|| format!("storing unit {}", plan.unit.dir_name))?;
-            Ok(entries)
+            Ok((entries, old))
         };
-        let stored: Vec<Result<Vec<FileEntry>>> = match pool {
+        let stored: Vec<Result<(Vec<FileEntry>, Option<PathBuf>)>> = match pool {
             Some(pool) if pending.len() > 1 => {
                 pool.install(|| pending.par_iter().map(|&at| store_one(at)).collect())
             }
             _ => pending.iter().map(|&at| store_one(at)).collect(),
         };
 
-        for (at, entries) in pending.into_iter().zip(stored) {
-            let entries = entries?;
+        // A replacement group is installed next to its retired predecessor,
+        // but the predecessor stays until the manifest that names the new
+        // bytes is durable. Collect every successful swap before looking at
+        // errors, so one failed unit can roll back all of its siblings.
+        let mut ready: Vec<(usize, Vec<FileEntry>, Option<PathBuf>)> =
+            Vec::with_capacity(pending.len());
+        let mut failure: Option<anyhow::Error> = None;
+        for (at, result) in pending.iter().copied().zip(stored) {
+            match result {
+                Ok((entries, old)) => ready.push((at, entries, old)),
+                Err(err) => {
+                    if failure.is_none() {
+                        failure = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = failure {
+            let swaps: Vec<(PathBuf, PathBuf)> = ready
+                .iter()
+                .filter_map(|(at, _, old)| {
+                    old.as_ref()
+                        .map(|old| (units.join(&plans[*at].unit.dir_name), old.clone()))
+                })
+                .collect();
+            rollback_swaps(&units, &swaps);
+            return Err(err);
+        }
+
+        for (at, entries, old) in ready {
             let plan = &plans[at];
+            if let Some(old) = old {
+                retired.push((units.join(&plan.unit.dir_name), old));
+            }
             let entry = UnitEntry {
                 name: plan.unit.dir_name.clone(),
                 profile: plan.unit.profile.clone(),
@@ -379,7 +415,21 @@ pub fn harvest_with_trust(
             (a.profile.as_str(), a.name.as_str()).cmp(&(b.profile.as_str(), b.name.as_str()))
         });
         manifest.updated = now_secs();
-        save_manifest(store_root, &parity, &manifest)?;
+        #[cfg(test)]
+        if FAIL_BEFORE_MANIFEST_SAVE.with(|flag| flag.replace(false)) {
+            rollback_swaps(&units, &retired);
+            anyhow::bail!("injected failure before the manifest was saved");
+        }
+        if let Err(err) = save_manifest(store_root, &parity, &manifest) {
+            // The stored manifest still names the retired groups: put them
+            // back instead of leaving the store pointing at uncommitted bytes.
+            rollback_swaps(&units, &retired);
+            return Err(err);
+        }
+        // The manifest is durable now, so the retired groups are unreachable.
+        for (_, old) in &retired {
+            let _ = util::remove_tree(&units, old);
+        }
     }
     Ok(report)
 }
@@ -426,10 +476,16 @@ fn unit_version(arts: &ArtifactInfo, package: &str) -> Option<String> {
         }
         for component in Path::new(&normalized).components().rev() {
             let name = component.as_os_str().to_string_lossy();
-            let Some((crate_name, version)) = name.rsplit_once('-') else {
+            // The package name may itself contain hyphens and the version may
+            // be a pre-release (`1.0.0-rc.1`), so split at the boundary that
+            // leaves the package whole instead of at the last hyphen.
+            let Some(version) = name
+                .strip_prefix(package)
+                .and_then(|rest| rest.strip_prefix('-'))
+            else {
                 continue;
             };
-            if crate_name == package && looks_like_version(version) {
+            if looks_like_version(version) {
                 return Some(version.to_string());
             }
         }
@@ -680,6 +736,11 @@ fn group_base(files: &[PlannedFile]) -> u64 {
 /// Copy one unit group into its final place: a temporary directory next to
 /// the target, stamped read-only files, then a swap that never leaves the
 /// group half-written under its real name.
+///
+/// The previous group is retired under a private name but not deleted: the
+/// manifest still names its bytes until the caller commits the replacement.
+/// `Ok(Some(old))` hands that retired directory back to the caller, which
+/// removes it only after a durable manifest or restores it on failure.
 fn store_group(
     store_root: &Path,
     parity: &str,
@@ -688,7 +749,7 @@ fn store_group(
     files: &[PlannedFile],
     blobs: Option<&Path>,
     entries: &mut Vec<FileEntry>,
-) -> Result<()> {
+) -> Result<Option<PathBuf>> {
     util::validate_component(name, "unit name")?;
     let units = units_dir(store_root, parity);
     let final_dir = units.join(name);
@@ -704,8 +765,15 @@ fn store_group(
     }
 
     let old = units.join(format!(".{name}.old-{}-{}", std::process::id(), now_secs()));
+    let mut retired = None;
     match util::metadata_nofollow(&final_dir) {
-        Ok(meta) if meta.is_dir() => fs::rename(&final_dir, &old)?,
+        Ok(meta) if meta.is_dir() => match fs::rename(&final_dir, &old) {
+            Ok(()) => retired = Some(old),
+            Err(err) => {
+                let _ = util::remove_tree(&units, &tmp);
+                return Err(err).with_context(|| format!("retiring {}", final_dir.display()));
+            }
+        },
         Ok(_) => {
             let _ = util::remove_tree(&units, &tmp);
             anyhow::bail!("store unit path {} is not a directory", final_dir.display());
@@ -718,13 +786,39 @@ fn store_group(
             );
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).context("inspecting store unit"),
+        Err(err) => {
+            let _ = util::remove_tree(&units, &tmp);
+            return Err(err).context("inspecting store unit");
+        }
     }
-    fs::rename(&tmp, &final_dir)?;
-    if util::metadata_nofollow(&old).is_ok_and(|meta| meta.is_dir()) {
-        let _ = util::remove_tree(&units, &old);
+    if let Err(err) = fs::rename(&tmp, &final_dir) {
+        // Put the retired group back before surfacing: a failed install must
+        // leave the group the manifest names intact.
+        if let Some(old) = &retired {
+            let _ = fs::rename(old, &final_dir);
+        }
+        let _ = util::remove_tree(&units, &tmp);
+        return Err(err).with_context(|| format!("installing {}", final_dir.display()));
     }
-    Ok(())
+    Ok(retired)
+}
+
+/// Restore groups swapped in by a failed store or manifest commit. Best
+/// effort: the caller is already returning an error, and any leftover swap
+/// directory is swept on the next run.
+fn rollback_swaps(units: &Path, swaps: &[(PathBuf, PathBuf)]) {
+    for (final_dir, old) in swaps.iter().rev() {
+        let _ = util::remove_tree(units, final_dir);
+        let _ = fs::rename(old, final_dir);
+    }
+}
+
+// Test-only seam: fail after the unit groups are swapped but before
+// `save_manifest` commits, to prove the store rolls back.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_BEFORE_MANIFEST_SAVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Library outputs bypass gzip (rustc reads them directly at restore time);
@@ -861,7 +955,9 @@ pub(crate) fn ceil_secs(time: SystemTime) -> u64 {
 }
 
 pub(crate) fn set_stamp(path: &Path, stamp: u64) -> Result<()> {
-    let time = UNIX_EPOCH + Duration::from_secs(stamp);
+    let time = UNIX_EPOCH
+        .checked_add(Duration::from_secs(stamp))
+        .with_context(|| format!("stamp {stamp} for {} is out of range", path.display()))?;
     // Unix allows futimens on a read-only fd owned by us; Windows requires a
     // handle with FILE_WRITE_ATTRIBUTES (GENERIC_READ's set_modified is
     // denied). A 0444 store file must still be stampable on Windows.
@@ -932,6 +1028,18 @@ fn is_volatile(name: &str) -> bool {
 /// dir or a shared build dir can still be written by another process between
 /// the check and the copy. The job marker decides which proof applies.
 fn authorize_harvest(build_root: &Path, trust: HarvestTrust<'_>) -> Result<()> {
+    let work_root = crate::exec::work_root(build_root);
+    authorize_harvest_at(build_root, trust, &work_root)
+}
+
+/// The marker decides which proof applies. Inside the work root an absent
+/// marker is tampering, not a shared build dir: `exec` creates every job dir
+/// with one, so a missing marker can only mean a writer removed it.
+pub(crate) fn authorize_harvest_at(
+    build_root: &Path,
+    trust: HarvestTrust<'_>,
+    work_root: &Path,
+) -> Result<()> {
     if let HarvestTrust::Trusted(_) = trust {
         return Ok(());
     }
@@ -943,22 +1051,29 @@ fn authorize_harvest(build_root: &Path, trust: HarvestTrust<'_>) -> Result<()> {
             build_root.display()
         );
     }
-    if let Some(token) = crate::job::job_marker_token(build_root)? {
-        match crate::job::record_covers(build_root, &token)? {
-            crate::job::RecordCoverage::Matching => {}
-            crate::job::RecordCoverage::Absent => anyhow::bail!(
-                "job dir {} has no exec record on this host — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
-                build_root.display()
-            ),
-            crate::job::RecordCoverage::Mismatch => anyhow::bail!(
-                "job dir {} has an exec record for a different build (token or path mismatch) — refusing to sign it",
-                build_root.display()
-            ),
-            crate::job::RecordCoverage::Untrusted => anyhow::bail!(
-                "job dir {} has an exec record this host does not trust (symlink, foreign owner, or permissive mode) — refusing to sign it",
-                build_root.display()
-            ),
-        }
+    let work_root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let token = match crate::job::job_marker_token(build_root)? {
+        Some(token) => token,
+        None if build_root.starts_with(&work_root) => anyhow::bail!(
+            "job dir {} has no job marker — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
+            build_root.display()
+        ),
+        None => return Ok(()),
+    };
+    match crate::job::record_covers(build_root, &token)? {
+        crate::job::RecordCoverage::Matching => {}
+        crate::job::RecordCoverage::Absent => anyhow::bail!(
+            "job dir {} has no exec record on this host — refusing to sign it; harvest it from the `epicenter exec --harvest` run that built it",
+            build_root.display()
+        ),
+        crate::job::RecordCoverage::Mismatch => anyhow::bail!(
+            "job dir {} has an exec record for a different build (token or path mismatch) — refusing to sign it",
+            build_root.display()
+        ),
+        crate::job::RecordCoverage::Untrusted => anyhow::bail!(
+            "job dir {} has an exec record this host does not trust (symlink, foreign owner, or permissive mode) — refusing to sign it",
+            build_root.display()
+        ),
     }
     Ok(())
 }

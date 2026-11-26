@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::util;
 
-use super::generations::stored_units;
+use super::generations::{link_count, stored_units};
 use super::layout::{check_store_trust, ensure_writable_store, generation_names, lock_generation};
 
 struct CompactFile {
@@ -108,9 +108,8 @@ pub fn compact(
             if util::probe(&base, "compact root")?.is_none() {
                 continue;
             }
-            let walker = util::SafeWalk::new(&base).walk();
-            for entry in walker {
-                budget.spend()?;
+            let mut walker = util::SafeWalk::new(&base).walk_with(&mut budget);
+            for entry in walker.by_ref() {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {
@@ -166,6 +165,9 @@ pub fn compact(
                     id,
                     stamp: raw_stamps.get(path).copied(),
                 });
+            }
+            if walker.truncated() {
+                budget.spend()?;
             }
         }
     }
@@ -229,6 +231,12 @@ pub fn compact(
         };
         let canonical_id = util::file_identity(&canonical, &canonical_meta);
         let mut counted = false;
+        // Reclamation is per inode: several duplicate paths may be hard links
+        // of one inode, and replacing them all frees it exactly once.
+        // (len, links, replaced paths) keyed by filesystem identity.
+        let mut reclaimed: std::collections::HashMap<(u64, u64), (u64, u64, usize)> =
+            std::collections::HashMap::new();
+        let mut unident: (usize, u64) = (0, 0);
         for duplicate in paths {
             let dup_meta = match util::metadata_nofollow(&duplicate) {
                 Ok(meta) => meta,
@@ -241,8 +249,8 @@ pub fn compact(
                 report.skipped += 1;
                 continue;
             }
-            if let (Some(canonical_id), Some(dup_id)) =
-                (canonical_id, util::file_identity(&duplicate, &dup_meta))
+            let dup_id = util::file_identity(&duplicate, &dup_meta);
+            if let (Some(canonical_id), Some(dup_id)) = (canonical_id, dup_id)
                 && canonical_id == dup_id
             {
                 report.already_shared += 1;
@@ -260,22 +268,38 @@ pub fn compact(
                 report.groups += 1;
                 counted = true;
             }
-            if dry_run {
-                report.linked += 1;
-                report.bytes_saved = report.bytes_saved.saturating_add(dup_meta.len());
-                continue;
-            }
-            match link_replace(&canonical, &duplicate) {
-                Ok(()) => {
-                    report.linked += 1;
-                    report.bytes_saved = report.bytes_saved.saturating_add(dup_meta.len());
+            if !dry_run {
+                match link_replace(&canonical, &duplicate) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        report.skipped += 1;
+                        eprintln!("  could not compact {}: {err:#}", duplicate.display());
+                        continue;
+                    }
                 }
-                Err(err) => {
-                    report.skipped += 1;
-                    eprintln!("  could not compact {}: {err:#}", duplicate.display());
+            }
+            match dup_id {
+                Some(id) => {
+                    let links = link_count(&duplicate, &dup_meta);
+                    let entry = reclaimed.entry(id).or_insert((dup_meta.len(), links, 0));
+                    entry.2 += 1;
+                }
+                // No stable identity on this platform: treat each path as its
+                // own inode, never crediting one replacement twice.
+                None => {
+                    unident.0 += 1;
+                    unident.1 = unident.1.saturating_add(dup_meta.len());
                 }
             }
         }
+        for (size, links, replaced) in reclaimed.values() {
+            if *replaced as u64 >= *links {
+                report.linked += 1;
+                report.bytes_saved = report.bytes_saved.saturating_add(*size);
+            }
+        }
+        report.linked += unident.0;
+        report.bytes_saved = report.bytes_saved.saturating_add(unident.1);
     }
 
     drop(locks);

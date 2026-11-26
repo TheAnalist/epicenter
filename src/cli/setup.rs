@@ -23,41 +23,36 @@ fn resolve_remote_key_arg(raw: &str) -> Result<String> {
     settings::normalize_remote_publisher_key(key)
 }
 
+/// Restore setup backups without loading the current policy: a malformed
+/// policy lives in the very file this command replaces.
+pub(super) fn cmd_setup_revert(args: &SetupArgs) -> Result<()> {
+    let reports = config::revert_backups(args.dry_run)?;
+    println!(
+        "{}",
+        util::heading(if args.dry_run {
+            "epicenter setup — revert (dry run)"
+        } else {
+            "epicenter setup — revert"
+        })
+    );
+    for report in &reports {
+        println!("  {} {}", label("config"), report.config.display());
+        println!(
+            "  {} {}",
+            label("restore"),
+            util::green(&report.backup.display().to_string())
+        );
+    }
+    if args.dry_run {
+        println!("  {}", util::dim("dry run: nothing restored"));
+    }
+    Ok(())
+}
+
 pub(super) fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Result<()> {
     if args.revert {
-        let reports = config::revert_backups(args.dry_run)?;
-        println!(
-            "{}",
-            util::heading(if args.dry_run {
-                "epicenter setup — revert (dry run)"
-            } else {
-                "epicenter setup — revert"
-            })
-        );
-        for report in &reports {
-            println!("  {} {}", label("config"), report.config.display());
-            println!(
-                "  {} {}",
-                label("restore"),
-                util::green(&report.backup.display().to_string())
-            );
-        }
-        if args.dry_run {
-            println!("  {}", util::dim("dry run: nothing restored"));
-        }
-        return Ok(());
+        return cmd_setup_revert(args);
     }
-
-    let profile_report = if args.write_profile {
-        Some(profile::write_recommended(
-            args.dry_run,
-            args.dev_debug
-                .map(Into::into)
-                .unwrap_or(profile::DevDebug::Full),
-        )?)
-    } else {
-        None
-    };
 
     let preset = args.preset.map(Into::into);
     let linker = args.linker.map(Into::into);
@@ -171,6 +166,20 @@ pub(super) fn cmd_setup(args: &SetupArgs, settings: &settings::Settings) -> Resu
         dry_run: args.dry_run,
     };
     let report = config::setup(&opts, settings)?;
+
+    // The profile is a workspace file, not part of the Cargo config. Write it
+    // only after every option has been validated and the config committed, so
+    // an invalid flag cannot leave Cargo.toml modified.
+    let profile_report = if args.write_profile {
+        Some(profile::write_recommended(
+            args.dry_run,
+            args.dev_debug
+                .map(Into::into)
+                .unwrap_or(profile::DevDebug::Full),
+        )?)
+    } else {
+        None
+    };
 
     println!(
         "{}",
@@ -458,20 +467,29 @@ fn print_profile(profile: &profile::Report, dry_run: bool) {
     } else if let Some(backup) = &profile.backup {
         println!("  {} {}", label("backup"), backup.display());
     }
-    let dev_debug = match profile.dev_debug {
-        profile::DevDebug::Full => "debug=2",
-        profile::DevDebug::Line => "debug=line-tables-only, split-debuginfo=unpacked",
-        profile::DevDebug::None => "debug=false",
-    };
     println!(
         "  {} {}, lto=false, codegen-units=256, incremental=true",
         label("dev"),
-        dev_debug
+        dev_profile_label(profile.dev_debug)
     );
     println!(
         "  {} lto=thin, codegen-units=16, debug=false",
         label("release")
     );
+}
+
+/// The dev profile exactly as `profile::write_recommended` writes it. The
+/// split-debuginfo key is Unix-only, so the summary must not claim it on
+/// Windows.
+pub(super) fn dev_profile_label(dev_debug: profile::DevDebug) -> String {
+    match dev_debug {
+        profile::DevDebug::Full => "debug=2".to_string(),
+        profile::DevDebug::Line if cfg!(unix) => {
+            "debug=line-tables-only, split-debuginfo=unpacked".to_string()
+        }
+        profile::DevDebug::Line => "debug=line-tables-only".to_string(),
+        profile::DevDebug::None => "debug=false".to_string(),
+    }
 }
 
 fn print_policy(policy: &config::PolicyReport) {

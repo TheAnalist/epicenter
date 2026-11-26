@@ -19,7 +19,7 @@ pub use https::HttpsSource;
 pub use s3::{S3Client, S3Sink, S3Source};
 
 use ::url::Url;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -180,12 +180,8 @@ impl Endpoint {
 
 impl HttpsEndpoint {
     pub fn parse(raw: &str) -> Result<Self> {
-        let url = parse_https_url(raw, "remote URL")?;
-        validate_path_prefix(
-            raw_after_scheme(raw, "https://").unwrap_or(""),
-            "remote URL",
-        )?;
-        Ok(Self { base: url })
+        let base = parse_https_endpoint(raw, "remote URL")?;
+        Ok(Self { base })
     }
 
     pub fn url_for(&self, key: &str) -> Result<Url> {
@@ -320,11 +316,7 @@ fn custom_endpoint() -> Result<Option<Url>> {
     let raw = raw
         .into_string()
         .map_err(|_| anyhow::anyhow!("AWS_ENDPOINT_URL_S3 is not valid UTF-8"))?;
-    let url = parse_https_url(&raw, "AWS_ENDPOINT_URL_S3")?;
-    validate_path_prefix(
-        raw_after_scheme(&raw, "https://").unwrap_or(""),
-        "AWS_ENDPOINT_URL_S3",
-    )?;
+    let url = parse_https_endpoint(&raw, "AWS_ENDPOINT_URL_S3")?;
     // The SigV4 canonical URI uses this base path verbatim. Only accept
     // segments that are already in SigV4's canonical form so the signed and
     // sent paths cannot diverge.
@@ -340,16 +332,25 @@ fn custom_endpoint() -> Result<Option<Url>> {
     Ok(Some(url))
 }
 
-fn parse_https_url(raw: &str, what: &str) -> Result<Url> {
+fn parse_https_endpoint(raw: &str, what: &str) -> Result<Url> {
+    // Trim once and validate exactly the string that is parsed: a raw check on
+    // untrimmed input would miss traversal that `Url::parse` then normalizes.
     let trimmed = raw.trim();
+    let url = parse_https_url(trimmed, what)?;
+    let rest = raw_after_scheme(trimmed, "https://")
+        .with_context(|| format!("{what} must use https://"))?;
+    validate_authority(rest, &url, what)?;
+    validate_path_prefix(rest, what)?;
+    validate_parsed_path(&url, what)?;
+    Ok(url)
+}
+
+fn parse_https_url(raw: &str, what: &str) -> Result<Url> {
     ensure!(
-        !trimmed.is_empty()
-            && !trimmed
-                .chars()
-                .any(|ch| ch.is_control() || ch.is_whitespace()),
+        !raw.is_empty() && !raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()),
         "{what} must be a single non-empty URL"
     );
-    let url = Url::parse(trimmed).with_context(|| format!("parsing {what}"))?;
+    let url = Url::parse(raw).with_context(|| format!("parsing {what}"))?;
     ensure!(url.scheme() == "https", "{what} must use https://");
     ensure!(
         url.username().is_empty() && url.password().is_none(),
@@ -361,6 +362,42 @@ fn parse_https_url(raw: &str, what: &str) -> Result<Url> {
     );
     ensure!(url.host_str().is_some(), "{what} is missing a host");
     Ok(url)
+}
+
+/// The authority written in the raw endpoint must resolve to the origin the
+/// parsed URL would send the request to.
+fn validate_authority(rest: &str, url: &Url, what: &str) -> Result<()> {
+    let authority = rest.split('/').next().unwrap_or_default();
+    let probe = Url::parse(&format!("https://{authority}/"))
+        .with_context(|| format!("{what} has an invalid authority"))?;
+    ensure!(
+        probe.origin().ascii_serialization() == url.origin().ascii_serialization(),
+        "{what} authority is inconsistent with the parsed endpoint"
+    );
+    Ok(())
+}
+
+/// Reject traversal that only appears after URL normalization or percent
+/// decoding, so the signed/sent path cannot diverge from the validated one.
+fn validate_parsed_path(url: &Url, what: &str) -> Result<()> {
+    let Some(segments) = url.path_segments() else {
+        bail!("{what} cannot be a base URL");
+    };
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        let lower = segment.to_ascii_lowercase();
+        ensure!(
+            segment != "."
+                && segment != ".."
+                && !lower.contains("%2e")
+                && !lower.contains("%2f")
+                && !lower.contains("%5c"),
+            "{what} path contains traversal after normalization"
+        );
+    }
+    Ok(())
 }
 
 fn raw_after_scheme<'a>(raw: &'a str, scheme: &str) -> Option<&'a str> {
@@ -407,6 +444,9 @@ fn append_key(url: &mut Url, key: &str) -> Result<()> {
     let mut segments = url
         .path_segments_mut()
         .map_err(|_| anyhow::anyhow!("remote URL cannot be a base URL"))?;
+    // A base path ending in `/` has an empty trailing segment; pushing onto it
+    // would produce `//`, so drop that one slash first.
+    segments.pop_if_empty();
     for part in key.split('/') {
         validate_key_segment(part, "remote object key")?;
         segments.push(part);
@@ -648,5 +688,61 @@ mod tests {
         assert!(HttpsEndpoint::parse("https://cache.example/../b").is_err());
         assert!(S3Endpoint::parse("s3://Bad_Bucket/prefix", "us-east-1", None).is_err());
         assert!(S3Endpoint::parse("s3://bucket/a/../b", "us-east-1", None).is_err());
+    }
+
+    #[test]
+    fn trailing_slash_and_bare_prefix_resolve_identically() -> Result<()> {
+        for raw in [
+            "https://cache.example/deps",
+            "https://cache.example/deps/",
+            "  https://cache.example/deps/  ",
+        ] {
+            let endpoint = HttpsEndpoint::parse(raw)?;
+            assert_eq!(
+                endpoint.url_for("index.json")?.as_str(),
+                "https://cache.example/deps/index.json",
+                "endpoint {raw:?}"
+            );
+        }
+        for raw in ["https://cache.example", "https://cache.example/"] {
+            let endpoint = HttpsEndpoint::parse(raw)?;
+            assert_eq!(
+                endpoint.url_for("blobs/abc")?.as_str(),
+                "https://cache.example/blobs/abc",
+                "endpoint {raw:?}"
+            );
+        }
+        for raw in ["s3://bucket/prefix", "s3://bucket/prefix/"] {
+            let endpoint = S3Endpoint::parse(raw, "us-east-1", None)?;
+            assert_eq!(
+                endpoint.url_for("blobs/abc")?.as_str(),
+                "https://bucket.s3.us-east-1.amazonaws.com/prefix/blobs/abc",
+                "endpoint {raw:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_traversal_is_rejected_after_trimming_and_normalization() {
+        for raw in [
+            "https://cache.example/a/../deps",
+            " https://cache.example/a/../deps",
+            "https://cache.example/a/../deps\n",
+            "https://cache.example/%2e%2e/deps",
+            " https://cache.example/%2E%2E/deps",
+            "https://cache.example/a/%2e/deps",
+            "https://cache.example/a%2f..%2fdeps",
+            "https://cache.example/a/..%5c/deps",
+        ] {
+            assert!(HttpsEndpoint::parse(raw).is_err(), "endpoint {raw:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_authority_must_match_the_parsed_origin() {
+        assert!(HttpsEndpoint::parse("https:///deps").is_err());
+        assert!(HttpsEndpoint::parse("https://cache.example@evil.example/deps").is_err());
+        assert!(HttpsEndpoint::parse(" https://CACHE.example/deps/ ").is_ok());
     }
 }

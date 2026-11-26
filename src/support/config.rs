@@ -39,7 +39,11 @@ pub fn trusted_cache_root() -> Result<PathBuf> {
 /// This is the only trusted source for epicenter state. A relative config path,
 /// or a symlinked `config.toml`, is refused.
 pub fn cargo_build_dir() -> Result<Option<String>> {
-    let config_path = cargo_config_path()?;
+    cargo_build_dir_in(&paths::cargo_home()?)
+}
+
+fn cargo_build_dir_in(cargo_home: &Path) -> Result<Option<String>> {
+    let config_path = cargo_config_path_in(cargo_home)?;
     if !config_path.exists() {
         return Ok(None);
     }
@@ -57,10 +61,31 @@ fn validate_config_value(value: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// A TOML key with its optional quoting removed, so `"jobs"` matches `jobs`.
+fn bare_key(candidate: &str) -> &str {
+    let key = candidate.trim();
+    key.strip_prefix('"')
+        .and_then(|key| key.strip_suffix('"'))
+        .or_else(|| {
+            key.strip_prefix('\'')
+                .and_then(|key| key.strip_suffix('\''))
+        })
+        .unwrap_or(key)
+}
+
+fn key_matches(candidate: &str, key: &str) -> bool {
+    bare_key(candidate) == key
+}
+
 /// Cargo's *global* config file: `$CARGO_HOME/config.toml`.
 /// Settings there apply to every project on the machine.
 pub fn cargo_config_path() -> Result<PathBuf> {
-    let cargo_home = paths::cargo_home()?;
+    cargo_config_path_in(&paths::cargo_home()?)
+}
+
+/// Cargo's global config for an explicit home. Setup resolves a previewed home
+/// locally and passes it here instead of installing it process-wide.
+fn cargo_config_path_in(cargo_home: &Path) -> Result<PathBuf> {
     if cargo_home.is_relative() {
         anyhow::bail!(
             "CARGO_HOME is relative ({}) — set an absolute CARGO_HOME",
@@ -72,7 +97,7 @@ pub fn cargo_config_path() -> Result<PathBuf> {
     // any path-only check. Check the directory, then the file; the actual
     // read uses fstat on the opened descriptor (util::read_trusted_config).
     crate::util::check_trusted_path(
-        &cargo_home,
+        cargo_home,
         crate::util::PathKind::Dir,
         crate::util::TrustPolicy::NoForeignWrite,
         "CARGO_HOME",
@@ -154,7 +179,7 @@ fn set_build_key(text: &mut String, key: &str, value: &str, is_bool: bool) -> Ca
                 if t.starts_with('[') && t.ends_with(']') {
                     break;
                 }
-                if t.split_once('=').map_or(false, |(k, _)| k.trim() == key) {
+                if t.split_once('=').is_some_and(|(k, _)| key_matches(k, key)) {
                     if t == wanted {
                         return CargoEdit::AlreadySet;
                     }
@@ -197,7 +222,7 @@ fn remove_build_key(text: &mut String, key: &str) -> CargoEdit {
         if in_build
             && trimmed
                 .split_once('=')
-                .map_or(false, |(candidate, _)| candidate.trim() == key)
+                .map_or(false, |(candidate, _)| key_matches(candidate, key))
         {
             removed = true;
             continue;
@@ -224,17 +249,111 @@ fn is_target_header(line: &str, target: &str) -> bool {
         || compact == format!("[target.'{target}']")
 }
 
-/// Does this `rustflags` value look like a linker setting epicenter manages?
-/// Used to migrate/remove values written by older releases (including the
-/// former `--fast` alias) instead of reporting a false conflict with the
-/// user's own flags.
+/// The triple from a `[target.<triple>]` header (plain or quoted), if any.
+fn target_table_name(line: &str) -> Option<String> {
+    let compact = line.trim().replace([' ', '\t'], "");
+    let rest = compact.strip_prefix("[target.")?.strip_suffix(']')?;
+    Some(rest.trim_matches('"').trim_matches('\'').to_string())
+}
+
+/// Does this `rustflags` value consist solely of flags epicenter wrote?
+///
+/// Ownership is structural, never a substring: the value must parse as a TOML
+/// array of `-C <flag>` pairs and every flag must be one of the shapes this
+/// tool emits. A user array that merely contains `-fuse-ld=lld` next to their
+/// own `target-cpu` is therefore left alone.
 fn is_managed_linker_flags(value: &str) -> bool {
-    let compact = value.replace([' ', '\t'], "");
-    compact.contains("-fuse-ld=lld")
-        || compact.contains("-fuse-ld=wild")
-        || compact.contains("--ld-path=wild")
-        || (compact.contains("linker=")
-            && (compact.contains("rust-lld") || compact.contains("lld-link")))
+    // Callers hand over the bare right-hand side of `rustflags = ...`, which is
+    // an array value, not a document. Wrap it in a one-key table so TOML parses
+    // it, and reject anything that smuggles extra keys into the wrapper.
+    let Ok(toml::Value::Table(mut document)) =
+        format!("rustflags = {value}").parse::<toml::Value>()
+    else {
+        return false;
+    };
+    if document.len() != 1 {
+        return false;
+    }
+    let Some(toml::Value::Array(items)) = document.remove("rustflags") else {
+        return false;
+    };
+    let mut flags = Vec::new();
+    let mut items = items.iter();
+    while let Some(prefix) = items.next() {
+        let Some(flag) = items.next() else {
+            return false;
+        };
+        if prefix.as_str() != Some("-C") {
+            return false;
+        }
+        let Some(flag) = flag.as_str() else {
+            return false;
+        };
+        flags.push(flag);
+    }
+    if flags.is_empty() {
+        return false;
+    }
+    let mut marker = false;
+    for flag in flags {
+        match managed_linker_flag(flag) {
+            Some(is_marker) => marker |= is_marker,
+            None => return false,
+        }
+    }
+    marker
+}
+
+/// Last path component, accepting both separators (config paths are
+/// forward-slashed, but be liberal when reading).
+fn file_name_any(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+}
+
+/// Recognise one flag from an epicenter-managed linker plan. Returns `None`
+/// for a user flag, `Some(false)` for a neutral part (`linker=clang`) and
+/// `Some(true)` for a flag that proves the array came from a managed plan.
+fn managed_linker_flag(flag: &str) -> Option<bool> {
+    const LINKERS: &[&str] = &["lld", "wild", "mold", "gold", "ld.gold", "ld.lld"];
+    if let Some(rest) = flag.strip_prefix("link-arg=-fuse-ld=") {
+        if LINKERS.contains(&rest) || LINKERS.contains(&file_name_any(rest)) {
+            return Some(true);
+        }
+        return None;
+    }
+    if let Some(rest) = flag.strip_prefix("link-arg=--ld-path=") {
+        // Legacy releases wrote the bare name; newer ones write the resolved
+        // path. Only Wild is ours, never an arbitrary user `--ld-path`.
+        if rest == "wild" || matches!(file_name_any(rest), "wild" | "wild.exe") {
+            return Some(true);
+        }
+        return None;
+    }
+    if let Some(dir) = flag.strip_prefix("link-arg=-B") {
+        return dir
+            .trim_end_matches(['/', '\\'])
+            .ends_with("gcc-ld")
+            .then_some(true);
+    }
+    if let Some(linker) = flag.strip_prefix("linker=") {
+        let name = file_name_any(linker);
+        if matches!(
+            name,
+            "rust-lld" | "rust-lld.exe" | "lld-link" | "lld-link.exe" | "wild" | "wild.exe"
+        ) {
+            return Some(true);
+        }
+        // `linker=clang` is only part of a managed plan when another flag
+        // (an ld-path or -fuse-ld) marks it; alone it is the user's choice.
+        return (name == "clang").then_some(false);
+    }
+    if flag == "linker-flavor=wasm-ld" {
+        return Some(true);
+    }
+    None
 }
 
 /// Insert `rustflags = ...` into `[target.<target>]`, preserving every other
@@ -256,7 +375,7 @@ fn set_target_rustflags(
                 break;
             }
             if let Some((key, value)) = trimmed.split_once('=') {
-                if key.trim() == "rustflags" {
+                if key_matches(key, "rustflags") {
                     let value = clean_toml_value(value);
                     if value == literal {
                         return (CargoEdit::AlreadySet, false);
@@ -310,7 +429,7 @@ fn remove_target_rustflags(
         }
         if in_table {
             if let Some((key, value)) = trimmed.split_once('=') {
-                if key.trim() == "rustflags" {
+                if key_matches(key, "rustflags") {
                     let value = clean_toml_value(value);
                     if value == literal
                         || stale.iter().any(|old| value == old.as_str())
@@ -333,6 +452,31 @@ fn remove_target_rustflags(
     } else {
         (CargoEdit::AlreadySet, false)
     }
+}
+
+/// Every target table whose `rustflags` are entirely setup-managed. Used by
+/// `--linker system` so stale flags are found in the file itself, without
+/// probing for Mold/Gold/Wild executables that may already be uninstalled.
+fn managed_targets(text: &str) -> Vec<String> {
+    let mut targets = std::collections::BTreeSet::new();
+    let mut current = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current = target_table_name(trimmed);
+            continue;
+        }
+        let Some(target) = current.as_ref() else {
+            continue;
+        };
+        if let Some((key, value)) = trimmed.split_once('=')
+            && key_matches(key, "rustflags")
+            && is_managed_linker_flags(&clean_toml_value(value))
+        {
+            targets.insert(target.clone());
+        }
+    }
+    targets.into_iter().collect()
 }
 
 /// Enable Cargo incremental compilation in `[build]`. Setup only does this
@@ -395,16 +539,17 @@ pub fn read_table_key(text: &str, table: &str, key: &str) -> Option<String> {
         }
         let candidate = trimmed.split_once('=').map(|(k, _)| k.trim());
         // TOML allows `build.build-dir = ...` at the document root.
-        if at_root && candidate == Some(dotted.as_str()) {
-            if let Some((_, value)) = trimmed.split_once('=') {
-                return Some(clean_toml_value(value));
-            }
+        if at_root
+            && candidate.is_some_and(|candidate| bare_key(candidate) == dotted)
+            && let Some((_, value)) = trimmed.split_once('=')
+        {
+            return Some(clean_toml_value(value));
         }
         if !in_table {
             continue;
         }
         if let Some((candidate, value)) = trimmed.split_once('=') {
-            if candidate.trim() != key {
+            if !key_matches(candidate, key) {
                 continue;
             }
             return Some(clean_toml_value(value));
@@ -571,6 +716,13 @@ pub fn normalize_root_input(raw: &str) -> Result<PathBuf> {
     Ok(cwd.join(path))
 }
 
+/// Expand `{cargo-cache-home}` with an explicit home. Setup resolves the
+/// effective home for the run and must not install it process-wide.
+fn resolve_template_in(value: &str, cargo_home: &Path) -> Result<PathBuf> {
+    let expanded = value.replace("{cargo-cache-home}", &cargo_home.to_string_lossy());
+    paths::resolve_template(&expanded)
+}
+
 /// Apply one setup decision to the **global** Cargo config, and persist the
 /// explicit policy keys in the global epicenter.toml.
 ///
@@ -599,13 +751,6 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
         CargoHomeAction::Clear => (paths::ambient_cargo_home()?, Source::Cli),
         CargoHomeAction::Keep => settings.cargo_home()?,
     };
-    // Make the Cargo config and the default {cargo-cache-home} template use
-    // the effective home even when this function is called directly.
-    match opts.cargo_home {
-        CargoHomeAction::Set(path) => paths::set_cargo_home_override(Some(path.to_path_buf())),
-        CargoHomeAction::Clear => paths::set_cargo_home_override(None),
-        CargoHomeAction::Keep => {}
-    }
     let cores = settings::available_cores();
     let jobs = settings::job_cap(cores, memory);
     let store = settings.store()?.map(|(path, _)| path);
@@ -631,7 +776,7 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
     } else if opts.use_default {
         DEFAULT_BUILD_DIR.to_string()
     } else {
-        cargo_build_dir()?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
+        cargo_build_dir_in(&cargo_home)?.unwrap_or_else(|| DEFAULT_BUILD_DIR.to_string())
     };
     validate_config_value(&build_dir_value, "build-dir")?;
     if let Some(name) = match opts.wrapper {
@@ -642,7 +787,7 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
     }
 
     // The filesystem view must always be RESOLVED (a template is not a path).
-    let root = paths::resolve_template(&build_dir_value)?;
+    let root = resolve_template_in(&build_dir_value, &cargo_home)?;
     let effective_store = store
         .clone()
         .unwrap_or_else(|| crate::paths::store_root(&root));
@@ -676,7 +821,7 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
         crate::util::validate_state_root(&root, "cache root")?;
     }
 
-    let cargo_cfg = cargo_config_path()?;
+    let cargo_cfg = cargo_config_path_in(&cargo_home)?;
     let existed = cargo_cfg.is_file();
     let mut text = if existed {
         crate::util::read_trusted_config(&cargo_cfg, 1024 * 1024)
@@ -730,18 +875,6 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
         || jobs_edit.is_some_and(|edit| edit != CargoEdit::AlreadySet)
         || incremental_edit.is_some_and(|edit| edit != CargoEdit::AlreadySet)
         || linker_edit.is_some_and(|edit| edit != CargoEdit::AlreadySet);
-
-    let mut backup = None;
-    if changed && !opts.dry_run {
-        if let Some(parent) = cargo_cfg.parent() {
-            crate::util::create_private_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        if existed {
-            backup = Some(backup_file(&cargo_cfg)?);
-        }
-        crate::util::write_atomic_private(&cargo_cfg, text.as_bytes())?;
-    }
 
     // Persist only the keys the user explicitly selected. The project file is
     // never written; the global file lives in the OS config directory so it
@@ -831,17 +964,20 @@ pub fn setup(opts: &SetupOptions<'_>, settings: &Settings) -> Result<SetupReport
             }
         }
     }
-    let mut settings_backup = None;
-    if settings_changed && !opts.dry_run {
-        if let Some(parent) = settings_path.parent() {
-            crate::util::create_private_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        if settings_existed {
-            settings_backup = Some(backup_file(&settings_path)?);
-        }
-        crate::util::write_atomic_private(&settings_path, settings_text.as_bytes())?;
-    }
+
+    // Validate both plans before writing either file: a rejected remote policy
+    // must leave the Cargo config exactly as it was.
+    let cargo_plan = (changed && !opts.dry_run).then_some(PendingWrite {
+        path: cargo_cfg.as_path(),
+        existed,
+        text: text.as_str(),
+    });
+    let settings_plan = (settings_changed && !opts.dry_run).then_some(PendingWrite {
+        path: settings_path.as_path(),
+        existed: settings_existed,
+        text: settings_text.as_str(),
+    });
+    let (backup, settings_backup) = commit_plans(cargo_plan, settings_plan)?;
     let policy = PolicyReport {
         preset,
         effective_preset,
@@ -930,38 +1066,14 @@ fn apply_linker(
             ))
         }
         LinkerChoice::System => {
-            let mut binary = PathBuf::new();
-            let mut plans = Vec::new();
-            if let Ok(lld) = crate::fastlink::detect() {
-                binary = lld.linker.clone();
-                plans.extend(lld.plans());
-            }
-            if let Ok(wild) = crate::fastlink::detect_wild() {
-                if binary.as_os_str().is_empty() {
-                    binary = wild.linker.clone();
-                }
-                plans.extend(wild.plans());
-            }
-            if plans.is_empty() {
-                return Ok((None, None));
-            }
-
-            // One `rustflags` key per target: collect every managed literal
-            // for a target, remove the first and pass the rest as stale.
-            let mut grouped: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)> =
-                std::collections::BTreeMap::new();
-            for plan in plans {
-                let entry = grouped.entry(plan.target).or_default();
-                entry.0.push(plan.literal);
-                entry.1.extend(plan.legacy);
-            }
+            // Removal is structural: every `[target.*]` table whose rustflags
+            // are entirely managed is cleared, regardless of which binary (or
+            // whether it still exists) wrote them. This catches stale Mold,
+            // Gold and Wild host flags plus Wild's wasm target.
             let mut targets = Vec::new();
             let mut conflict = false;
-            for (target, (literals, legacy)) in grouped {
-                let mut stale = legacy;
-                stale.extend(literals.iter().skip(1).cloned());
-                let (edit, target_conflict) =
-                    remove_target_rustflags(text, &target, &literals[0], &stale);
+            for target in managed_targets(text) {
+                let (edit, target_conflict) = remove_target_rustflags(text, &target, "", &[]);
                 conflict |= target_conflict;
                 targets.push(LinkerTargetReport {
                     target,
@@ -975,7 +1087,7 @@ fn apply_linker(
             Ok((
                 Some(LinkerSetupReport {
                     choice,
-                    binary,
+                    binary: PathBuf::new(),
                     targets,
                     conflict,
                 }),
@@ -1002,7 +1114,7 @@ fn set_top_key(text: &mut String, key: &str, wanted: &str) -> bool {
             break;
         }
         if let Some((candidate, _)) = trimmed.split_once('=') {
-            if candidate.trim() == key {
+            if key_matches(candidate, key) {
                 found = Some(index);
                 break;
             }
@@ -1034,7 +1146,7 @@ fn remove_top_key(text: &mut String, key: &str) -> bool {
             break;
         }
         if let Some((candidate, _)) = trimmed.split_once('=') {
-            if candidate.trim() == key {
+            if key_matches(candidate, key) {
                 found = Some(index);
                 break;
             }
@@ -1074,6 +1186,40 @@ fn remove_remote_table(text: &mut String) -> Result<bool> {
         *text = doc.to_string();
     }
     Ok(*text != before)
+}
+
+/// One file edit, validated before either setup file is written.
+struct PendingWrite<'a> {
+    path: &'a Path,
+    existed: bool,
+    text: &'a str,
+}
+
+/// Validate both setup plans, then commit the Cargo config and the policy
+/// file. Nothing is written when either plan is not valid TOML.
+fn commit_plans(
+    cargo: Option<PendingWrite<'_>>,
+    settings: Option<PendingWrite<'_>>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    for plan in [cargo.as_ref(), settings.as_ref()].into_iter().flatten() {
+        plan.text
+            .parse::<DocumentMut>()
+            .with_context(|| format!("validating {}", plan.path.display()))?;
+    }
+    Ok((commit_plan(cargo)?, commit_plan(settings)?))
+}
+
+fn commit_plan(plan: Option<PendingWrite<'_>>) -> Result<Option<PathBuf>> {
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    if let Some(parent) = plan.path.parent() {
+        crate::util::create_private_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let backup = plan.existed.then(|| backup_file(plan.path)).transpose()?;
+    crate::util::write_atomic_private(plan.path, plan.text.as_bytes())?;
+    Ok(backup)
 }
 
 /// `<config>.epicenter-bak` (suffix 0).
@@ -1648,5 +1794,171 @@ mod tests {
         assert_eq!(edit, CargoEdit::Removed);
         assert!(!conflict);
         assert!(!src.contains("rustflags"), "{src}");
+    }
+
+    #[test]
+    fn quoted_build_keys_are_updated_and_removed_in_place() {
+        let mut src =
+            "[build]\n\"incremental\" = false\n\"jobs\" = 1\n\"build-dir\" = '/old'\n".to_string();
+        assert_eq!(set_incremental(&mut src, true), CargoEdit::Replaced);
+        assert_eq!(
+            set_build_key(&mut src, "jobs", "8", true),
+            CargoEdit::Replaced
+        );
+        assert_eq!(src.matches("incremental =").count(), 1, "{src}");
+        assert!(!src.contains("\"incremental\""), "{src}");
+        assert_eq!(src.matches("jobs =").count(), 1, "{src}");
+        assert!(!src.contains("\"jobs\""), "{src}");
+        assert_eq!(remove_build_key(&mut src, "build-dir"), CargoEdit::Removed);
+        assert!(!src.contains("build-dir"), "{src}");
+        src.parse::<DocumentMut>().expect("valid toml");
+        assert_eq!(
+            read_build_key("[build]\n\"build-dir\" = '/quoted'\n", "build-dir"),
+            Some("/quoted".to_string())
+        );
+    }
+
+    #[test]
+    fn quoted_policy_keys_are_updated_in_place() {
+        let mut text =
+            "\"preset\" = \"auto\"\n\"linker\" = \"auto\"\n\n[remote]\ntier = \"libraries\"\n"
+                .to_string();
+        assert!(set_top_key(&mut text, "preset", "\"dev\""));
+        assert!(set_top_key(&mut text, "linker", "\"lld\""));
+        assert_eq!(text.matches("preset =").count(), 1, "{text}");
+        assert!(!text.contains("\"preset\""), "{text}");
+        assert_eq!(text.matches("linker =").count(), 1, "{text}");
+        assert!(
+            text.find("preset").unwrap() < text.find("[remote]").unwrap(),
+            "{text}"
+        );
+        text.parse::<DocumentMut>().expect("valid toml");
+
+        assert!(remove_top_key(&mut text, "preset"));
+        assert!(!text.contains("preset ="), "{text}");
+        text.parse::<DocumentMut>().expect("valid toml");
+    }
+
+    #[test]
+    fn custom_rustflags_that_mention_managed_flags_are_kept() {
+        let target = "x86_64-unknown-linux-gnu";
+        let custom = r#"["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]"#;
+        let mut src = format!("[target.{target}]\nrustflags = {custom}\n");
+        let literal = r#"["-C", "link-arg=-fuse-ld=lld"]"#;
+        let (edit, conflict) = set_target_rustflags(&mut src, target, literal, &[]);
+        assert_eq!(edit, CargoEdit::AlreadySet);
+        assert!(conflict);
+        assert!(src.contains("target-cpu=native"), "{src}");
+    }
+
+    #[test]
+    fn managed_linker_ownership_is_structural() {
+        assert!(is_managed_linker_flags(
+            r#"["-C", "link-arg=-fuse-ld=lld"]"#
+        ));
+        assert!(is_managed_linker_flags(
+            r#"["-C", "linker=clang", "-C", "link-arg=-fuse-ld=/usr/bin/mold"]"#
+        ));
+        assert!(is_managed_linker_flags(
+            r#"["-C", "link-arg=--ld-path=/home/u/.cargo/bin/wild"]"#
+        ));
+        assert!(!is_managed_linker_flags(
+            r#"["-C", "link-arg=--ld-path=/usr/bin/mold"]"#
+        ));
+        assert!(!is_managed_linker_flags(
+            r#"["-C", "link-arg=-fuse-ld=lld-next"]"#
+        ));
+        assert!(!is_managed_linker_flags(r#"["-C", "target-cpu=native"]"#));
+    }
+
+    #[test]
+    fn migrates_the_legacy_wild_literal_to_the_resolved_path() {
+        let target = "x86_64-unknown-linux-gnu";
+        let old = r#"["-C", "link-arg=-fuse-ld=wild"]"#;
+        let new = r#"["-C", "link-arg=--ld-path=/home/u/.cargo/bin/wild"]"#;
+        let mut src = format!("[target.{target}]\nrustflags = {old}\n");
+        let (edit, conflict) = set_target_rustflags(&mut src, target, new, &[]);
+        assert_eq!(edit, CargoEdit::Replaced);
+        assert!(!conflict);
+        assert!(src.contains("--ld-path=/home/u/.cargo/bin/wild"), "{src}");
+    }
+
+    #[test]
+    fn system_removes_every_managed_linker_shape_without_probing() {
+        let mut src = "\
+[target.x86_64-unknown-linux-gnu]
+rustflags = [\"-C\", \"linker=clang\", \"-C\", \"link-arg=-fuse-ld=/usr/bin/mold\"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = [\"-C\", \"linker=clang\", \"-C\", \"link-arg=-fuse-ld=/usr/bin/ld.gold\"]
+
+[target.wasm32-unknown-unknown]
+rustflags = [\"-C\", \"linker=/home/u/.cargo/bin/wild\", \"-C\", \"linker-flavor=wasm-ld\"]
+
+[target.thumbv7em-none-eabihf]
+rustflags = [\"-C\", \"target-cpu=cortex-m4\"]
+"
+        .to_string();
+        let (report, edit) = apply_linker(&mut src, LinkerChoice::System).unwrap();
+        assert_eq!(edit, Some(CargoEdit::Removed));
+        let report = report.expect("a system report");
+        assert_eq!(report.targets.len(), 3, "{src}");
+        assert!(!src.contains("mold"), "{src}");
+        assert!(!src.contains("ld.gold"), "{src}");
+        assert!(!src.contains("wasm-ld"), "{src}");
+        assert!(src.contains("target-cpu=cortex-m4"), "{src}");
+        src.parse::<DocumentMut>().expect("valid toml");
+    }
+
+    #[test]
+    fn system_removes_a_resolved_wild_ld_path() {
+        let mut src = "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=--ld-path=/opt/wild/bin/wild\"]\n"
+            .to_string();
+        let (_, edit) = apply_linker(&mut src, LinkerChoice::System).unwrap();
+        assert_eq!(edit, Some(CargoEdit::Removed));
+        assert!(!src.contains("rustflags"), "{src}");
+    }
+
+    #[test]
+    fn invalid_settings_plan_commits_neither_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cargo = dir.path().join("config.toml");
+        let settings = dir.path().join("epicenter.toml");
+        fs::write(&cargo, "[build]\nbuild-dir = '/old'\n")?;
+        fs::write(&settings, "preset = \"auto\"\n")?;
+        let err = commit_plans(
+            Some(PendingWrite {
+                path: &cargo,
+                existed: true,
+                text: "[build]\nbuild-dir = '/new'\n",
+            }),
+            Some(PendingWrite {
+                path: &settings,
+                existed: true,
+                text: "preset = \"dev\n",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("validating"), "{err}");
+        assert_eq!(fs::read_to_string(&cargo)?, "[build]\nbuild-dir = '/old'\n");
+        assert_eq!(fs::read_to_string(&settings)?, "preset = \"auto\"\n");
+        assert_eq!(backups(&cargo)?.len(), 0, "no backup before validation");
+        Ok(())
+    }
+
+    #[test]
+    fn preview_cargo_home_is_not_installed_process_wide() -> Result<()> {
+        let before = paths::cargo_home()?;
+        let home = tempfile::tempdir()?;
+        assert_eq!(
+            cargo_config_path_in(home.path())?,
+            home.path().join("config.toml")
+        );
+        assert_eq!(
+            resolve_template_in("{cargo-cache-home}/epicenter/build", home.path())?,
+            home.path().join("epicenter").join("build")
+        );
+        assert_eq!(paths::cargo_home()?, before, "the preview leaked");
+        Ok(())
     }
 }

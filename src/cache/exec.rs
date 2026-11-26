@@ -135,8 +135,8 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
             newest: None,
         };
         let job_dir = entry.path();
-        for file in util::SafeWalk::new(&job_dir).walk().flatten() {
-            budget.spend()?;
+        let mut walk = util::SafeWalk::new(&job_dir).walk_with(&mut budget);
+        for file in walk.by_ref().flatten() {
             if !file.file_type().is_file() {
                 continue;
             }
@@ -149,6 +149,9 @@ pub fn work_tier(build_root: &Path) -> Result<WorkTier> {
                     }
                 }
             }
+        }
+        if walk.truncated() {
+            budget.spend()?;
         }
         tier.dirs = tier.dirs.saturating_add(1);
         tier.files = tier.files.saturating_add(info.files);
@@ -195,6 +198,83 @@ pub(crate) fn remove_job_lock(work_root: &Path, job_id: &str) {
     };
     if !dir.exists() {
         let _ = fs::remove_file(&path);
+    }
+}
+
+/// Owns a job's locks and, with `--rm`, removes its dir on every exit after
+/// the job takes ownership — including early errors that never reach the
+/// command (a missing program, a failed harvest, a failed restore).
+///
+/// The record is deleted while the per-job lock is still held, so a successor
+/// that takes the same id cannot have its fresh record deleted by this run.
+/// Cargo's sentinel locks are released first: on Windows an open lock file
+/// under the job dir would otherwise block the removal.
+struct JobCleanup<'a> {
+    work_root: &'a Path,
+    job_id: &'a str,
+    work_dir: PathBuf,
+    /// The command was asked to run with `--rm` and has not finished cleanup.
+    armed: bool,
+    removed: bool,
+    job_lock: Option<crate::util::FileLock>,
+    cargo_locks: Option<Vec<fs::File>>,
+}
+
+impl<'a> JobCleanup<'a> {
+    fn new(
+        work_root: &'a Path,
+        job_id: &'a str,
+        work_dir: PathBuf,
+        remove: bool,
+        job_lock: crate::util::FileLock,
+        cargo_locks: Option<Vec<fs::File>>,
+    ) -> Self {
+        Self {
+            work_root,
+            job_id,
+            work_dir,
+            armed: remove,
+            removed: false,
+            job_lock: Some(job_lock),
+            cargo_locks,
+        }
+    }
+
+    /// Release the Cargo sentinel locks so the child's own Cargo can proceed.
+    fn release_cargo_locks(&mut self) {
+        self.cargo_locks.take();
+    }
+
+    /// Remove at the normal end of a job. Disarms the exit cleanup, so a
+    /// removal error here is reported once and never retried on unwind.
+    fn remove_now(&mut self) -> Result<()> {
+        self.armed = false;
+        util::remove_tree(self.work_root, &self.work_dir)?;
+        remove_record(self.work_root, self.job_id);
+        self.removed = true;
+        Ok(())
+    }
+
+    fn removed(&self) -> bool {
+        self.removed
+    }
+}
+
+impl Drop for JobCleanup<'_> {
+    fn drop(&mut self) {
+        self.cargo_locks.take();
+        if self.armed {
+            // Best effort: the original error is what the caller reports.
+            if util::remove_tree(self.work_root, &self.work_dir).is_ok() {
+                remove_record(self.work_root, self.job_id);
+                self.removed = true;
+            }
+        }
+        self.job_lock.take();
+        if self.removed {
+            remove_job_lock(self.work_root, self.job_id);
+            sweep_job_locks(self.work_root);
+        }
     }
 }
 
@@ -314,8 +394,9 @@ struct ChildCargo {
 }
 
 /// `+toolchain`, version, profile and target of a cargo child. A non-cargo
-/// program returns the default (empty) value.
-fn child_cargo(command: &[String]) -> ChildCargo {
+/// program returns the default (empty) value. The probe runs in the child's
+/// working directory so a per-directory toolchain override is honored.
+fn child_cargo(command: &[String], cwd: Option<&Path>) -> ChildCargo {
     let Some(program) = command.first() else {
         return ChildCargo::default();
     };
@@ -351,6 +432,9 @@ fn child_cargo(command: &[String]) -> ChildCargo {
     };
     if let Some(selector) = &selector {
         probe.arg(format!("+{selector}"));
+    }
+    if let Some(dir) = cwd {
+        probe.current_dir(dir);
     }
     let version = probe
         .arg("--version")
@@ -597,9 +681,18 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     } else {
         create_job_dir(&work_dir)?
     };
+    let source_dir = project_dir(opts);
     let target_dir = opts
         .target_dir
-        .map(|raw| resolve_target_dir(raw, &work_dir, opts.cwd.as_deref()));
+        .map(|raw| resolve_target_dir(raw, &work_dir, source_dir.as_deref()));
+    let mut cleanup = JobCleanup::new(
+        work_root,
+        &job_id,
+        work_dir.clone(),
+        opts.remove_on_success,
+        job_lock,
+        reuse_locks,
+    );
 
     eprintln!(
         "{}",
@@ -628,7 +721,6 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     // project resolves to: restoring all of it puts every other project's
     // units in the job dir (214 fingerprints for a one-dependency project).
     // A missing or unreadable lock keeps the whole-generation seed.
-    let source_dir = project_dir(opts);
     let packages = source_dir.as_deref().and_then(|cwd| {
         crate::lockfile::LockIndex::load(
             cwd,
@@ -645,7 +737,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     // The child may select another toolchain (`cargo +nightly`), and Cargo
     // 1.99-nightly+ writes the new build-dir layout. Both decide which vault
     // generation/layout can actually be reused.
-    let child = child_cargo(opts.command);
+    let child = child_cargo(opts.command, source_dir.as_deref());
     let selector = child.selector.clone();
     let cargo_version = child.version.clone();
     let layout = cargo_version
@@ -831,7 +923,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             util::dim("  (CARGO_TARGET_DIR — finals live and die with this job)")
         );
     }
-    drop(reuse_locks);
+    cleanup.release_cargo_locks();
     eprintln!("{}", util::dim("  ── command ──"));
     let _ = std::io::stderr().flush();
 
@@ -851,16 +943,24 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     if let Some(dir) = &opts.cwd {
         child.current_dir(dir);
     }
+    // The baseline is sampled before spawn: a later, larger `ru_maxrss` is
+    // then this job's peak rather than a cumulative maximum.
+    let memory = ChildMemory::before_spawn();
     let mut child = child
         .spawn()
         .with_context(|| format!("cannot run `{program}` — is it installed and on PATH?"))?;
-    let memory = ChildMemory::start(&child);
+    let memory = memory.attach(&child);
     let status = child
         .wait()
         .with_context(|| format!("cannot run `{program}` — is it installed and on PATH?"))?;
     let elapsed = started.elapsed();
     let code = exit_code(&status);
-    memory.record_build(opts.command, elapsed);
+    if let Some(Err(err)) = memory.record_build(opts.command, elapsed) {
+        eprintln!(
+            "  {} could not record the last build: {err:#}",
+            util::warn(util::GLYPH_WARN)
+        );
+    }
     record.finished = unix_now();
     record.exit_code = code;
     // The pre-spawn record is already valid; a failed update only loses the
@@ -885,12 +985,10 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     } else {
         None
     };
-    let mut removed = false;
     let mut remove_error = None;
     if opts.remove_on_success {
-        match util::remove_tree(work_root, &work_dir) {
-            Ok(()) => removed = true,
-            Err(err) => remove_error = Some(err),
+        if let Err(err) = cleanup.remove_now() {
+            remove_error = Some(err);
         }
     }
 
@@ -917,7 +1015,7 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             eprintln!("  {} {line}", util::dim(&format!("{:<11}", "harvest")));
         }
     }
-    if removed {
+    if cleanup.removed() {
         eprintln!(
             "  {} {} (--rm)",
             util::dim(&format!("{:<11}", "work dir")),
@@ -937,34 +1035,59 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             util::dim("(kept — pass --rm to remove)")
         );
     }
-    // The job dir is gone: drop its outside lock and clear old lock debris.
-    // A kept dir keeps its lock (the next `--reuse` takes the same file).
-    drop(job_lock);
-    if removed {
-        remove_job_lock(work_root, &job_id);
-        remove_record(work_root, &job_id);
-        sweep_job_locks(work_root);
-    }
     Ok(code)
 }
 
 /// Samples the resident set of a child's whole process tree while it runs.
 ///
-/// Unix gets this after the fact from `RUSAGE_CHILDREN`. Windows has no
+/// Unix gets this after the fact from `RUSAGE_CHILDREN`, which is a running
+/// maximum over every child the process has waited for. Windows has no
 /// equivalent: once the child is reaped its memory counters are gone, so the
 /// tree has to be observed while it is alive. The child is placed in a Job
 /// object; the sampler then asks that job for its own member PIDs, never the
-/// machine's process list. Start it immediately after `spawn`, keep it alive
-/// across `wait`, then call [`finish`](Self::finish).
+/// machine's process list. Capture the baseline with [`before_spawn`]
+/// (Self::before_spawn), spawn, [`attach`](Self::attach), keep it alive across
+/// `wait`, then call [`finish`](Self::finish).
 pub struct ChildMemory {
     #[cfg(windows)]
     sampler: Option<win_rss::Sampler>,
+    /// `RUSAGE_CHILDREN` peak before this job spawned its child.
+    #[cfg(unix)]
+    baseline: Option<u64>,
 }
 
 impl ChildMemory {
-    pub fn start(child: &std::process::Child) -> Self {
+    /// Sample the pre-spawn baseline, so a later increase is attributable to
+    /// this job rather than to an earlier probe.
+    pub fn before_spawn() -> Self {
         #[cfg(windows)]
         {
+            Self { sampler: None }
+        }
+        #[cfg(unix)]
+        {
+            Self {
+                baseline: unix_peak_rss(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
+        }
+    }
+
+    /// Start observing an already-spawned child. Used where the caller cannot
+    /// sample before spawn; prefer [`before_spawn`](Self::before_spawn) then
+    /// [`attach`](Self::attach).
+    pub fn start(child: &std::process::Child) -> Self {
+        Self::before_spawn().attach(child)
+    }
+
+    /// Attach to the spawned child: the Windows sampler is created here.
+    pub fn attach(self, child: &std::process::Child) -> Self {
+        #[cfg(windows)]
+        {
+            let _ = self;
             Self {
                 sampler: win_rss::Sampler::start(child.id()),
             }
@@ -972,7 +1095,7 @@ impl ChildMemory {
         #[cfg(not(windows))]
         {
             let _ = child;
-            Self {}
+            self
         }
     }
 
@@ -988,7 +1111,7 @@ impl ChildMemory {
         }
         #[cfg(unix)]
         {
-            Ok(unix_peak_rss())
+            Ok(per_build_peak(self.baseline))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -997,8 +1120,9 @@ impl ChildMemory {
     }
 
     /// Record the last job's wall time and peak child RSS for `doctor`.
-    /// `None` means the state file could not be written; a missing peak is
-    /// stored as JSON `null` rather than a misleading zero.
+    /// `None` means there is no state dir to write; `Some(Err)` means the
+    /// stats should have been written but could not. A missing peak is stored
+    /// as JSON `null` rather than a misleading zero.
     pub fn record_build(
         self,
         command: &[String],
@@ -1015,8 +1139,8 @@ impl ChildMemory {
             }
         };
         let state = crate::paths::state_dir().ok()?;
-        if crate::util::create_private_dir_all(&state).is_err() {
-            return None;
+        if let Err(err) = crate::util::create_private_dir_all(&state) {
+            return Some(Err(err).context("creating the state dir for last-build stats"));
         }
         let path = state.join("last-build.json");
         let payload = serde_json::json!({
@@ -1028,11 +1152,14 @@ impl ChildMemory {
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
         });
-        if let Ok(text) = serde_json::to_string(&payload) {
-            let _ = crate::util::write_atomic_private(&path, text.as_bytes());
-        }
-
-        Some(Ok(()))
+        let text = match serde_json::to_string(&payload) {
+            Ok(text) => text,
+            Err(err) => return Some(Err(err).context("serializing last-build stats")),
+        };
+        Some(
+            crate::util::write_atomic_private(&path, text.as_bytes())
+                .context("writing last-build stats"),
+        )
     }
 }
 
@@ -1084,7 +1211,9 @@ mod win_rss {
     unsafe impl Send for Job {}
 
     impl Job {
-        fn create(process_id: u32) -> Option<Self> {
+        /// A configured job object with no members yet, so it can exist before
+        /// the child is spawned.
+        fn create() -> Option<Self> {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
                 return None;
@@ -1103,17 +1232,20 @@ mod win_rss {
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 )
             } != 0;
-            if !configured {
-                return None;
-            }
+            configured.then_some(job)
+        }
+
+        /// Put an already-spawned process (and so its later descendants) in the
+        /// job.
+        fn assign(&self, process_id: u32) -> bool {
             let process =
                 unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, process_id) };
             if process.is_null() {
-                return None;
+                return false;
             }
-            let assigned = unsafe { AssignProcessToJobObject(job.0, process) } != 0;
+            let assigned = unsafe { AssignProcessToJobObject(self.0, process) } != 0;
             unsafe { CloseHandle(process) };
-            assigned.then_some(job)
+            assigned
         }
     }
 
@@ -1131,7 +1263,10 @@ mod win_rss {
 
     impl Sampler {
         pub fn start(root_pid: u32) -> Option<Self> {
-            let job = Job::create(root_pid)?;
+            let job = Job::create()?;
+            if !job.assign(root_pid) {
+                return None;
+            }
             let (stop, stopped) = mpsc::channel();
             let worker = thread::Builder::new()
                 .name("epicenter-rss".into())
@@ -1239,6 +1374,17 @@ fn unix_peak_rss() -> Option<u64> {
     } else {
         usage.ru_maxrss as u64 * 1024
     })
+}
+
+/// This job's peak, attributed from the running maximum that
+/// `RUSAGE_CHILDREN` keeps. A value above the pre-spawn baseline is the new
+/// maximum and therefore this job's peak; an unchanged value means the job
+/// stayed below an earlier child (the `cargo --version` probe), so the peak is
+/// unknown rather than the earlier, misleading number.
+#[cfg(unix)]
+fn per_build_peak(baseline: Option<u64>) -> Option<u64> {
+    let after = unix_peak_rss()?;
+    (after > baseline?).then_some(after)
 }
 
 /// Signals use the shell convention: 128 + signal number.

@@ -7,7 +7,7 @@
 //! pruning is safe by design.
 //!
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::fs;
 use std::fs::Metadata;
@@ -167,6 +167,29 @@ fn anchor_for(root: &Path, path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Is this path incremental state? Only the `incremental` directory under a
+/// profile and the `incremental.*` wrapper families qualify. A package or
+/// build directory whose *name* merely starts with `incremental` is ordinary
+/// output, so stop at the same keywords `artifact_key` classifies first.
+fn is_incremental_path(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = rel.components();
+    // The first component is the profile: state lives below it.
+    components.next();
+    for component in components {
+        let name = component.as_os_str().to_string_lossy();
+        if name == "incremental" || name.starts_with("incremental.") {
+            return true;
+        }
+        if matches!(name.as_ref(), "build" | ".fingerprint" | "deps") {
+            return false;
+        }
+    }
+    false
+}
+
 /// Walk `root` and group every file into units.
 pub fn scan(root: &Path) -> Result<BTreeMap<String, Group>> {
     scan_with(root, "prune", |_, _| {})
@@ -181,9 +204,8 @@ pub(crate) fn scan_with(
 ) -> Result<BTreeMap<String, Group>> {
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
     let mut budget = util::ScanBudget::new(budget_name);
-    let walker = util::SafeWalk::new(root).walk();
-    for entry in walker {
-        budget.spend()?;
+    let mut walk = util::SafeWalk::new(root).walk_with(&mut budget);
+    for entry in walk.by_ref() {
         // Unreadable entries are skipped rather than failing the whole scan.
         let entry = match entry {
             Ok(e) => e,
@@ -201,12 +223,7 @@ pub(crate) fn scan_with(
         let Some(key) = artifact_key(root, entry.path()) else {
             continue;
         };
-        let incremental = entry.path().components().any(|component| {
-            component
-                .as_os_str()
-                .to_string_lossy()
-                .starts_with("incremental")
-        });
+        let incremental = is_incremental_path(root, entry.path());
         let kind = if incremental {
             "incremental"
         } else if entry
@@ -241,6 +258,9 @@ pub(crate) fn scan_with(
                 group.newest = Some(mtime);
             }
         }
+    }
+    if walk.truncated() {
+        budget.spend()?;
     }
     for group in groups.values_mut() {
         group.anchor = group.files.iter().find_map(|f| anchor_for(root, f));
@@ -280,6 +300,81 @@ fn package_key(key: &str) -> &str {
         .unwrap_or(key)
 }
 
+/// One pre-deletion observation of a file that a removal will touch.
+struct ObservedFile {
+    path: PathBuf,
+    size: u64,
+    links: u64,
+    identity: Option<(u64, u64)>,
+}
+
+fn observed_file(path: &Path) -> Option<ObservedFile> {
+    let meta = util::metadata_nofollow(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(ObservedFile {
+        path: path.to_path_buf(),
+        size: meta.len(),
+        links: crate::vault::link_count(path, &meta),
+        identity: crate::util::file_identity(path, &meta),
+    })
+}
+
+/// Every regular file removing this group touches: its classified files plus
+/// the whole anchor tree, which also removes entries the scan skipped (a
+/// nested lock file, an unreadable artifact).
+fn removal_paths(group: &Group) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(anchor) = &group.anchor {
+        let mut budget = util::ScanBudget::new("removal tree");
+        let mut walk = util::SafeWalk::new(anchor).walk_with(&mut budget);
+        if let Ok(entries) = walk.by_ref().collect::<Result<Vec<_>, _>>() {
+            for entry in entries {
+                if util::metadata_nofollow(entry.path()).is_ok_and(|meta| meta.is_file()) {
+                    paths.push(entry.into_path());
+                }
+            }
+        }
+    }
+    paths.extend(group.files.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Bytes actually reclaimed by removing `observed`: a file frees its bytes
+/// only when every link it had is gone, and an inode is counted once.
+fn account_removed(observed: &[ObservedFile]) -> (u64, u64, u64) {
+    let mut per_inode: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+    let mut unknown_freed = 0u64;
+    let mut freed_count = 0u64;
+    for file in observed {
+        // A path that survived a failed removal is not reclaimed.
+        if file.path.symlink_metadata().is_ok() {
+            continue;
+        }
+        freed_count = freed_count.saturating_add(1);
+        match file.identity {
+            Some(inode) => {
+                let entry = per_inode.entry(inode).or_insert((file.size, file.links, 0));
+                entry.0 = entry.0.max(file.size);
+                entry.2 = entry.2.saturating_add(1);
+            }
+            None => unknown_freed = unknown_freed.saturating_add(file.size),
+        }
+    }
+    let mut nominal = unknown_freed;
+    let mut freed = unknown_freed;
+    for (size, links, removed) in per_inode.values() {
+        nominal = nominal.saturating_add(*size);
+        if *removed >= *links {
+            freed = freed.saturating_add(*size);
+        }
+    }
+    (freed_count, freed, nominal.saturating_sub(freed))
+}
+
 /// The garbage collector.
 pub fn prune_with(
     root: &Path,
@@ -289,8 +384,8 @@ pub fn prune_with(
 ) -> Result<PruneReport> {
     // Hold Cargo's build locks through the whole scan/delete. A check that
     // drops them lets a build start before the removals and lose artifacts.
-    let _build_locks = if delete {
-        match crate::job::cargo_locks(root)? {
+    let mut build_locks = if delete {
+        match crate::job::cargo_lock_set(root)? {
             Some(locks) => Some(locks),
             None => anyhow::bail!(
                 "build dir {} is in use by a live build — prune skipped",
@@ -301,6 +396,16 @@ pub fn prune_with(
         None
     };
     let groups = scan(root)?;
+    // A profile can appear while the scan runs. Discover it now and hold its
+    // lock too, before any deletion, so a build starting there is fenced.
+    if let Some(locks) = build_locks.as_mut()
+        && !locks.refresh(root)?
+    {
+        anyhow::bail!(
+            "build dir {} is in use by a live build — prune skipped",
+            root.display()
+        );
+    }
     let mut report = PruneReport::default();
     let mut selected = Vec::new();
     let mut candidates: Vec<Group> = groups
@@ -337,20 +442,39 @@ pub fn prune_with(
         }
     }
 
-    // Count every selected path before deleting so dry-runs report the same
-    // numbers. Hard links outside the selection keep their bytes.
+    if opts.incremental {
+        // A unit key can be shared by incremental state and an ordinary deps
+        // artifact. Prune only the incremental paths and never the compiled
+        // build output that happens to share the key.
+        selected.retain_mut(|group| {
+            group.files.retain(|file| is_incremental_path(root, file));
+            group.anchor = group.files.iter().find_map(|file| anchor_for(root, file));
+            !group.files.is_empty()
+        });
+    }
+
     report.removed_groups = selected.len() as u64;
-    let files: Vec<PathBuf> = selected
-        .iter()
-        .flat_map(|group| group.files.iter().cloned())
-        .collect();
-    let (_, freed, released, count) = crate::util::account_files(&files);
-    report.files_freed = count;
-    report.bytes_freed = freed;
-    report.bytes_released = released;
+    // The anchor delete removes the whole tree, including entries the scan
+    // skipped (a nested lock file), so account those paths too.
+    let mut targets = Vec::new();
+    for group in &selected {
+        targets.extend(removal_paths(group));
+    }
+    targets.sort();
+    targets.dedup();
+
     if !delete {
+        let (_, freed, released, count) = crate::util::account_files(&targets);
+        report.files_freed = count;
+        report.bytes_freed = freed;
+        report.bytes_released = released;
         return Ok(report);
     }
+
+    let observed: Vec<ObservedFile> = targets
+        .iter()
+        .filter_map(|path| observed_file(path))
+        .collect();
 
     for group in selected {
         match &group.anchor {
@@ -381,6 +505,12 @@ pub fn prune_with(
             }
         }
     }
+    // Report what the filesystem actually let go, not what the selection
+    // planned: a failed removal or a file that vanished keeps its bytes.
+    let (count, freed, released) = account_removed(&observed);
+    report.files_freed = count;
+    report.bytes_freed = freed;
+    report.bytes_released = released;
     Ok(report)
 }
 
@@ -669,6 +799,92 @@ mod tests {
         assert_eq!(report.bytes_freed, 9);
         assert!(!deps.join("libx-abc.rlib").exists());
         assert!(!fingerprint.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_prune_ignores_names_that_merely_start_with_incremental() -> Result<()> {
+        let base = tempfile::tempdir()?;
+        // The cache root and a build package both carry an `incremental*` name;
+        // neither is incremental state.
+        let root = base.path().join("incremental-cache");
+        let deps = root.join("debug/deps");
+        let build = root.join("debug/build/incremental-tool/9709d57b46b8d526/out");
+        fs::create_dir_all(&deps)?;
+        fs::create_dir_all(&build)?;
+        let dep = deps.join("libdemo-aaaaaaaaaaaaaaaa.rlib");
+        let output = build.join("libincremental_tool-9709d57b46b8d526.rlib");
+        fs::write(&dep, b"compiled")?;
+        fs::write(&output, b"output")?;
+
+        let report = prune_with(
+            &root,
+            SystemTime::now(),
+            true,
+            &Options {
+                keep_latest: Some(0),
+                incremental: true,
+            },
+        )?;
+        assert_eq!(report.removed_groups, 0);
+        assert_eq!(report.errors, 0);
+        assert_eq!(fs::read(&dep)?, b"compiled");
+        assert_eq!(fs::read(&output)?, b"output");
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_prune_keeps_output_sharing_a_unit_key() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let deps = root.path().join("debug/deps");
+        let state = root.path().join("debug/incremental/demo-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&deps)?;
+        fs::create_dir_all(&state)?;
+        let artifact = deps.join("libdemo-aaaaaaaaaaaaaaaa.rlib");
+        fs::write(&artifact, b"compiled")?;
+        fs::write(state.join("session.bin"), b"scratch")?;
+
+        let report = prune_with(
+            root.path(),
+            SystemTime::now(),
+            true,
+            &Options {
+                keep_latest: Some(0),
+                incremental: true,
+            },
+        )?;
+        assert_eq!(report.removed_groups, 1);
+        assert_eq!(report.errors, 0);
+        assert!(!state.exists(), "incremental state is reclaimed");
+        assert_eq!(
+            fs::read(&artifact)?,
+            b"compiled",
+            "compiled output shares the key but must survive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prune_reports_the_anchor_tree_it_actually_removed() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = root.path().join("debug/incremental/demo-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&state)?;
+        fs::write(state.join("session.bin"), [0u8; 3])?;
+        // A nested lock is not classifiable, so a plan of the classified files
+        // alone misses it; deleting the anchor tree still reclaims its bytes.
+        fs::write(state.join(".cargo-lock"), [0u8; 4])?;
+
+        let cutoff = SystemTime::now() + std::time::Duration::from_secs(3_600);
+        let dry = prune(root.path(), cutoff, false)?;
+        assert_eq!(dry.files_freed, 2);
+        assert_eq!(dry.bytes_freed, 7);
+
+        let report = prune(root.path(), cutoff, true)?;
+        assert_eq!(report.removed_groups, 1);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.files_freed, 2);
+        assert_eq!(report.bytes_freed, 7);
+        assert!(!state.exists());
         Ok(())
     }
 }

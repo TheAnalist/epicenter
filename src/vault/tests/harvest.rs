@@ -637,6 +637,18 @@ fn harvest_stamps_groups_by_the_metadata_output() -> Result<()> {
 }
 
 #[test]
+fn harvest_refuses_a_stamp_that_overflows_the_clock() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("dep-lib-x");
+    fs::write(&file, b"x")?;
+
+    let err = set_stamp(&file, u64::MAX).unwrap_err();
+    assert!(format!("{err:#}").contains("out of range"), "{err:#}");
+    assert_eq!(fs::read(&file)?, b"x");
+    Ok(())
+}
+
+#[test]
 fn harvest_stores_read_only_sources() -> Result<()> {
     let build = tempfile::tempdir()?;
     let store = tempfile::tempdir()?;
@@ -916,6 +928,25 @@ fn harvest_accepts_a_job_dir_with_an_exec_record() -> Result<()> {
 }
 
 #[test]
+fn harvest_takes_the_generation_lock_before_creating_state() -> Result<()> {
+    let build = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    synthetic_build_dir(build.path())?;
+    let parity = parity_key()?;
+    // A directory where the lock file belongs cannot be opened as a lock, so
+    // the write path stops at the lock instead of creating the generation.
+    fs::create_dir(store.path().join(format!(".lock-{parity}")))?;
+
+    let err = harvest(build.path(), store.path(), Some("102a33f0"), false).unwrap_err();
+    assert!(format!("{err:#}").contains("lock"), "{err:#}");
+    assert!(
+        !store.path().join(&parity).exists(),
+        "no generation state is created before the lock is held"
+    );
+    Ok(())
+}
+
+#[test]
 fn harvest_records_the_registry_version_from_dep_info() -> Result<()> {
     let build = tempfile::tempdir()?;
     let store = tempfile::tempdir()?;
@@ -934,5 +965,59 @@ fn harvest_records_the_registry_version_from_dep_info() -> Result<()> {
         .find(|entry| entry.name == "serde-102a33f055a8d229")
         .expect("serde unit stored");
     assert_eq!(entry.version.as_deref(), Some("1.0.219"));
+    Ok(())
+}
+
+#[test]
+fn harvest_parses_a_hyphenated_package_and_a_prerelease_version() -> Result<()> {
+    let build = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let jsons = r#"{"rustc":12019306335353385202,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"config":4,"deps":[]}"#;
+    let unit = build
+        .path()
+        .join("debug/.fingerprint/serde-json-aa11bb22cc33dd44");
+    fs::create_dir_all(&unit)?;
+    fs::write(unit.join("lib-serde_json"), "0123456789abcdef")?;
+    fs::write(unit.join("lib-serde_json.json"), jsons)?;
+    fs::write(unit.join("dep-lib-serde_json"), [0u8; 8])?;
+    fs::create_dir_all(build.path().join("debug/deps"))?;
+    fs::write(
+        build
+            .path()
+            .join("debug/deps/libserde_json-aa11bb22cc33dd44.rlib"),
+        [4u8; 16],
+    )?;
+    fs::write(
+        build
+            .path()
+            .join("debug/deps/serde_json-aa11bb22cc33dd44.d"),
+        "/work/deps/libserde_json-aa11bb22cc33dd44.rlib: \
+         /home/u/.cargo/registry/src/index.crates.io-abc/serde-json-1.0.0-rc.1/src/lib.rs\n",
+    )?;
+
+    harvest(build.path(), store.path(), None, false)?;
+    let manifest = load_manifest(store.path(), &parity_key()?)?.expect("manifest");
+    let entry = manifest
+        .units
+        .iter()
+        .find(|entry| entry.name == "serde-json-aa11bb22cc33dd44")
+        .expect("hyphenated unit stored");
+    assert_eq!(entry.version.as_deref(), Some("1.0.0-rc.1"));
+    Ok(())
+}
+
+#[test]
+fn missing_job_marker_inside_the_work_root_is_not_a_shared_build_dir() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let job = home.path().join("job");
+    util::create_private_dir_all(&job)?;
+    let err =
+        crate::vault::harvest::authorize_harvest_at(&job, HarvestTrust::Recorded, home.path())
+            .expect_err("a job dir without its marker must not be signed");
+    assert!(format!("{err:#}").contains("job marker"), "{err:#}");
+
+    // Outside the work root the same directory is an ordinary build dir.
+    let elsewhere = home.path().join("elsewhere");
+    crate::vault::harvest::authorize_harvest_at(&job, HarvestTrust::Recorded, &elsewhere)?;
     Ok(())
 }

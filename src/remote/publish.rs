@@ -9,7 +9,7 @@
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::SigningKey;
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -73,6 +73,9 @@ pub struct PublishOutcome {
     pub skipped_tier: usize,
     pub public_key: String,
     pub identity_created: bool,
+    /// A staged `--rotate-key` candidate, promoted only once the remote
+    /// pointer confirms the index it signed. `None` for ordinary publishes.
+    rotation: Option<PendingRotation>,
     pub publisher_state: PathBuf,
     pub out_dir: PathBuf,
     pub index: SignedIndex,
@@ -84,6 +87,15 @@ struct PublisherIdentity {
     public_key: String,
     key_id: String,
     created: bool,
+    rotation: Option<PendingRotation>,
+}
+
+/// A candidate identity written beside the active key but not yet trusted.
+#[derive(Clone)]
+struct PendingRotation {
+    staged: PathBuf,
+    active: PathBuf,
+    key_id: String,
 }
 
 struct PublishUnit {
@@ -185,6 +197,7 @@ pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
         request.expect_key_id,
         request.rotate_key,
     )?;
+    let rotation = identity.rotation.clone();
     if let Some(pointer) = &current
         && !request.rotate_key
     {
@@ -281,6 +294,7 @@ pub fn publish(request: &PublishRequest<'_>) -> Result<PublishOutcome> {
         skipped_tier: selection.skipped_tier,
         public_key: identity.public_key,
         identity_created: identity.created,
+        rotation,
         publisher_state: state_dir,
         out_dir,
         index,
@@ -319,6 +333,12 @@ fn key_path(state_dir: &Path, bucket: &str) -> PathBuf {
     state_dir.join(format!("publisher-{}.key", bucket_id(bucket)))
 }
 
+fn rotation_path(path: &Path) -> PathBuf {
+    let mut staged = path.as_os_str().to_os_string();
+    staged.push(".next");
+    PathBuf::from(staged)
+}
+
 fn resolve_identity(
     state_dir: &Path,
     bucket: &str,
@@ -335,8 +355,15 @@ fn resolve_identity(
             "`--rotate-key` and `--expect-key-id` are mutually exclusive; rotate first, then \
              update the pin"
         );
-        let identity = new_identity()?;
-        write_key(&path, &identity.key, true)?;
+        let mut identity = new_identity()?;
+        let staged = rotation_path(&path);
+        write_key(&staged, &identity.key, true)?;
+        let key_id = identity.key_id.clone();
+        identity.rotation = Some(PendingRotation {
+            staged,
+            active: path,
+            key_id,
+        });
         return Ok(identity);
     }
 
@@ -408,6 +435,7 @@ fn identity_from_key(key: SigningKey, created: bool) -> PublisherIdentity {
         public_key,
         key_id,
         created,
+        rotation: None,
     }
 }
 
@@ -423,6 +451,7 @@ fn new_identity() -> Result<PublisherIdentity> {
         public_key,
         key_id,
         created: true,
+        rotation: None,
     })
 }
 
@@ -436,43 +465,82 @@ fn read_key(path: &Path) -> Result<SigningKey> {
 }
 
 fn write_key(path: &Path, key: &SigningKey, replace: bool) -> Result<bool> {
-    if let Some(parent) = path.parent() {
-        crate::util::create_private_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    crate::util::create_private_dir_all(parent)?;
     let text = format!("{}\n", crate::vault::hex_encode(&key.to_bytes()));
     if replace {
         crate::util::write_atomic_private(path, text.as_bytes())?;
         return Ok(true);
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
-        Ok(mut file) => {
-            file.write_all(text.as_bytes())
-                .with_context(|| format!("writing publisher identity {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("syncing publisher identity {}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(0o600))
-                    .with_context(|| format!("securing publisher identity {}", path.display()))?;
-            }
-            Ok(true)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Two publishers raced. The winner's key is the identity.
-            Ok(false)
-        }
+    // A fresh identity is only ever a complete, fsynced file: write a private
+    // temp in the same directory, then publish it with an atomic no-overwrite
+    // link. A concurrent creator that wins the race keeps its key.
+    let (tmp, ()) = crate::util::with_temp_file(parent, "publisher-key", ".tmp", 0o600, |file| {
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing publisher identity {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing publisher identity {}", path.display()))?;
+        Ok(())
+    })?;
+    let created = match fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(err) => {
             Err(err).with_context(|| format!("creating publisher identity {}", path.display()))
         }
+    };
+    let _ = fs::remove_file(&tmp);
+    created
+}
+
+/// Promote a staged `--rotate-key` candidate after the remote pointer carries
+/// it. Renaming over the active key is atomic; if the staged file is already
+/// gone, the promotion happened earlier and only the identity is re-checked.
+fn promote_rotation(rotation: &PendingRotation) -> Result<()> {
+    match fs::symlink_metadata(&rotation.staged) {
+        Ok(meta) if meta.is_file() => {
+            // Never install a candidate other than the one this pointer was
+            // signed with; a replaced staged file must not hijack the identity.
+            let staged = identity_from_key(read_key(&rotation.staged)?, false);
+            ensure!(
+                staged.key_id == rotation.key_id,
+                "staged publisher identity {} is {}, but the confirmed rotation signed with {}",
+                rotation.staged.display(),
+                staged.key_id,
+                rotation.key_id
+            );
+            crate::util::replace_file(&rotation.staged, &rotation.active).with_context(|| {
+                format!(
+                    "promoting staged publisher identity {}",
+                    rotation.staged.display()
+                )
+            })?;
+        }
+        Ok(_) => anyhow::bail!(
+            "staged publisher identity {} is not a regular file",
+            rotation.staged.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspecting staged publisher identity {}",
+                    rotation.staged.display()
+                )
+            });
+        }
     }
+    let active = identity_from_key(read_key(&rotation.active)?, false);
+    ensure!(
+        active.key_id == rotation.key_id,
+        "active publisher identity {} is {}, but the confirmed rotation signed with {}",
+        rotation.active.display(),
+        active.key_id,
+        rotation.key_id
+    );
+    Ok(())
 }
 
 fn read_current_pointer(out_dir: &Path) -> Result<Option<IndexPointer>> {
@@ -544,13 +612,35 @@ impl PublisherState {
             updated: now_secs(),
         };
         let path = Self::path(state_dir, url)?;
+        // Serialize read-compare-write per endpoint. A publisher that staged
+        // sequence 8 and paused must never lower the checkpoint another
+        // writer advanced to 9, or the remote rollback guard regresses.
+        let _lock = crate::util::FileLock::acquire(&path.with_extension("json.lock"))?;
+        if let Some(existing) = Self::load(state_dir, url)? {
+            ensure!(
+                state.sequence >= existing.sequence,
+                "publisher state is already at sequence {}; refusing to record older sequence {} — the remote index may have rolled back",
+                existing.sequence,
+                state.sequence
+            );
+            ensure!(
+                state.sequence != existing.sequence || state.body_sha256 == existing.body_sha256,
+                "publisher state already records sequence {} with a different body; refusing equivocation",
+                existing.sequence
+            );
+        }
         let bytes = serde_json::to_vec_pretty(&state)?;
         crate::util::write_atomic_private(&path, &bytes)
     }
 }
 
-/// Record a successful upload after the pointer was replaced.
+/// Record a successful upload after the pointer was replaced. A staged
+/// `--rotate-key` candidate is promoted first, because the confirmed pointer
+/// is what makes it the active identity.
 pub fn record_publish_state(outcome: &PublishOutcome, pointer_etag: Option<String>) -> Result<()> {
+    if let Some(rotation) = &outcome.rotation {
+        promote_rotation(rotation)?;
+    }
     PublisherState::record(
         &outcome.publisher_state,
         &outcome.url,
@@ -974,6 +1064,10 @@ mod tests {
         let rotated = resolve_identity(dir.path(), "bucket", Some(&first.key_id), None, true)?;
         assert!(rotated.created);
         assert_ne!(rotated.key_id, first.key_id);
+        // The rotation is only staged: the previous identity still signs.
+        let still_first = resolve_identity(dir.path(), "bucket", Some(&first.key_id), None, false)?;
+        assert_eq!(still_first.key_id, first.key_id);
+        promote_rotation(rotated.rotation.as_ref().expect("staged rotation"))?;
         let third = resolve_identity(dir.path(), "bucket", Some(&rotated.key_id), None, false)?;
         assert_eq!(third.key_id, rotated.key_id);
 
@@ -982,6 +1076,91 @@ mod tests {
             .err()
             .expect("a missing identity with an existing pin must fail");
         assert!(format!("{err:#}").contains("missing"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_rotation_keeps_the_active_key_until_promoted() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let active_path = key_path(dir.path(), "bucket");
+        let active = resolve_identity(dir.path(), "bucket", None, None, false)?;
+        let original = fs::read(&active_path)?;
+
+        // A dry run or a failed upload stages the candidate and returns
+        // without touching the identity readers already accept.
+        let staged = resolve_identity(dir.path(), "bucket", Some(&active.key_id), None, true)?;
+        assert!(staged.created);
+        assert_ne!(staged.key_id, active.key_id);
+        assert_eq!(fs::read(&active_path)?, original);
+        assert!(rotation_path(&active_path).is_file());
+
+        // Retrying the ordinary publish still signs with the active identity.
+        let retry = resolve_identity(dir.path(), "bucket", Some(&active.key_id), None, false)?;
+        assert_eq!(retry.key_id, active.key_id);
+
+        // Confirming the pointer promotes the candidate exactly once; the
+        // second call is a no-op that only verifies the active identity.
+        let rotation = staged.rotation.as_ref().expect("staged rotation");
+        promote_rotation(rotation)?;
+        assert!(!rotation_path(&active_path).exists());
+        assert_ne!(fs::read(&active_path)?, original);
+        promote_rotation(rotation)?;
+        assert_eq!(
+            resolve_identity(dir.path(), "bucket", Some(&staged.key_id), None, false)?.key_id,
+            staged.key_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn promotion_refuses_a_replaced_candidate() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let active_path = key_path(dir.path(), "bucket");
+        let active = resolve_identity(dir.path(), "bucket", None, None, false)?;
+        let original = fs::read(&active_path)?;
+        let staged = resolve_identity(dir.path(), "bucket", Some(&active.key_id), None, true)?;
+
+        // A different key at the staged path must never become the active
+        // identity, even though the outcome believes the pointer confirmed it.
+        let other = new_identity()?;
+        write_key(&rotation_path(&active_path), &other.key, true)?;
+        let err = promote_rotation(staged.rotation.as_ref().expect("staged rotation"))
+            .expect_err("a replaced candidate must not be promoted");
+        assert!(format!("{err:#}").contains("signed with"), "{err:#}");
+        assert_eq!(fs::read(&active_path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_identity_creation_converges() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_identity(&root, "bucket", None, None, false)
+                })
+            })
+            .collect();
+
+        let mut created = 0usize;
+        let mut key_id = None;
+        for handle in handles {
+            let identity = handle.join().expect("identity thread panicked")?;
+            created += usize::from(identity.created);
+            match &key_id {
+                Some(existing) => assert_eq!(identity.key_id, *existing),
+                None => key_id = Some(identity.key_id),
+            }
+        }
+        assert_eq!(created, 1, "exactly one publisher writes the identity");
+        assert!(key_path(&root, "bucket").is_file());
         Ok(())
     }
 
@@ -1092,9 +1271,43 @@ mod tests {
     }
 
     #[test]
-    fn publishes_a_store_generation_end_to_end() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = temp.path().join("store");
+    fn publisher_state_never_regresses_or_equivocates() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pointer = |sequence: u64, body: &str| IndexPointer {
+            schema: SCHEMA_VERSION,
+            key_id: "ed25519:0123456789abcdef".into(),
+            sequence,
+            created: 1,
+            expires: 2,
+            body_sha256: body.repeat(32),
+            body_size: 1,
+            signature: "00".repeat(64),
+        };
+        PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(9, "ab"), None)?;
+        PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(9, "ab"), None)?;
+
+        let err = PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(8, "ab"), None)
+            .expect_err("an older sequence must not replace the checkpoint");
+        assert!(format!("{err:#}").contains("older sequence"), "{err:#}");
+        let err = PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(9, "cd"), None)
+            .expect_err("a different body at one sequence is equivocation");
+        assert!(format!("{err:#}").contains("equivocation"), "{err:#}");
+        let loaded = PublisherState::load(dir.path(), "s3://bucket/prefix")?.expect("state");
+        assert_eq!(loaded.sequence, 9);
+        assert_eq!(loaded.body_sha256, "ab".repeat(32));
+
+        PublisherState::record(dir.path(), "s3://bucket/prefix", &pointer(10, "cd"), None)?;
+        assert_eq!(
+            PublisherState::load(dir.path(), "s3://bucket/prefix")?
+                .expect("state")
+                .sequence,
+            10
+        );
+        Ok(())
+    }
+
+    fn store_fixture(temp: &Path) -> Result<(PathBuf, PathBuf)> {
+        let store = temp.join("store");
         let generation = "gen";
         let name = "serde-0011223344556677";
         let unit_dir = package_dir(&store, generation, name);
@@ -1153,13 +1366,21 @@ mod tests {
         };
         vault::save_manifest(&store, generation, &manifest)?;
 
-        let lock_path = temp.path().join("Cargo.lock");
+        let lock_path = temp.join("Cargo.lock");
         fs::write(
             &lock_path,
             "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\
              source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
              checksum = \"abababababababababababababababababababababababababababababababab\"\n",
         )?;
+        Ok((store, lock_path))
+    }
+
+    #[test]
+    fn publishes_a_store_generation_end_to_end() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (store, lock_path) = store_fixture(temp.path())?;
+        let generation = "gen";
 
         let out_dir = temp.path().join("out");
         let publisher_state = temp.path().join("publisher");
@@ -1199,6 +1420,123 @@ mod tests {
         assert_eq!(second.index.pointer().sequence, 2);
         assert_eq!(second.index.pointer().key_id, first.index.pointer().key_id);
         assert!(!second.identity_created);
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_signs_with_the_candidate_and_promotes_after_confirmation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (store, lock_path) = store_fixture(temp.path())?;
+        let out_dir = temp.path().join("out");
+        let publisher_state = temp.path().join("publisher");
+        let request = PublishRequest {
+            store_root: &store,
+            cwd: temp.path(),
+            url: "s3://bucket/prefix",
+            tier: RemoteTier::Libraries,
+            generation: Some("gen"),
+            profile: Some("debug"),
+            selector: None,
+            sequence: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: false,
+            valid_for: Duration::from_secs(3_600),
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            ci_job: "ci/test",
+            notes: "",
+            expect_key_id: None,
+            rotate_key: true,
+            publisher_state: Some(&publisher_state),
+            out_dir: Some(&out_dir),
+            lockfile: Some(&lock_path),
+        };
+
+        let staged = publish(&request)?;
+        let active_path = key_path(&publisher_state, "bucket");
+        assert!(
+            !active_path.exists(),
+            "a rotation must not commit the active key before the pointer"
+        );
+        let candidate = identity_from_key(read_key(&rotation_path(&active_path))?, true);
+        assert_eq!(staged.index.pointer().key_id, candidate.key_id);
+        assert_eq!(staged.public_key, candidate.public_key);
+
+        record_publish_state(&staged, None)?;
+        assert!(active_path.is_file());
+        assert!(!rotation_path(&active_path).exists());
+        // A repeated finalize (for example after a state write retry) must not
+        // promote again or rewrite the committed identity.
+        let committed = fs::read(&active_path)?;
+        record_publish_state(&staged, None)?;
+        assert_eq!(fs::read(&active_path)?, committed);
+        assert_eq!(
+            resolve_identity(
+                &publisher_state,
+                "bucket",
+                Some(&candidate.key_id),
+                None,
+                false
+            )?
+            .key_id,
+            candidate.key_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_record_failure_keeps_the_confirmed_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (store, lock_path) = store_fixture(temp.path())?;
+        let out_dir = temp.path().join("out");
+        let publisher_state = temp.path().join("publisher");
+        let request = PublishRequest {
+            store_root: &store,
+            cwd: temp.path(),
+            url: "s3://bucket/prefix",
+            tier: RemoteTier::Libraries,
+            generation: Some("gen"),
+            profile: Some("debug"),
+            selector: None,
+            sequence: None,
+            current: None,
+            reset_sequence: false,
+            allow_staged_pointer: false,
+            valid_for: Duration::from_secs(3_600),
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            ci_job: "ci/test",
+            notes: "",
+            expect_key_id: None,
+            rotate_key: true,
+            publisher_state: Some(&publisher_state),
+            out_dir: Some(&out_dir),
+            lockfile: Some(&lock_path),
+        };
+        let staged = publish(&request)?;
+        let active_path = key_path(&publisher_state, "bucket");
+        let candidate = identity_from_key(read_key(&rotation_path(&active_path))?, true);
+
+        // A checkpoint ahead of this publish makes the state write fail after
+        // the pointer was confirmed and the candidate promoted.
+        let mut ahead = staged.index.pointer().clone();
+        ahead.sequence += 1;
+        ahead.body_sha256 = "cd".repeat(32);
+        PublisherState::record(&publisher_state, &staged.url, &ahead, None)?;
+
+        let err = record_publish_state(&staged, None).expect_err("state write must fail");
+        assert!(format!("{err:#}").contains("older sequence"), "{err:#}");
+        assert!(active_path.is_file());
+        assert!(!rotation_path(&active_path).exists());
+        assert_eq!(
+            identity_from_key(read_key(&active_path)?, false).key_id,
+            candidate.key_id
+        );
+
+        // Retrying the same finalize cannot repromote or rewrite the identity.
+        let committed = fs::read(&active_path)?;
+        let err = record_publish_state(&staged, None).expect_err("state write must still fail");
+        assert!(format!("{err:#}").contains("older sequence"), "{err:#}");
+        assert_eq!(fs::read(&active_path)?, committed);
         Ok(())
     }
 }

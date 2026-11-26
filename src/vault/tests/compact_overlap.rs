@@ -257,3 +257,147 @@ fn compact_counts_already_hardlinked_files() -> Result<()> {
     assert!(report.already_shared >= 1);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn compact_counts_reclaimed_inodes_not_replaced_paths() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let payload = b"reclaim once";
+    let _first = write_overlap_unit(store.path(), "generation", "aaaaaaaaaaaaaaaa", payload)?;
+    // Two paths are hard links of one inode: replacing both frees that inode
+    // once, so the report must say one file, not two.
+    let second = write_overlap_unit(store.path(), "generation", "bbbbbbbbbbbbbbbb", payload)?;
+    let third_dir = store
+        .path()
+        .join("generation")
+        .join("units")
+        .join("demo-cccccccccccccccc");
+    fs::create_dir_all(&third_dir)?;
+    fs::hard_link(&second, third_dir.join("lib-demo"))?;
+    save_manifest(
+        store.path(),
+        "generation",
+        &compact_manifest(
+            "generation",
+            &["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"],
+            payload.len() as u64,
+        ),
+    )?;
+
+    let report = compact(store.path(), None, false)?;
+    assert_eq!(report.groups, 1);
+    assert_eq!(report.linked, 1, "one inode reclaimed, not two paths");
+    assert_eq!(report.bytes_saved, payload.len() as u64);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn overlap_counts_blob_bytes_and_shared_blobs_once() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let store = tempfile::tempdir()?;
+    let hash = "aaaaaaaaaaaaaaaa";
+    let payload = b"0123456789";
+    let first = write_overlap_unit(store.path(), "generation", hash, payload)?;
+    let blob = store
+        .path()
+        .join("generation")
+        .join("blobs")
+        .join("aa")
+        .join("bbbb.gz");
+    fs::create_dir_all(blob.parent().unwrap())?;
+    fs::write(&blob, b"abcde")?;
+
+    // A second generation shares both inodes through hard links.
+    let second_dir = store
+        .path()
+        .join("generation2")
+        .join("units")
+        .join(format!("demo-{hash}"));
+    fs::create_dir_all(&second_dir)?;
+    fs::hard_link(&first, second_dir.join("lib-demo"))?;
+    let second_blob = store
+        .path()
+        .join("generation2")
+        .join("blobs")
+        .join("aa")
+        .join("bbbb.gz");
+    fs::create_dir_all(second_blob.parent().unwrap())?;
+    fs::hard_link(&blob, &second_blob)?;
+
+    let object = "blobs/aa/bbbb.gz";
+    for (generation, created) in [("generation", 1u64), ("generation2", 2u64)] {
+        let mut unit = overlap_unit(hash, payload.len() as u64);
+        unit.files.push(FileEntry {
+            path: "deps/libx.rlib".into(),
+            dest: "deps/libx.rlib".into(),
+            size: 40,
+            sha256: String::new(),
+            role: "artifact".into(),
+            object: Some(object.into()),
+        });
+        save_manifest(
+            store.path(),
+            generation,
+            &Manifest {
+                parity_key: generation.into(),
+                toolchain: "test".into(),
+                created,
+                updated: created,
+                units: vec![unit],
+                mac: String::new(),
+                signature: String::new(),
+            },
+        )?;
+    }
+
+    let report = overlap(store.path(), &Default::default())?;
+    assert_eq!(report.len(), 1);
+    assert_eq!(
+        report[0].bytes, 100,
+        "recorded sizes are summarized per unit"
+    );
+    assert_eq!(
+        report[0].unique_bytes,
+        payload.len() as u64 + 5,
+        "the blob counts, and hard links count once"
+    );
+    assert_eq!(
+        fs::metadata(&first)?.ino(),
+        fs::metadata(second_dir.join("lib-demo"))?.ino()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn generations_count_blobs_without_double_counting_hard_links() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let file = write_overlap_unit(
+        store.path(),
+        "generation",
+        "aaaaaaaaaaaaaaaa",
+        b"0123456789",
+    )?;
+    let blob = store
+        .path()
+        .join("generation")
+        .join("blobs")
+        .join("aa")
+        .join("object.gz");
+    fs::create_dir_all(blob.parent().unwrap())?;
+    fs::hard_link(&file, &blob)?;
+    save_manifest(
+        store.path(),
+        "generation",
+        &compact_manifest("generation", &["aaaaaaaaaaaaaaaa"], 10),
+    )?;
+
+    let info = &generations(store.path())?[0];
+    assert_eq!(info.units, 1);
+    assert_eq!(info.files, 2, "both units and blobs are store files");
+    assert_eq!(info.bytes, 10, "one inode is one allocation");
+    assert_eq!(info.linked, 2, "both names point at the shared inode");
+    Ok(())
+}

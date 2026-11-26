@@ -43,6 +43,11 @@ fn load_repairs_an_authentic_manifest_with_an_invalid_unit() -> Result<()> {
         "the writer repair drops the invalid entry"
     );
     assert_eq!(repaired.units.len(), 2, "the valid units survive");
+    let raw = fs::read_to_string(&path)?;
+    assert!(
+        !raw.contains("$message_type"),
+        "the writer repair must persist on disk"
+    );
     let reread = load_manifest(store.path(), &parity)?.expect("manifest");
     assert_eq!(reread.units.len(), 2);
     Ok(())

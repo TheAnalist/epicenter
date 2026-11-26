@@ -81,35 +81,44 @@ fn root_is_reparse(dir: &Path) -> bool {
 /// delete/enter a view can keep Cargo out for the whole operation. A check
 /// that drops the locks immediately is only advisory and races a build that
 /// starts one instruction later.
-pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
-    // Cargo puts the lock at `<build>/<profile>/.cargo-build-lock` or, with
-    // `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
-    // bounded depth and take every lock, not just direct children.
-    //
-    // Keep symlinked files visible so a planted `.cargo-build-lock` is rejected
-    // by `open_lock_file` (fail closed), but prune reparse directories so the
-    // scan cannot write a sentinel outside `dir` through a junction. A reparse
-    // root is treated as un-inspectable and fails closed.
-    //
-    // A profile directory without a lock file gets a sentinel: otherwise a
-    // build that starts after this check is not fenced at all. Creating the
-    // sentinel is safe because Cargo uses the same path and only contends on
-    // the advisory lock.
-    //
-    // Windows refuses to rename a directory while any file inside it is open
-    // (even with FILE_SHARE_DELETE), so a caller that renames/removes `dir`
-    // must drop these handles first.
+/// Both spellings Cargo uses for the per-profile build lock: the newer
+/// `.cargo-build-lock` and the `.cargo-lock` a build can hold on its own.
+const CARGO_LOCK_NAMES: [&str; 2] = [".cargo-build-lock", ".cargo-lock"];
+
+fn is_cargo_lock_name(name: &std::ffi::OsStr) -> bool {
+    CARGO_LOCK_NAMES.iter().any(|known| name == *known)
+}
+
+/// Cargo puts the lock at `<build>/<profile>/.cargo-build-lock` or, with
+/// `--target`, at `<build>/<triple>/<profile>/.cargo-build-lock`. Walk a
+/// bounded depth and return every lock path, not just direct children.
+///
+/// Keep symlinked files visible so a planted `.cargo-build-lock` is rejected
+/// by `open_lock_file` (fail closed), but prune reparse directories so the
+/// scan cannot write a sentinel outside `dir` through a junction. A reparse
+/// root is treated as un-inspectable and fails closed.
+///
+/// A profile directory without a lock file gets a sentinel path: otherwise a
+/// build that starts after this scan is not fenced at all. Creating the
+/// sentinel is safe because Cargo uses the same path and only contends on the
+/// advisory lock.
+fn cargo_lock_paths(dir: &Path) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
     if root_is_reparse(dir) {
         return Ok(None);
     }
     let mut lock_paths = std::collections::BTreeSet::new();
-    let entries = util::SafeWalk::new(dir)
+    let mut budget = util::ScanBudget::new("cargo lock scan");
+    let mut walk = util::SafeWalk::new(dir)
         .depth(3)
         .keep_links()
-        .walk()
-        .collect::<Result<Vec<_>, _>>()?;
+        .walk_with(&mut budget);
+    let entries = walk.by_ref().collect::<Result<Vec<_>, _>>()?;
+    // A truncated scan may have missed a lock: fail closed.
+    if walk.truncated() {
+        return Ok(None);
+    }
     for entry in entries {
-        if entry.file_name().to_string_lossy() == ".cargo-build-lock" {
+        if is_cargo_lock_name(entry.file_name()) {
             lock_paths.insert(entry.path().to_path_buf());
             continue;
         }
@@ -123,21 +132,66 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
     if is_cargo_profile_dir(dir) {
         lock_paths.insert(dir.join(".cargo-build-lock"));
     }
+    Ok(Some(lock_paths))
+}
 
-    let mut locks = Vec::with_capacity(lock_paths.len());
-    for path in lock_paths {
-        // `open_lock_file` is no-follow, creates a missing sentinel with
-        // O_EXCL, and rejects a symlink/reparse target. Any failure fails
-        // closed: the caller treats it as "a build may be running".
-        let Ok(file) = util::open_lock_file(&path) else {
-            return Ok(None);
+/// Held Cargo build locks for one build dir. `refresh` discovers and locks
+/// profiles that appeared after the first pass, which is the window a scan
+/// opens between the lock and the deletion.
+///
+/// Windows refuses to rename a directory while any file inside it is open
+/// (even with FILE_SHARE_DELETE), so a caller that renames/removes the dir
+/// must drop these handles first.
+pub(crate) struct CargoLockSet {
+    paths: std::collections::BTreeSet<PathBuf>,
+    files: Vec<fs::File>,
+}
+
+impl CargoLockSet {
+    /// Lock every not-yet-held lock path. `false` means a reparse root or a
+    /// contended lock: the caller treats it as "a build may be running".
+    pub(crate) fn refresh(&mut self, dir: &Path) -> Result<bool> {
+        let Some(paths) = cargo_lock_paths(dir)? else {
+            return Ok(false);
         };
-        if !try_lock_now(&file) {
-            return Ok(None);
+        for path in paths {
+            if self.paths.contains(&path) {
+                continue;
+            }
+            // `open_lock_file` is no-follow, creates a missing sentinel with
+            // O_EXCL, and rejects a symlink/reparse target. Any failure fails
+            // closed.
+            let Ok(file) = util::open_lock_file(&path) else {
+                return Ok(false);
+            };
+            if !try_lock_now(&file) {
+                return Ok(false);
+            }
+            self.paths.insert(path);
+            self.files.push(file);
         }
-        locks.push(file);
+        Ok(true)
     }
-    Ok(Some(locks))
+
+    pub(crate) fn into_files(self) -> Vec<fs::File> {
+        self.files
+    }
+}
+
+/// Take and hold every Cargo build lock under `dir`.
+pub(crate) fn cargo_lock_set(dir: &Path) -> Result<Option<CargoLockSet>> {
+    let mut set = CargoLockSet {
+        paths: std::collections::BTreeSet::new(),
+        files: Vec::new(),
+    };
+    if !set.refresh(dir)? {
+        return Ok(None);
+    }
+    Ok(Some(set))
+}
+
+pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
+    Ok(cargo_lock_set(dir)?.map(CargoLockSet::into_files))
 }
 
 /// Does `dir` look like a Cargo profile directory? A profile is the only
@@ -146,6 +200,7 @@ pub(crate) fn cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> {
 fn is_cargo_profile_dir(dir: &Path) -> bool {
     [
         ".cargo-build-lock",
+        ".cargo-lock",
         "deps",
         ".fingerprint",
         "build",
@@ -186,14 +241,19 @@ pub(crate) fn existing_cargo_locks(dir: &Path) -> Result<Option<Vec<fs::File>>> 
     if root_is_reparse(dir) {
         return Ok(None);
     }
-    let entries = util::SafeWalk::new(dir)
+    let mut budget = util::ScanBudget::new("cargo lock scan");
+    let mut walk = util::SafeWalk::new(dir)
         .depth(3)
         .keep_links()
-        .walk()
-        .collect::<Result<Vec<_>, _>>()?;
+        .walk_with(&mut budget);
+    let entries = walk.by_ref().collect::<Result<Vec<_>, _>>()?;
+    // A truncated scan may have missed a held lock: fail closed.
+    if walk.truncated() {
+        return Ok(None);
+    }
     let mut locks = Vec::new();
     for entry in entries {
-        if entry.file_name().to_string_lossy() != ".cargo-build-lock" {
+        if !is_cargo_lock_name(entry.file_name()) {
             continue;
         }
         // A symlink/non-regular lock is treated as held (fail closed).
@@ -251,8 +311,41 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Serialize the record so the on-disk bytes fit the reader cap. The identity
+/// fields (`version`, `token`, `build_root`) must survive or the record can
+/// never match; the provenance-only fields are dropped longest-first until it
+/// fits. An identity field that alone exceeds the cap is a hard error rather
+/// than a file the reader will reject as untrusted.
+fn encode_record(record: &ExecRecord) -> Result<Vec<u8>> {
+    let mut body = serde_json::to_vec(record).context("serializing the exec record")?;
+    if body.len() as u64 <= EXEC_RECORD_MAX_BYTES {
+        return Ok(body);
+    }
+    let mut trimmed = record.clone();
+    while body.len() as u64 > EXEC_RECORD_MAX_BYTES {
+        let lens = [
+            trimmed.command.len(),
+            trimmed.source_root.len(),
+            trimmed.toolchain.len(),
+            trimmed.run_id.len(),
+        ];
+        match lens.iter().enumerate().max_by_key(|(_, len)| **len) {
+            Some((_, 0)) | None => bail!(
+                "exec record for {} is larger than {EXEC_RECORD_MAX_BYTES} bytes even without optional fields",
+                record.build_root
+            ),
+            Some((0, _)) => trimmed.command.clear(),
+            Some((1, _)) => trimmed.source_root.clear(),
+            Some((2, _)) => trimmed.toolchain.clear(),
+            _ => trimmed.run_id.clear(),
+        }
+        body = serde_json::to_vec(&trimmed).context("serializing the exec record")?;
+    }
+    Ok(body)
+}
+
 pub(crate) fn write_record(work_root: &Path, job_id: &str, record: &ExecRecord) -> Result<()> {
-    let body = serde_json::to_vec(record).context("serializing the exec record")?;
+    let body = encode_record(record)?;
     util::write_atomic_private(&record_path(work_root, job_id), &body)
         .with_context(|| format!("writing the exec record for job {job_id}"))
 }
@@ -377,5 +470,55 @@ pub(crate) fn remove_record(work_root: &Path, job_id: &str) {
     let path = record_path(work_root, job_id);
     if metadata_nofollow(&path).is_ok_and(|meta| meta.is_file()) {
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(build_root: &Path) -> ExecRecord {
+        ExecRecord {
+            version: EXEC_RECORD_VERSION,
+            run_id: "run".into(),
+            token: "a".repeat(32),
+            build_root: build_root.to_string_lossy().into_owned(),
+            source_root: String::new(),
+            toolchain: String::new(),
+            command: "cargo test".into(),
+            started: 1,
+            finished: 2,
+            exit_code: 0,
+        }
+    }
+
+    #[test]
+    fn oversized_record_is_capped_and_still_loads() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let job_id = "job-oversized";
+        let build_root = root.path().join(job_id);
+        fs::create_dir_all(&build_root)?;
+
+        let mut record = sample(&build_root);
+        record.run_id = "r".repeat(4_000);
+        record.source_root = "s".repeat(4_000);
+        record.toolchain = "t".repeat(4_000);
+        record.command = "\u{1}".repeat(1_024);
+
+        write_record(root.path(), job_id, &record)?;
+
+        let len = fs::metadata(record_path(root.path(), job_id))?.len();
+        assert!(
+            len <= EXEC_RECORD_MAX_BYTES,
+            "record must fit the reader cap, got {len}"
+        );
+        match load_record(root.path(), job_id)? {
+            RecordFile::Present(loaded) => {
+                assert_eq!(loaded.token, record.token);
+                assert_eq!(loaded.build_root, record.build_root);
+            }
+            _ => panic!("a capped record must still load"),
+        }
+        Ok(())
     }
 }

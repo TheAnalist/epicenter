@@ -1,6 +1,6 @@
 //! Local TLS tests for the anonymous HTTPS and signed S3 paths.
 
-use super::s3::{MAX_MULTIPART_PARTS, MultipartPlan};
+use super::s3::{MAX_MULTIPART_PARTS, MultipartPlan, checksum_sha256};
 use super::*;
 use crate::remote::sink::{Precondition, PutStatus, RemoteSink};
 use crate::remote::{RemoteSource, Upload, UploadKind, UploadMode, sha256_hex};
@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[derive(Clone)]
@@ -34,6 +35,8 @@ struct MockResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Delay between flushing the headers and writing the body.
+    delay_body: Duration,
 }
 
 impl MockResponse {
@@ -42,6 +45,7 @@ impl MockResponse {
             status: 200,
             headers: Vec::new(),
             body: body.into(),
+            delay_body: Duration::ZERO,
         }
     }
 
@@ -50,8 +54,39 @@ impl MockResponse {
             status: 404,
             headers: Vec::new(),
             body: Vec::new(),
+            delay_body: Duration::ZERO,
         }
     }
+
+    fn delaying_body(mut self, delay: Duration) -> Self {
+        self.delay_body = delay;
+        self
+    }
+}
+
+/// Loopback traffic must bypass any proxy configured by the environment. The
+/// bypass list is additive and installed once for the whole process, so no
+/// test races another by setting or restoring it.
+fn bypass_proxy_for_loopback() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for name in ["NO_PROXY", "no_proxy"] {
+            let current = std::env::var(name).unwrap_or_default();
+            let already = current.split(',').any(|entry| entry.trim() == "127.0.0.1");
+            if already {
+                continue;
+            }
+            let merged = if current.is_empty() {
+                "127.0.0.1,localhost,::1".to_string()
+            } else {
+                format!("{current},127.0.0.1,localhost,::1")
+            };
+            // SAFETY: this runs once, before this module builds any client, and
+            // the value is never restored, so no thread can observe a torn or
+            // removed entry because of a test.
+            unsafe { std::env::set_var(name, merged) };
+        }
+    });
 }
 
 struct TestServer {
@@ -63,6 +98,7 @@ struct TestServer {
 fn start_server(
     handler: impl Fn(&MockRequest) -> MockResponse + Send + Sync + 'static,
 ) -> anyhow::Result<TestServer> {
+    bypass_proxy_for_loopback();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
@@ -186,10 +222,14 @@ fn write_response<W: Write>(
         write!(writer, "content-length: {}\r\n", response.body.len())?;
     }
     write!(writer, "connection: close\r\n\r\n")?;
-    if !head {
-        writer.write_all(&response.body)?;
-    }
     writer.flush()?;
+    if !head {
+        if !response.delay_body.is_zero() {
+            std::thread::sleep(response.delay_body);
+        }
+        writer.write_all(&response.body)?;
+        writer.flush()?;
+    }
     Ok(())
 }
 
@@ -290,6 +330,7 @@ fn s3_missing_pointer_is_a_clean_miss_but_forbidden_is_not() -> anyhow::Result<(
         status: 403,
         headers: Vec::new(),
         body: Vec::new(),
+        delay_body: Duration::ZERO,
     })?;
     let endpoint = S3Endpoint::parse(
         "s3://bucket/prefix",
@@ -297,7 +338,14 @@ fn s3_missing_pointer_is_a_clean_miss_but_forbidden_is_not() -> anyhow::Result<(
         Some(Url::parse(&format!("https://{}", forbidden.addr))?),
     )?;
     let source = S3Source::new(&config_with_ca(Endpoint::S3(endpoint), &forbidden.ca))?;
-    assert!(source.fetch_pointer_optional().is_err());
+    let err = source
+        .fetch_pointer_optional()
+        .err()
+        .expect("a 403 must not look like a missing pointer");
+    assert!(
+        format!("{err:#}").contains("s3:ListBucket"),
+        "unexpected error {err:#}"
+    );
     Ok(())
 }
 
@@ -341,6 +389,10 @@ fn s3_put_uses_if_none_match() -> anyhow::Result<()> {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].method, "PUT");
     assert_eq!(seen[0].header("if-none-match"), Some("*"));
+    assert_eq!(
+        seen[0].header("x-amz-checksum-sha256"),
+        checksum_sha256(&upload.sha256).as_deref()
+    );
     assert_eq!(seen[0].body, bytes);
     Ok(())
 }
@@ -417,6 +469,8 @@ fn multipart_skips_a_present_blob_without_creating_an_upload() -> anyhow::Result
     let seen = Arc::new(Mutex::new(Vec::new()));
     let capture = seen.clone();
     let size = 100 * 1024 * 1024u64;
+    let sha256 = "ab".repeat(32);
+    let checksum = checksum_sha256(&sha256).expect("valid digest");
     let server = start_server(move |request| {
         capture.lock().unwrap().push(request.clone());
         if request.method == "HEAD" {
@@ -424,6 +478,9 @@ fn multipart_skips_a_present_blob_without_creating_an_upload() -> anyhow::Result
             response
                 .headers
                 .push(("content-length".into(), size.to_string()));
+            response
+                .headers
+                .push(("x-amz-checksum-sha256".into(), checksum.clone()));
             response
         } else {
             MockResponse::not_found()
@@ -439,7 +496,7 @@ fn multipart_skips_a_present_blob_without_creating_an_upload() -> anyhow::Result
     let upload = Upload {
         key: "blobs/large".into(),
         source: PathBuf::from("/nonexistent"),
-        sha256: "ab".repeat(32),
+        sha256,
         size,
         mode: UploadMode::PutIfAbsent,
         kind: UploadKind::Blob,
@@ -466,6 +523,9 @@ fn multipart_aborts_after_a_lost_conditional_complete() -> anyhow::Result<()> {
     let heads = Arc::new(AtomicUsize::new(0));
     let head_count = heads.clone();
     let size = 1024 * 1024u64;
+    let bytes = vec![7u8; size as usize];
+    let sha256 = sha256_hex(&bytes);
+    let checksum = checksum_sha256(&sha256).expect("valid digest");
     let server = start_server(move |request| {
         capture.lock().unwrap().push(request.clone());
         if request.method == "HEAD" {
@@ -478,6 +538,9 @@ fn multipart_aborts_after_a_lost_conditional_complete() -> anyhow::Result<()> {
             response
                 .headers
                 .push(("content-length".into(), size.to_string()));
+            response
+                .headers
+                .push(("x-amz-checksum-sha256".into(), checksum.clone()));
             return response;
         }
         if request.method == "POST" && request.path.contains("uploads=") {
@@ -491,12 +554,14 @@ fn multipart_aborts_after_a_lost_conditional_complete() -> anyhow::Result<()> {
                 status: 412,
                 headers: Vec::new(),
                 body: Vec::new(),
+                delay_body: Duration::ZERO,
             }
         } else if request.method == "DELETE" && request.path.contains("uploadId=") {
             MockResponse {
                 status: 204,
                 headers: Vec::new(),
                 body: Vec::new(),
+                delay_body: Duration::ZERO,
             }
         } else {
             MockResponse::not_found()
@@ -511,12 +576,11 @@ fn multipart_aborts_after_a_lost_conditional_complete() -> anyhow::Result<()> {
     let client = S3Client::new(&config)?;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("blob");
-    let bytes = vec![7u8; size as usize];
     std::fs::write(&path, &bytes)?;
     let upload = Upload {
-        key: format!("blobs/{}", sha256_hex(&bytes)),
+        key: format!("blobs/{sha256}"),
         source: path,
-        sha256: sha256_hex(&bytes),
+        sha256,
         size,
         mode: UploadMode::PutIfAbsent,
         kind: UploadKind::Blob,
@@ -563,6 +627,7 @@ fn multipart_plan_uses_more_than_one_part_and_stays_bounded() -> anyhow::Result<
 
 #[test]
 fn https_refuses_a_plain_http_server() -> anyhow::Result<()> {
+    bypass_proxy_for_loopback();
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     std::thread::spawn(move || {
@@ -615,6 +680,7 @@ fn a_server_error_is_not_a_miss() -> anyhow::Result<()> {
         status: 500,
         headers: Vec::new(),
         body: Vec::new(),
+        delay_body: Duration::ZERO,
     })?;
     let endpoint = S3Endpoint::parse(
         "s3://bucket/prefix",
@@ -630,9 +696,10 @@ fn a_server_error_is_not_a_miss() -> anyhow::Result<()> {
 
 #[test]
 fn a_read_timeout_is_reported() -> anyhow::Result<()> {
+    // Headers arrive promptly; the body stalls so the read timeout fires
+    // instead of the connect/response timeout.
     let server = start_server(|_| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        MockResponse::ok(Vec::new())
+        MockResponse::ok(b"delayed body".to_vec()).delaying_body(Duration::from_millis(300))
     })?;
     let endpoint = HttpsEndpoint::parse(&format!("https://{}/prefix", server.addr))?;
     let mut config = TransportConfig {
@@ -644,8 +711,8 @@ fn a_read_timeout_is_reported() -> anyhow::Result<()> {
         timeouts: Timeouts::default(),
         retry: RetryPolicy::default(),
     };
-    config.timeouts.response = std::time::Duration::from_millis(50);
-    config.timeouts.read = std::time::Duration::from_millis(50);
+    config.timeouts.response = Duration::from_secs(5);
+    config.timeouts.read = Duration::from_millis(50);
     config.retry.attempts = 1;
     let source = HttpsSource::new(&config)?;
     assert!(source.fetch_pointer().is_err());
@@ -658,6 +725,7 @@ fn lenient_head_treats_forbidden_as_absent_but_not_server_errors() -> anyhow::Re
         status: 403,
         headers: Vec::new(),
         body: Vec::new(),
+        delay_body: Duration::ZERO,
     })?;
     let endpoint = S3Endpoint::parse(
         "s3://bucket/prefix",
@@ -672,6 +740,7 @@ fn lenient_head_treats_forbidden_as_absent_but_not_server_errors() -> anyhow::Re
         status: 500,
         headers: Vec::new(),
         body: Vec::new(),
+        delay_body: Duration::ZERO,
     })?;
     let endpoint = S3Endpoint::parse(
         "s3://bucket/prefix",
@@ -682,5 +751,296 @@ fn lenient_head_treats_forbidden_as_absent_but_not_server_errors() -> anyhow::Re
     config.retry.attempts = 1;
     let client = S3Client::new(&config)?;
     assert!(client.head_lenient("blobs/x").is_err());
+    Ok(())
+}
+
+#[test]
+fn multipart_completion_reads_the_result_document() -> anyhow::Result<()> {
+    for (body, expect_ok) in [
+        (
+            "<Error><Code>InternalError</Code><Message>part lost</Message></Error>",
+            false,
+        ),
+        (
+            "<CompleteMultipartUploadResult><ETag>\"done\"</ETag></CompleteMultipartUploadResult>",
+            true,
+        ),
+    ] {
+        let body = body.to_string();
+        let expected_body = body.clone();
+        let server = start_server(move |request| {
+            if request.method == "HEAD" {
+                MockResponse::not_found()
+            } else if request.method == "POST" && request.path.contains("uploads=") {
+                MockResponse::ok(b"<UploadId>abc</UploadId>".to_vec())
+            } else if request.method == "PUT" && request.path.contains("partNumber=") {
+                let mut response = MockResponse::ok(Vec::new());
+                response.headers.push(("etag".into(), "\"p\"".into()));
+                response
+            } else if request.method == "POST" && request.path.contains("uploadId=") {
+                let mut response = MockResponse::ok(body.as_bytes().to_vec());
+                response.headers.push(("etag".into(), "\"done\"".into()));
+                response
+            } else if request.method == "DELETE" {
+                MockResponse::ok(Vec::new())
+            } else {
+                MockResponse::not_found()
+            }
+        })?;
+        let endpoint = S3Endpoint::parse(
+            "s3://bucket/prefix",
+            "us-east-1",
+            Some(Url::parse(&format!("https://{}", server.addr))?),
+        )?;
+        let config = config_with_ca(Endpoint::S3(endpoint), &server.ca);
+        let client = S3Client::new(&config)?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("blob");
+        let bytes = vec![7u8; 1024 * 1024];
+        std::fs::write(&path, &bytes)?;
+        let upload = Upload {
+            key: format!("blobs/{}", sha256_hex(&bytes)),
+            source: path,
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+            mode: UploadMode::PutIfAbsent,
+            kind: UploadKind::Blob,
+        };
+        let result = client.put_multipart(&upload, Precondition::IfAbsent);
+        assert_eq!(result.is_ok(), expect_ok, "body: {expected_body}");
+        if let Err(err) = result {
+            assert!(
+                format!("{err:#}").contains("error document"),
+                "unexpected error: {err:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn put_refuses_to_reuse_a_same_size_blob_with_a_different_checksum() -> anyhow::Result<()> {
+    let bytes = b"payload".to_vec();
+    let sha256 = sha256_hex(&bytes);
+    let wrong = checksum_sha256(&"cd".repeat(32)).expect("valid digest");
+    for (label, checksum, expected) in [
+        ("mismatch", Some(wrong), "refusing to reuse"),
+        ("missing", None, "cannot be verified"),
+    ] {
+        let size = bytes.len() as u64;
+        let server = start_server(move |request| {
+            if request.method == "PUT" {
+                let mut response = MockResponse::ok(Vec::new());
+                response.status = 412;
+                response
+            } else if request.method == "HEAD" {
+                let mut response = MockResponse::ok(Vec::new());
+                response
+                    .headers
+                    .push(("content-length".into(), size.to_string()));
+                if let Some(checksum) = &checksum {
+                    response
+                        .headers
+                        .push(("x-amz-checksum-sha256".into(), checksum.clone()));
+                }
+                response
+            } else {
+                MockResponse::not_found()
+            }
+        })?;
+        let endpoint = S3Endpoint::parse(
+            "s3://bucket/prefix",
+            "us-east-1",
+            Some(Url::parse(&format!("https://{}", server.addr))?),
+        )?;
+        let sink = S3Sink::new(&config_with_ca(Endpoint::S3(endpoint), &server.ca))?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("blob");
+        std::fs::write(&path, &bytes)?;
+        let upload = Upload {
+            key: format!("blobs/{sha256}"),
+            source: path,
+            sha256: sha256.clone(),
+            size,
+            mode: UploadMode::PutIfAbsent,
+            kind: UploadKind::Blob,
+        };
+        let err = sink.put(&upload, Precondition::IfAbsent).expect_err(label);
+        assert!(
+            format!("{err:#}").contains(expected),
+            "{label}: unexpected error {err:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn bootstrap_head_forbidden_asks_for_list_bucket() -> anyhow::Result<()> {
+    let server = start_server(|_| MockResponse {
+        status: 403,
+        headers: Vec::new(),
+        body: Vec::new(),
+        delay_body: Duration::ZERO,
+    })?;
+    let endpoint = S3Endpoint::parse(
+        "s3://bucket/prefix",
+        "us-east-1",
+        Some(Url::parse(&format!("https://{}", server.addr))?),
+    )?;
+    let sink = S3Sink::new(&config_with_ca(Endpoint::S3(endpoint), &server.ca))?;
+    let err = sink
+        .head_lenient("publisher.json")
+        .expect_err("a 403 must not be reported as absent");
+    assert!(
+        format!("{err:#}").contains("s3:ListBucket"),
+        "unexpected error {err:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn multipart_conditional_rejection_keeps_if_absent() -> anyhow::Result<()> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let size = 1024 * 1024u64;
+    let bytes = vec![7u8; size as usize];
+    let sha256 = sha256_hex(&bytes);
+    let server = start_server(move |request| {
+        capture.lock().unwrap().push(request.clone());
+        if request.method == "HEAD" {
+            MockResponse::not_found()
+        } else if request.method == "POST" && request.path.contains("uploads=") {
+            MockResponse::ok(b"<UploadId>u1</UploadId>".to_vec())
+        } else if request.method == "PUT" && request.path.contains("partNumber=") {
+            let mut response = MockResponse::ok(Vec::new());
+            response.headers.push(("etag".into(), "\"p\"".into()));
+            response
+        } else if request.method == "POST" && request.path.contains("uploadId=") {
+            MockResponse {
+                status: 501,
+                headers: Vec::new(),
+                body: Vec::new(),
+                delay_body: Duration::ZERO,
+            }
+        } else if request.method == "DELETE" {
+            MockResponse {
+                status: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+                delay_body: Duration::ZERO,
+            }
+        } else {
+            MockResponse::not_found()
+        }
+    })?;
+    let endpoint = S3Endpoint::parse(
+        "s3://bucket/prefix",
+        "us-east-1",
+        Some(Url::parse(&format!("https://{}", server.addr))?),
+    )?;
+    let mut config = config_with_ca(Endpoint::S3(endpoint), &server.ca);
+    config.retry.attempts = 1;
+    let client = S3Client::new(&config)?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("blob");
+    std::fs::write(&path, &bytes)?;
+    let upload = Upload {
+        key: format!("blobs/{sha256}"),
+        source: path,
+        sha256,
+        size,
+        mode: UploadMode::PutIfAbsent,
+        kind: UploadKind::Blob,
+    };
+    let err = client
+        .put_multipart(&upload, Precondition::IfAbsent)
+        .expect_err("a 501 on the conditional complete must fail the publish");
+    assert!(
+        format!("{err:#}").contains("If-None-Match"),
+        "unexpected error {err:#}"
+    );
+    let seen = seen.lock().unwrap();
+    let completes = seen
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.contains("uploadId="))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completes.len(),
+        1,
+        "must not retry without the precondition"
+    );
+    assert_eq!(completes[0].header("if-none-match"), Some("*"));
+    Ok(())
+}
+
+#[test]
+fn multipart_decodes_upload_id_entities() -> anyhow::Result<()> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let size = 1024 * 1024u64;
+    let bytes = vec![9u8; size as usize];
+    let sha256 = sha256_hex(&bytes);
+    let server = start_server(move |request| {
+        capture.lock().unwrap().push(request.clone());
+        if request.method == "HEAD" {
+            MockResponse::not_found()
+        } else if request.method == "POST" && request.path.contains("uploads=") {
+            MockResponse::ok(b"<UploadId>part&amp;id</UploadId>".to_vec())
+        } else if request.method == "PUT" && request.path.contains("partNumber=") {
+            let mut response = MockResponse::ok(Vec::new());
+            response.headers.push(("etag".into(), "\"p\"".into()));
+            response
+        } else if request.method == "POST" && request.path.contains("uploadId=") {
+            let mut response = MockResponse::ok(
+                b"<CompleteMultipartUploadResult><ETag>\"d\"</ETag></CompleteMultipartUploadResult>"
+                    .to_vec(),
+            );
+            response.headers.push(("etag".into(), "\"d\"".into()));
+            response
+        } else if request.method == "DELETE" {
+            MockResponse::ok(Vec::new())
+        } else {
+            MockResponse::not_found()
+        }
+    })?;
+    let endpoint = S3Endpoint::parse(
+        "s3://bucket/prefix",
+        "us-east-1",
+        Some(Url::parse(&format!("https://{}", server.addr))?),
+    )?;
+    let config = config_with_ca(Endpoint::S3(endpoint), &server.ca);
+    let client = S3Client::new(&config)?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("blob");
+    std::fs::write(&path, &bytes)?;
+    let upload = Upload {
+        key: format!("blobs/{sha256}"),
+        source: path,
+        sha256,
+        size,
+        mode: UploadMode::PutIfAbsent,
+        kind: UploadKind::Blob,
+    };
+    let outcome = client.put_multipart(&upload, Precondition::IfAbsent)?;
+    assert_eq!(outcome.status, PutStatus::Created);
+    let seen = seen.lock().unwrap();
+    let part = seen
+        .iter()
+        .find(|r| r.method == "PUT" && r.path.contains("partNumber="))
+        .expect("part upload");
+    assert!(
+        part.path.contains("uploadId=part%26id"),
+        "decoded upload id missing: {}",
+        part.path
+    );
+    let complete = seen
+        .iter()
+        .find(|r| r.method == "POST" && r.path.contains("uploadId="))
+        .expect("complete");
+    assert!(
+        complete.path.contains("uploadId=part%26id"),
+        "decoded upload id missing: {}",
+        complete.path
+    );
     Ok(())
 }

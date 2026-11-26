@@ -22,6 +22,7 @@ const MULTIPART_MIN_PART: u64 = 16 * 1024 * 1024;
 const MULTIPART_MAX_PART: u64 = 64 * 1024 * 1024;
 pub(super) const MAX_MULTIPART_PARTS: u64 = 10_000;
 const MIB: u64 = 1024 * 1024;
+const MAX_UPLOAD_ID_BYTES: usize = 2048;
 
 #[derive(Clone)]
 pub struct S3Client {
@@ -200,7 +201,14 @@ impl S3Client {
     }
 
     fn put_single(&self, upload: &Upload, precondition: Precondition) -> Result<PutOutcome> {
-        let headers = put_headers(&precondition);
+        let mut headers = put_headers(&precondition);
+        // Have the store record a whole-object SHA-256 so a later HEAD can
+        // prove the existing bytes before a name is reused.
+        headers.push((
+            "x-amz-checksum-sha256".to_string(),
+            checksum_sha256(&upload.sha256)
+                .context("upload SHA-256 is not a 64-character hex digest")?,
+        ));
         let response = self.send(
             Method::Put,
             &upload.key,
@@ -223,7 +231,7 @@ impl S3Client {
         }
         if status == 412 {
             if matches!(precondition, Precondition::IfAbsent) {
-                return self.existing_put(upload);
+                return self.existing_object(upload);
             }
             // A retried or lost response may have written exactly our bytes.
             if let Ok(bytes) = self.get(&upload.key, upload.size)
@@ -254,14 +262,20 @@ impl S3Client {
         Err(TransportError::status(status, format!("S3 PUT {} failed{code}", upload.key)).into())
     }
 
-    fn existing_put(&self, upload: &Upload) -> Result<PutOutcome> {
-        let meta = match self.head(&upload.key)? {
-            Some(meta) => meta,
-            None => bail!(
+    fn existing_object(&self, upload: &Upload) -> Result<PutOutcome> {
+        let meta = self.head(&upload.key)?.with_context(|| {
+            format!(
                 "S3 reported a conditional conflict for {} but the object is missing",
                 upload.key
-            ),
-        };
+            )
+        })?;
+        self.accept_existing(upload, meta)
+    }
+
+    /// Decide whether an object that already owns a key may be reused. A blob
+    /// is only reused when the store reports a SHA-256 checksum equal to the
+    /// staged bytes; size alone (or an ETag) is never treated as identity.
+    fn accept_existing(&self, upload: &Upload, meta: ObjectMeta) -> Result<PutOutcome> {
         ensure!(
             meta.size == upload.size,
             "S3 object {} already exists with {} bytes (expected {}) — refusing to overwrite",
@@ -269,7 +283,25 @@ impl S3Client {
             meta.size,
             upload.size
         );
-        if upload.kind != UploadKind::Blob {
+        if upload.kind == UploadKind::Blob {
+            let expected = checksum_sha256(&upload.sha256)
+                .context("upload SHA-256 is not a 64-character hex digest")?;
+            match meta.checksum_sha256.as_deref() {
+                Some(found) if found.trim() == expected => {}
+                Some(found) => bail!(
+                    "S3 object {} already exists with SHA-256 {} (expected {}) — refusing to reuse it",
+                    upload.key,
+                    found.trim(),
+                    expected
+                ),
+                None => bail!(
+                    "S3 object {} already exists but the store returned no x-amz-checksum-sha256, \
+                     so its bytes cannot be verified without overwriting; delete the object or \
+                     publish to a store that reports SHA-256 checksums",
+                    upload.key
+                ),
+            }
+        } else {
             let bytes = self.get(&upload.key, upload.size)?;
             ensure!(
                 hex_sha256(&bytes) == upload.sha256,
@@ -284,21 +316,6 @@ impl S3Client {
         })
     }
 
-    fn existing_object(&self, key: &str, size: u64) -> Result<PutOutcome> {
-        match self.head(key)? {
-            Some(meta) if meta.size == size => Ok(PutOutcome {
-                status: PutStatus::AlreadyExists,
-                etag: meta.etag,
-                size: meta.size,
-            }),
-            Some(meta) => bail!(
-                "S3 object {key} already exists with {} bytes (expected {size}) — refusing to overwrite",
-                meta.size,
-            ),
-            None => bail!("S3 reported a conditional conflict for {key} but the object is missing"),
-        }
-    }
-
     pub(super) fn put_multipart(
         &self,
         upload: &Upload,
@@ -308,18 +325,7 @@ impl S3Client {
         if matches!(&precondition, Precondition::IfAbsent)
             && let Some(meta) = self.head_lenient(&upload.key)?
         {
-            ensure!(
-                meta.size == upload.size,
-                "S3 object {} already exists with {} bytes (expected {}) — refusing to overwrite",
-                upload.key,
-                meta.size,
-                upload.size
-            );
-            return Ok(PutOutcome {
-                status: PutStatus::AlreadyExists,
-                etag: meta.etag,
-                size: meta.size,
-            });
+            return self.accept_existing(upload, meta);
         }
         // Multipart completion carries only per-part hashes, not a whole-object
         // checksum. Verify the staged source once here so the CAS key and the
@@ -351,14 +357,8 @@ impl S3Client {
         for result in results {
             parts.push(result?);
         }
-        let outcome = self.complete_multipart(
-            &upload.key,
-            &upload_id,
-            &parts,
-            precondition,
-            matches!(upload.kind, UploadKind::Blob),
-            upload.size,
-        )?;
+        let outcome =
+            self.complete_multipart(&upload.key, &upload_id, &parts, precondition, upload)?;
         if outcome.status != PutStatus::AlreadyExists {
             guard.armed = false;
         } else if self.abort_multipart(&upload.key, &upload_id).is_ok() {
@@ -382,11 +382,13 @@ impl S3Client {
         let response = response.ensure_success("S3 CreateMultipartUpload")?;
         let bytes = response.read_vec(16 * 1024)?;
         let text = String::from_utf8_lossy(&bytes);
-        let upload_id = extract_xml(&text, "UploadId")
+        let raw = extract_xml(&text, "UploadId")
             .context("S3 CreateMultipartUpload response has no UploadId")?;
+        let upload_id = decode_xml_entities(&raw, MAX_UPLOAD_ID_BYTES)
+            .context("S3 returned an invalid UploadId")?;
         ensure!(
             !upload_id.is_empty()
-                && upload_id.len() <= 2048
+                && upload_id.len() <= MAX_UPLOAD_ID_BYTES
                 && !upload_id.chars().any(char::is_control),
             "S3 returned an invalid UploadId"
         );
@@ -424,15 +426,13 @@ impl S3Client {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn complete_multipart(
         &self,
         key: &str,
         upload_id: &str,
         parts: &[MultipartPart],
         precondition: Precondition,
-        allow_unconditional_blob: bool,
-        size: u64,
+        upload: &Upload,
     ) -> Result<PutOutcome> {
         let xml = complete_xml(parts);
         let mut headers = put_headers(&precondition);
@@ -447,46 +447,38 @@ impl S3Client {
         )?;
         let status = response.status;
         if matches!(status, 200 | 201 | 204) {
+            let etag = response.header("etag").map(str::to_string);
+            // S3 can answer 200 and then report the failure in the body.
+            // Success is the result document, not the status code.
+            ensure_completion_body(response.read_vec(64 * 1024)?)?;
             return Ok(PutOutcome {
                 status: match precondition {
                     Precondition::IfAbsent => PutStatus::Created,
                     _ => PutStatus::Replaced,
                 },
-                etag: response.header("etag").map(str::to_string),
-                size,
+                etag,
+                size: upload.size,
             });
         }
         if status == 412 {
-            return self.existing_object(key, size);
+            return self.existing_object(upload);
         }
         if status == 404 {
             // A retried Complete may have succeeded before the response was
-            // lost. If the object is present at the expected size, treat the
+            // lost. If the object is present with matching bytes, treat the
             // upload as complete.
-            return self.existing_object(key, size);
+            return self.existing_object(upload);
         }
-        if allow_unconditional_blob && matches!(status, 400 | 501) {
-            // Content-addressed blobs are safe to complete without a
-            // precondition: identical names imply identical bytes.
-            let headers = vec![("content-type".to_string(), "application/xml".to_string())];
-            let response = self.send(
-                Method::Post,
-                key,
-                vec![("uploadId".to_string(), upload_id.to_string())],
-                headers,
-                Body::Bytes(complete_xml(parts).into_bytes()),
-                None,
-            )?;
-            if response.is_success() {
-                return Ok(PutOutcome {
-                    status: PutStatus::Created,
-                    etag: response.header("etag").map(str::to_string),
-                    size,
-                });
-            }
+        if matches!(status, 400 | 501) && matches!(precondition, Precondition::IfAbsent) {
+            // Never retry without `If-None-Match`: the earlier HEAD is not a
+            // guarantee, so degrading here could overwrite another publisher.
             return Err(TransportError::status(
-                response.status,
-                "S3 CompleteMultipartUpload failed after the conditional attempt",
+                status,
+                format!(
+                    "S3 rejected the conditional CompleteMultipartUpload for {key}; the store \
+                     does not support If-None-Match on multipart completion, so nothing was \
+                     committed and no existing object was overwritten"
+                ),
             )
             .into());
         }
@@ -544,6 +536,11 @@ impl RemoteSource for S3Source {
         {
             Ok(pointer) => Ok(Some(pointer)),
             Err(err) if err.is_miss() => Ok(None),
+            Err(err) if err.kind == ErrorKind::Forbidden => Err(anyhow::Error::new(err).context(
+                "S3 denied the remote index lookup; grant s3:ListBucket on the bucket so a \
+                     missing index can be told apart from an access denial (needed to bootstrap a \
+                     new store), then retry",
+            )),
             Err(err) => Err(anyhow::Error::new(err)),
         }
     }
@@ -579,11 +576,21 @@ impl S3Sink {
         Self { client }
     }
 
-    /// Optional existence hint. Unlike [`RemoteSink::head`], a 403 (missing
-    /// key without `s3:ListBucket`) is reported as absent; never use this to
-    /// decide that an object is safe to replace.
+    /// Bootstrap existence probe. A 403 here means the caller cannot list the
+    /// bucket, so a missing `publisher.json` and an access denial are
+    /// indistinguishable; fail with the permission to grant instead of
+    /// pretending the object is absent.
     pub fn head_lenient(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        self.client.head_lenient(key).map_err(anyhow::Error::new)
+        match self.client.head(key) {
+            Ok(meta) => Ok(meta),
+            Err(err) if err.kind == ErrorKind::Forbidden => {
+                Err(anyhow::Error::new(err).context(format!(
+                    "S3 denied the bootstrap lookup for {key}; grant s3:ListBucket on the bucket \
+                     so a missing object can be told apart from an access denial, then retry"
+                )))
+            }
+            Err(err) => Err(anyhow::Error::new(err)),
+        }
     }
 }
 
@@ -684,6 +691,29 @@ fn content_type(kind: &UploadKind) -> &'static str {
     }
 }
 
+/// A 2xx CompleteMultipartUpload is only a success when the body says so.
+/// An empty body is accepted for stores that answer 204; an error document
+/// and an unrelated document are not.
+fn ensure_completion_body(bytes: Vec<u8>) -> Result<()> {
+    let text = String::from_utf8_lossy(&bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.contains("<Error") {
+        let detail = extract_xml(trimmed, "Message")
+            .or_else(|| extract_xml(trimmed, "Code"))
+            .and_then(|raw| decode_xml_entities(&raw, 200).ok())
+            .unwrap_or_else(|| trimmed.chars().take(200).collect());
+        anyhow::bail!("S3 CompleteMultipartUpload returned an error document: {detail}");
+    }
+    ensure!(
+        trimmed.contains("<CompleteMultipartUploadResult"),
+        "S3 CompleteMultipartUpload returned an unexpected response body"
+    );
+    Ok(())
+}
+
 fn complete_xml(parts: &[MultipartPart]) -> String {
     let mut xml = String::from("<CompleteMultipartUpload>");
     for part in parts {
@@ -712,6 +742,101 @@ fn extract_xml(text: &str, tag: &str) -> Option<String> {
     let start = text.find(&start_tag)? + start_tag.len();
     let end = text[start..].find(&end_tag)? + start;
     Some(text[start..end].to_string())
+}
+
+/// Decode the predefined XML entities plus decimal/hex character references.
+/// Every reference must be well-formed and the decoded text must fit in
+/// `max_bytes`, so a hostile or malformed document cannot grow the value or
+/// leave an entity spelling in a query.
+fn decode_xml_entities(text: &str, max_bytes: usize) -> Result<String> {
+    let mut out = String::with_capacity(text.len().min(max_bytes));
+    let mut rest = text;
+    while let Some(position) = rest.find('&') {
+        out.push_str(&rest[..position]);
+        rest = &rest[position..];
+        let end = rest
+            .find(';')
+            .context("unterminated XML entity reference")?;
+        let entity = &rest[1..end];
+        let decoded = match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                let code = if let Some(hex) = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    entity.strip_prefix('#').and_then(|dec| dec.parse().ok())
+                };
+                code.and_then(char::from_u32)
+                    .context("invalid XML character reference")?
+            }
+        };
+        ensure!(
+            out.len() + decoded.len_utf8() <= max_bytes,
+            "decoded XML value exceeds {max_bytes} bytes"
+        );
+        out.push(decoded);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    ensure!(
+        out.len() <= max_bytes,
+        "decoded XML value exceeds {max_bytes} bytes"
+    );
+    Ok(out)
+}
+
+/// Base64 of the raw SHA-256 digest, the form S3 uses for
+/// `x-amz-checksum-sha256`.
+pub(super) fn checksum_sha256(hex_digest: &str) -> Option<String> {
+    let bytes = hex_bytes(hex_digest)?;
+    (bytes.len() == 32).then(|| base64_encode(&bytes))
+}
+
+fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for pair in bytes.as_chunks::<2>().0 {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+    }
+    Some(out)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let triple = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let value = u32::from(triple[0]) << 16 | u32::from(triple[1]) << 8 | u32::from(triple[2]);
+        out.push(TABLE[(value >> 18) as usize & 0x3f] as char);
+        out.push(TABLE[(value >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(value >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[value as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {

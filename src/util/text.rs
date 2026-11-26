@@ -2,14 +2,14 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use super::nofollow::open_regular;
-#[cfg(windows)]
-use super::platform::windows_acl_is_private;
 use super::platform::{is_windows_reserved, owned_by_us};
+#[cfg(windows)]
+use super::platform::{windows_acl_is_private, windows_acl_is_secret};
 
 /// One path component: no separators, no `.`/`..`, no NUL, no Windows
 /// drive/ADS separator, no trailing dot/space, no reserved device stem.
@@ -30,40 +30,42 @@ pub fn validate_component(value: &str, what: &str) -> Result<()> {
 }
 
 /// A **relative** path with only normal components. Rejects absolute paths,
-/// `..`, `.`, NUL, drive prefixes, and backslash/forward-slash tricks. This is
-/// the single gate for every manifest path that reaches the filesystem.
+/// `..`, `.`, NUL, drive prefixes, backslash/forward-slash tricks, and
+/// non-canonical spellings: an empty interior component (`deps//x`) or an
+/// explicit `.` component (`./x`, `deps/./x`) never reaches `Path`
+/// normalization, which would silently rewrite both. This is the single gate
+/// for every manifest path that reaches the filesystem.
 pub fn validate_rel(value: &str, what: &str) -> Result<PathBuf> {
     if value.is_empty() || value.contains('\0') || value.ends_with(['/', '\\']) {
         anyhow::bail!("invalid {what} {value:?}: empty or trailing separator");
     }
-    let normalized = value.replace('\\', "/");
     let mut out = PathBuf::new();
-    for component in Path::new(&normalized).components() {
-        match component {
-            Component::Normal(part) => {
-                let part = part.to_string_lossy();
-                validate_component(&part, what)?;
-                out.push(&*part);
-            }
-            _ => anyhow::bail!("invalid {what} {value:?}: only relative components are allowed"),
+    // Split the raw text: `Path::components` would fold `.` and repeated
+    // separators away before any check could see them.
+    for part in value.split(['/', '\\']) {
+        if part.is_empty() {
+            anyhow::bail!("invalid {what} {value:?}: empty path component");
         }
-    }
-    if out.as_os_str().is_empty() {
-        anyhow::bail!("invalid {what} {value:?}: empty path");
+        validate_component(part, what)?;
+        out.push(part);
     }
     Ok(out)
 }
 
-fn read_bounded(mut file: File, max_bytes: u64, message: &'static str) -> std::io::Result<String> {
-    if file.metadata()?.len() > max_bytes {
+fn read_capped(file: File, max_bytes: u64, message: &'static str) -> std::io::Result<String> {
+    // Take one byte past the cap so a file that grew after the metadata
+    // check, or reports a bogus length, still cannot exceed the limit.
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             message,
         ));
     }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    Ok(text)
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 /// Read at most `max_bytes` from the start of a regular file, without
@@ -80,7 +82,7 @@ pub fn read_text_prefix(path: &Path, max_bytes: u64) -> std::io::Result<String> 
 /// blocking on FIFOs/devices. Returns an error on non-regular or oversized
 /// inputs.
 pub fn read_small_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    read_bounded(
+    read_capped(
         open_regular(path, false)?,
         max_bytes,
         "not a small regular file",
@@ -105,7 +107,7 @@ pub fn read_private_text(path: &Path, max_bytes: u64) -> std::io::Result<String>
 fn read_trusted_text(path: &Path, max_bytes: u64, private: bool) -> std::io::Result<String> {
     #[cfg(not(unix))]
     let _ = private;
-    let mut file = open_regular(path, false)?;
+    let file = open_regular(path, false)?;
     let meta = file.metadata()?;
     if meta.len() > max_bytes {
         return Err(std::io::Error::new(
@@ -135,14 +137,26 @@ fn read_trusted_text(path: &Path, max_bytes: u64, private: bool) -> std::io::Res
         }
     }
     #[cfg(windows)]
-    if windows_acl_is_private(path) != Some(true) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "config file DACL grants write access to an untrusted principal",
-        ));
+    {
+        // Ordinary config cares about mutation; secrets must not be readable
+        // by another principal either.
+        let ok = if private {
+            windows_acl_is_secret(path)
+        } else {
+            windows_acl_is_private(path)
+        };
+        if ok != Some(true) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                if private {
+                    "private file DACL grants read or write access to an untrusted principal"
+                } else {
+                    "config file DACL grants write access to an untrusted principal"
+                },
+            ));
+        }
     }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
+    let text = read_capped(file, max_bytes, "not a small regular config file")?;
     Ok(text)
 }
 

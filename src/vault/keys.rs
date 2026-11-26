@@ -1,7 +1,7 @@
 //! Per-user manifest keys and the store's public key.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -84,7 +84,7 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub(crate) fn read_key_file(path: &Path) -> Result<Vec<u8>> {
-    let mut file = util::open_regular(path, false)
+    let file = util::open_regular(path, false)
         .with_context(|| format!("opening vault key {}", path.display()))?;
     let meta = file.metadata()?;
     if !util::owned_by_us(path, &meta) {
@@ -111,8 +111,9 @@ pub(crate) fn read_key_file(path: &Path) -> Result<Vec<u8>> {
             path.display()
         );
     }
-    let mut key = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut key)?;
+    // The key is exactly 32 bytes: never buffer an arbitrarily large file.
+    let mut key = Vec::with_capacity(32);
+    file.take(33).read_to_end(&mut key)?;
     if key.len() != 32 {
         anyhow::bail!("vault key {} is malformed", path.display());
     }
@@ -124,22 +125,30 @@ pub(crate) fn write_new_key_file(path: &Path, key: &[u8; 32]) -> Result<Vec<u8>>
         .parent()
         .with_context(|| format!("{} has no parent", path.display()))?;
     util::create_private_dir_all(parent)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
-        Ok(mut file) => {
-            file.write_all(key)?;
-            file.sync_all()?;
+    let base = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "vault.key".to_string());
+    // Stage the complete key, then publish it with a link that cannot replace
+    // a racing winner. Readers never observe a partly written key.
+    let (tmp, ()) = util::with_temp_file(parent, &format!("{base}.tmp"), "", 0o600, |file| {
+        file.write_all(key)?;
+        file.sync_all()?;
+        Ok(())
+    })?;
+    let result = match fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
             Ok(key.to_vec())
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => read_key_file(path),
-        Err(err) => Err(err).with_context(|| format!("creating vault key {}", path.display())),
-    }
+        Err(err) => Err(err).with_context(|| format!("publishing vault key {}", path.display())),
+    };
+    let _ = fs::remove_file(&tmp);
+    result
 }
 
 fn read_existing_key(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -284,5 +293,72 @@ pub(crate) fn write_store_public_key(store_root: &Path, key: &SigningKey) -> Res
             }
         }
         Err(err) => Err(err).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn assert_no_staging_files(dir: &Path) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.contains(".tmp"), "staging file left behind: {name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn first_writer_key_wins_and_leaves_no_staging_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("manifest.ed25519");
+        assert_eq!(write_new_key_file(&path, &[7u8; 32])?, vec![7u8; 32]);
+        assert_eq!(
+            write_new_key_file(&path, &[9u8; 32])?,
+            vec![7u8; 32],
+            "a later writer must keep the established identity"
+        );
+        assert_eq!(read_key_file(&path)?, vec![7u8; 32]);
+        assert_no_staging_files(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_writers_converge_on_the_winner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("manifest.ed25519");
+        let mut handles = Vec::new();
+        for seed in 1..=8u8 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                write_new_key_file(&path, &[seed; 32])
+            }));
+        }
+        let mut keys = Vec::new();
+        for handle in handles {
+            keys.push(handle.join().expect("writer thread panicked")?);
+        }
+        let winner = &keys[0];
+        assert!(keys.iter().all(|key| key == winner));
+        assert_eq!(&read_key_file(&path)?, winner);
+        assert_no_staging_files(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn reading_an_oversized_key_is_rejected() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("manifest.ed25519");
+        write_new_key_file(&path, &[5u8; 32])?;
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(&[0u8])?;
+        file.sync_all()?;
+        drop(file);
+
+        let err = read_key_file(&path).expect_err("a 33-byte key must be refused");
+        assert!(format!("{err:#}").contains("malformed"));
+        Ok(())
     }
 }

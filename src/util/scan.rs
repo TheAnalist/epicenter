@@ -11,6 +11,17 @@ use super::platform::metadata_nofollow;
 /// performance target: rustc artifacts are normally far smaller.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Refuse a copy whose running byte count passes [`MAX_FILE_BYTES`]. A metadata
+/// check alone cannot stop a file that grows after it was inspected, so every
+/// copy loop passes each chunk through this cap.
+pub(crate) fn check_copied_size(size: u64) -> Result<()> {
+    anyhow::ensure!(
+        size <= MAX_FILE_BYTES,
+        "copy exceeds the {MAX_FILE_BYTES} byte cap"
+    );
+    Ok(())
+}
+
 /// Bound one tree scan so a hostile tree cannot burn CPU/IO indefinitely.
 pub(crate) const MAX_SCAN_FILES: u64 = 2_000_000;
 
@@ -173,6 +184,28 @@ impl<'a> SafeWalk<'a> {
     }
 
     pub(crate) fn walk(self) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + 'a {
+        let (walker, filter, reject_root) = self.into_parts();
+        walker
+            .filter_entry(filter)
+            .take(if reject_root { 0 } else { usize::MAX })
+    }
+
+    /// [`walk`](Self::walk) with every visited entry charged to `budget`
+    /// **before** the safety predicate runs: a hostile tree of rejected
+    /// symlinks/reparse points cannot buy free traversal. Iteration stops when
+    /// the budget runs out; [`BudgetedWalk::truncated`] reports that it did.
+    pub(crate) fn walk_with(self, budget: &mut ScanBudget) -> BudgetedWalk<'_> {
+        let (walker, filter, reject_root) = self.into_parts();
+        BudgetedWalk {
+            walker,
+            budget,
+            filter,
+            reject_root,
+            stopped: false,
+        }
+    }
+
+    fn into_parts(self) -> (walkdir::IntoIter, fn(&walkdir::DirEntry) -> bool, bool) {
         // `follow_root_links(false)` stops a symlinked root. A Windows junction
         // is not a symlink for older platforms and non-surrogate reparse
         // directories are not either, so reject any reparse root explicitly.
@@ -187,13 +220,103 @@ impl<'a> SafeWalk<'a> {
         } else {
             walk_entry_is_safe
         };
-        WalkDir::new(self.base)
+        let walker = WalkDir::new(self.base)
             .min_depth(1)
             .max_depth(self.depth)
             .follow_links(false)
             .follow_root_links(false)
-            .into_iter()
-            .filter_entry(filter)
-            .take(if reject_root { 0 } else { usize::MAX })
+            .into_iter();
+        (walker, filter, reject_root)
+    }
+}
+
+/// A [`SafeWalk`] that charges a [`ScanBudget`] for every entry the walker
+/// visits — including entries the safety predicate then rejects.
+pub(crate) struct BudgetedWalk<'b> {
+    walker: walkdir::IntoIter,
+    budget: &'b mut ScanBudget,
+    filter: fn(&walkdir::DirEntry) -> bool,
+    reject_root: bool,
+    stopped: bool,
+}
+
+impl BudgetedWalk<'_> {
+    /// Did iteration stop because the budget ran out? A caller whose deletion
+    /// depends on a complete walk must treat `true` as fail-closed.
+    pub(crate) fn truncated(&self) -> bool {
+        self.stopped
+    }
+}
+
+impl Iterator for BudgetedWalk<'_> {
+    type Item = walkdir::Result<walkdir::DirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reject_root {
+            return None;
+        }
+        loop {
+            let item = self.walker.next()?;
+            if !self.budget.take() {
+                self.stopped = true;
+                return None;
+            }
+            match item {
+                Ok(entry) => {
+                    if !(self.filter)(&entry) {
+                        if entry.file_type().is_dir() {
+                            self.walker.skip_current_dir();
+                        }
+                        continue;
+                    }
+                    return Some(Ok(entry));
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copied_size_cap_rejects_an_oversized_stream() {
+        assert!(check_copied_size(MAX_FILE_BYTES).is_ok());
+        assert!(check_copied_size(MAX_FILE_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn budgeted_walk_stops_at_the_limit() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for index in 0..8 {
+            std::fs::write(root.path().join(format!("file{index}")), b"x")?;
+        }
+        let mut budget = ScanBudget::with_limit(3, "test");
+        let mut walk = SafeWalk::new(root.path()).walk_with(&mut budget);
+        let visited = walk.by_ref().filter_map(Result::ok).count();
+        assert_eq!(visited, 3, "the walk yields at most the budget");
+        assert!(walk.truncated(), "the walk reports the truncation");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_entries_consume_the_budget() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let victim = tempfile::tempdir()?;
+        for index in 0..3 {
+            std::os::unix::fs::symlink(victim.path(), root.path().join(format!("link{index}")))?;
+        }
+        let mut budget = ScanBudget::with_limit(2, "test");
+        let mut walk = SafeWalk::new(root.path()).walk_with(&mut budget);
+        let visited = walk.by_ref().filter_map(Result::ok).count();
+        assert_eq!(visited, 0, "symlinks are rejected, not visited");
+        assert!(
+            walk.truncated(),
+            "entries rejected by the safety filter still charge the budget"
+        );
+        Ok(())
     }
 }

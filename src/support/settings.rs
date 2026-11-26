@@ -670,7 +670,11 @@ fn validate_project_store(path: &Path, project_dir: &Path) -> Result<()> {
     .is_some()
     {
         let marker = path.join(crate::paths::STORE_MARKER);
-        if !marker.is_file() {
+        // A symlinked marker must not pass a plain `is_file()`: it would let a
+        // link to any regular file vouch for an unmarked directory.
+        let marked =
+            crate::util::probe(&marker, "store marker")?.is_some_and(|meta| meta.is_file());
+        if !marked {
             // An empty directory is a fresh store: the writer creates and
             // marks it. A non-empty unmarked directory is the dangerous
             // case (`store = "~/.cargo"`, `store = "~/.config"`).
@@ -808,7 +812,12 @@ fn validate_https_url(rest: &str) -> Result<()> {
         .split_once('/')
         .map(|(_, path)| path)
         .unwrap_or_default();
+    // The raw prefix checks run first: the URL parser folds percent-encoded
+    // dot segments during normalization, so parsing first could hide a `..`.
     validate_remote_prefix(path, "`[remote] url`")?;
+    // Let the parser validate what the raw checks cannot: host and port.
+    url::Url::parse(&format!("https://{rest}"))
+        .context("`[remote] url` is not a valid https URL")?;
     Ok(())
 }
 
@@ -1353,6 +1362,10 @@ mod tests {
             "https://cache.example/root#fragment",
             "https://cache.example/../root",
             "https://cache.example/%2e%2e/root",
+            "https://cache.example:not-a-port/root",
+            "https://cache.example:99999/root",
+            "https://:8080/root",
+            "https://[::1/root",
             "s3://bucket/../prefix",
             "s3://bucket//prefix",
             "s3://bucket/%2e%2e/prefix",
@@ -1664,6 +1677,25 @@ mod tests {
         );
         let settings = Settings::load_at(dir.path(), None).unwrap();
         assert!(settings.store().is_ok(), "a marked store is accepted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_store_marker_symlink_is_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("vault");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = dir.path().join("elsewhere");
+        write(&target, "not a store marker");
+        symlink(&target, store.join(crate::paths::STORE_MARKER)).unwrap();
+        write(&dir.path().join(FILE_NAME), "store = \"vault\"\n");
+
+        let settings = Settings::load_at(dir.path(), None).unwrap();
+        let err = settings.store().unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
     }
 
     #[test]

@@ -485,7 +485,13 @@ fn push_mismatch(out: &mut Vec<Mismatch>, field: &str, expected: &str, actual: &
 }
 
 fn path_key(value: &str) -> String {
-    let mut text = value.replace('\\', "/");
+    // On Unix a backslash is an ordinary path byte: folding it would make two
+    // distinct paths compare equal. Fold separators and case only on Windows.
+    let mut text = if cfg!(windows) {
+        value.replace('\\', "/")
+    } else {
+        value.to_string()
+    };
     while text.len() > 1 && text.ends_with('/') {
         text.pop();
     }
@@ -587,7 +593,7 @@ impl RemoteUnit {
         for file in &self.files {
             file.validate()?;
             ensure!(
-                paths.insert(file.path.to_ascii_lowercase()),
+                paths.insert(super::validate::relative_key(&file.path)),
                 "duplicate case-insensitive file path {:?} in unit {:?}",
                 file.path,
                 self.name
@@ -747,15 +753,30 @@ impl RemoteFile {
     }
 
     pub fn is_executable(&self) -> bool {
-        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
-        let Some((_, extension)) = name.rsplit_once('.') else {
-            // Rustc library artifacts always have an extension; an
-            // extensionless artifact in `deps/` is a binary.
-            return self.role == FileRole::Artifact;
+        let path_name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let dest_name = self.dest.rsplit('/').next().unwrap_or(&self.dest);
+        let has_extension = |name: &str| name.rsplit_once('.').is_some();
+        let executable_extension = |name: &str| {
+            name.rsplit_once('.').is_some_and(|(_, extension)| {
+                EXECUTABLE_EXTENSIONS
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
         };
-        EXECUTABLE_EXTENSIONS
-            .iter()
-            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+
+        // Rustc library artifacts always have an extension; an extensionless
+        // artifact in `deps/` is a binary. Check both names: the staged name
+        // and the destination can differ.
+        if self.role == FileRole::Artifact
+            && (!has_extension(path_name) || !has_extension(dest_name))
+        {
+            return true;
+        }
+        // A libraries reader must not install anything into the build tree.
+        if self.dest == "build" || self.dest.starts_with("build/") {
+            return true;
+        }
+        executable_extension(path_name) || executable_extension(dest_name)
     }
 
     fn validate(&self) -> Result<()> {

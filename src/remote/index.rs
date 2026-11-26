@@ -244,7 +244,7 @@ impl IndexBody {
             );
 
             for file in &unit.files {
-                let destination = file.dest.to_ascii_lowercase();
+                let destination = super::validate::relative_key(&file.dest);
                 if let Some(owner) = destinations.insert(destination, unit.name.as_str()) {
                     bail!(
                         "duplicate destination {:?} in remote index (units {:?} and {:?})",

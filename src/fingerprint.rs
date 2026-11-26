@@ -876,10 +876,8 @@ fn collect_classic_artifacts(
             if !metadata_nofollow(&candidate).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
-            for entry in crate::util::SafeWalk::new(&candidate).walk() {
-                if !budget.take() {
-                    return;
-                }
+            let mut walk = crate::util::SafeWalk::new(&candidate).walk_with(budget);
+            for entry in walk.by_ref() {
                 let Ok(entry) = entry else { continue };
                 if !entry.file_type().is_file() {
                     continue;
@@ -887,6 +885,9 @@ fn collect_classic_artifacts(
                 if let Ok(meta) = entry.metadata() {
                     paths.push((entry.path().to_path_buf(), meta.len(), meta.modified().ok()));
                 }
+            }
+            if walk.truncated() {
+                return;
             }
         }
     }
@@ -906,10 +907,8 @@ fn collect_new_artifacts(
         if !metadata_nofollow(&dir).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
-        for entry in crate::util::SafeWalk::new(&dir).walk() {
-            if !budget.take() {
-                return;
-            }
+        let mut walk = crate::util::SafeWalk::new(&dir).walk_with(budget);
+        for entry in walk.by_ref() {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() {
                 continue;
@@ -917,6 +916,9 @@ fn collect_new_artifacts(
             if let Ok(meta) = entry.metadata() {
                 paths.push((entry.path().to_path_buf(), meta.len(), meta.modified().ok()));
             }
+        }
+        if walk.truncated() {
+            return;
         }
     }
     let Ok(entries) = fs::read_dir(&unit.unit_dir) else {
@@ -1262,8 +1264,14 @@ mod tests {
     fn read_units_skips_a_symlinked_profile() -> Result<()> {
         let build = tempfile::tempdir()?;
         let victim = tempfile::tempdir()?;
-        let unit = victim.path().join(".fingerprint/pkg-1111222233334444");
-        fs::create_dir_all(&unit)?;
+        let unit_dir = victim.path().join(".fingerprint/pkg-1111222233334444");
+        fs::create_dir_all(&unit_dir)?;
+        // A real memo: without it `pick_memo` returns `None` and the test
+        // would pass even if discovery followed the link.
+        fs::write(unit_dir.join("lib-pkg"), "1111222233334444")?;
+        let unit = read_classic_unit("debug", &unit_dir).expect("a valid memo parses");
+        assert_eq!(unit.memo_hash.as_deref(), Some("1111222233334444"));
+
         std::os::unix::fs::symlink(victim.path(), build.path().join("debug"))?;
         assert!(read_units(build.path())?.is_empty());
         Ok(())

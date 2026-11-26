@@ -202,7 +202,15 @@ fn body_hash_size_and_canonical_form_are_enforced() -> Result<()> {
     assert!(verify_body(pointer, short, now).is_err());
 
     let pretty = serde_json::to_vec_pretty(index.body())?;
-    assert!(verify_body(pointer, &pretty, now).is_err());
+    let mut pretty_pointer = pointer.clone();
+    pretty_pointer.body_size = pretty.len() as u64;
+    pretty_pointer.body_sha256 = sha256_hex(&pretty);
+    let err = verify_body(&pretty_pointer, &pretty, now)
+        .expect_err("a pretty-printed body must reach the canonical check");
+    assert!(
+        format!("{err:#}").contains("canonical form"),
+        "unexpected error: {err:#}"
+    );
 
     assert!(verify_index(bytes, bytes, &public_key(&key), RemoteTier::Libraries, now).is_err());
     Ok(())
@@ -326,6 +334,60 @@ fn replay_state_isolates_endpoints_and_publisher_keys() -> Result<()> {
         let saved = state::load_state_at(dir.path(), policy)?.expect("independent replay state");
         assert_eq!(saved.sequence, sequence);
     }
+    Ok(())
+}
+
+#[test]
+fn replay_state_accepts_expiry_exactly_at_now() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let key = signing_key(7);
+    let public = public_key(&key);
+    let remote = remote_policy(&public);
+    let mut body = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
+    body.expires = now;
+    let index = make_index(body, &key, now)?;
+    index.pointer().verify(&public, now)?;
+
+    state::record_state_at(dir.path(), &remote, &index, now)?;
+    let saved = state::load_state_at(dir.path(), &remote)?.expect("state at the expiry boundary");
+    assert_eq!(saved.expires, now);
+    assert_eq!(saved.fetched_at, now);
+    Ok(())
+}
+
+#[test]
+fn oversized_replay_state_fails_closed_and_keeps_the_old_record() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let key = signing_key(7);
+    let remote = remote_policy(&public_key(&key));
+
+    let original = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
+    let original = make_index(original, &key, now)?;
+    state::record_state_at(dir.path(), &remote, &original, now)?;
+    let before = state::load_state_at(dir.path(), &remote)?.expect("state");
+
+    let mut oversized = body_for(&key, now, 8, RemoteTier::Libraries, Vec::new());
+    oversized.compatibility.features = (0..super::schema::MAX_FEATURES)
+        .map(|index| {
+            format!(
+                "{index:04}{}",
+                "a".repeat(super::schema::MAX_FEATURE_BYTES - 4)
+            )
+        })
+        .collect();
+    let oversized = make_index(oversized, &key, now)?;
+    let err = state::record_state_at(dir.path(), &remote, &oversized, now)
+        .expect_err("an oversized replay record must fail closed");
+    assert!(
+        format!("{err:#}").contains("cap"),
+        "unexpected error: {err:#}"
+    );
+
+    let after = state::load_state_at(dir.path(), &remote)?.expect("previous state");
+    assert_eq!(after.sequence, 7);
+    assert_eq!(after.body_sha256, before.body_sha256);
     Ok(())
 }
 
@@ -484,6 +546,109 @@ fn tier_gate_rejects_executables_in_libraries() -> Result<()> {
 }
 
 #[test]
+fn executable_destinations_are_classified_without_a_benign_staging_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for (path, dest, role, expected) in [
+        (
+            "deps/libdemo.rlib",
+            "deps/libdemo.rlib",
+            FileRole::Artifact,
+            false,
+        ),
+        (
+            "deps/libdemo.rlib",
+            "deps/libdemo.so",
+            FileRole::Artifact,
+            true,
+        ),
+        (
+            "deps/libdemo.rlib",
+            "deps/libdemo.DLL",
+            FileRole::Artifact,
+            true,
+        ),
+        (
+            "deps/libdemo.rlib",
+            "deps/libdemo.dylib",
+            FileRole::Artifact,
+            true,
+        ),
+        (
+            "deps/libdemo.rlib",
+            "deps/libdemo.exe",
+            FileRole::Artifact,
+            true,
+        ),
+        // An executable staged name must still count when the destination
+        // happens to be extensionless.
+        ("deps/libmacros.so", "deps/libmacros", FileRole::Extra, true),
+        // Extensionless artifacts are binaries regardless of destination.
+        ("deps/probe", "deps/probe", FileRole::Artifact, true),
+        // Anything installed into Cargo's build tree may execute during a
+        // build, even when neither path carries an executable extension.
+        (
+            "deps/libdemo.rlib",
+            "build/demo/out/tool",
+            FileRole::Extra,
+            true,
+        ),
+        (
+            "deps/libdemo.rlib",
+            "build/demo/out/helper.rlib",
+            FileRole::Extra,
+            true,
+        ),
+    ] {
+        let file = remote_file(dir.path(), path, dest, role, b"content")?;
+        assert_eq!(
+            file.is_executable(),
+            expected,
+            "staging path {path:?} -> destination {dest:?} ({role:?})"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn libraries_tier_filters_units_by_executable_destination() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let key = signing_key(28);
+
+    let mut unit = test_unit(
+        dir.path(),
+        "demo",
+        RemoteUnitKind::Lib,
+        "deps/libdemo.rlib",
+        FileRole::Artifact,
+        b"rlib bytes",
+    );
+    unit.files[0].dest = "deps/libdemo.so".to_string();
+
+    assert!(unit.executable_file().is_some());
+    assert!(!unit.importable_for(RemoteTier::Libraries));
+    assert!(unit.importable_for(RemoteTier::Full));
+
+    let body = body_for(&key, now, 20, RemoteTier::Libraries, vec![unit.clone()]);
+    let err = body
+        .validate_for(RemoteTier::Libraries)
+        .expect_err("a libraries index must reject an executable destination");
+    assert!(
+        format!("{err:#}").contains("executable unit"),
+        "unexpected error: {err:#}"
+    );
+    let full_body = body_for(&key, now, 21, RemoteTier::Full, vec![unit.clone()]);
+    assert!(full_body.validate_for(RemoteTier::Full).is_ok());
+
+    unit.files[0].dest = "deps/libdemo.rlib".to_string();
+    assert!(!unit.is_executable());
+    assert!(unit.importable_for(RemoteTier::Libraries));
+    let body = body_for(&key, now, 22, RemoteTier::Libraries, vec![unit]);
+    assert!(body.validate_for(RemoteTier::Libraries).is_ok());
+    Ok(())
+}
+
+#[test]
 fn path_workspace_and_path_traversal_are_rejected() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let now = now_secs();
@@ -583,6 +748,26 @@ fn duplicate_destinations_and_bad_names_are_rejected() -> Result<()> {
         vec![first.clone(), second],
     );
     assert!(body.validate_shape().is_err());
+
+    for spelling in [
+        "deps//libsame.rlib",
+        "deps/./libsame.rlib",
+        "./deps/libsame.rlib",
+    ] {
+        let duplicate = test_unit(
+            dir.path(),
+            "three",
+            RemoteUnitKind::Lib,
+            spelling,
+            FileRole::Artifact,
+            b"three",
+        );
+        let body = body_for(&key, now, 16, RemoteTier::Libraries, vec![duplicate]);
+        assert!(
+            body.validate_shape().is_err(),
+            "noncanonical spelling {spelling:?} must be rejected"
+        );
+    }
 
     let mut bad_name = first;
     bad_name.package = "different".to_string();
@@ -713,6 +898,24 @@ fn compatibility_mismatches_name_the_field() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+#[test]
+fn unix_path_key_keeps_backslash_distinct() {
+    let local = local_environment();
+    let mut compatibility = Compatibility::from_local(&local, &[]).unwrap();
+    compatibility.cargo_home = "/srv/cache/team".to_string();
+
+    let mut backslash = local;
+    backslash.cargo_home = "/srv/cache\\team".to_string();
+    let mismatches = compatibility.compare_local(&backslash);
+    assert!(
+        mismatches
+            .iter()
+            .any(|mismatch| mismatch.field == "cargo home"),
+        "{mismatches:?}"
+    );
+}
+
 #[test]
 fn local_compatibility_gate_checks_the_machine_tuple() -> Result<()> {
     let local = local_environment();
@@ -751,6 +954,18 @@ fn publisher_metadata_rejects_control_characters_and_oversize_text() -> Result<(
     assert!(body.validate_shape().is_err());
 
     body.publisher.ci_job.clear();
+    body.publisher.notes =
+        "first https://ci.example/job then https://user:pass@mirror.example/index".to_string();
+    assert!(
+        body.validate_shape().is_err(),
+        "credentials in a later URL must be rejected"
+    );
+
+    body.publisher.notes =
+        "first https://ci.example/job then https://mirror.example/index".to_string();
+    assert!(body.validate_shape().is_ok());
+
+    body.publisher.notes.clear();
     body.publisher.tool = "x".repeat(super::index::MAX_TOOL_BYTES + 1);
     assert!(body.validate_shape().is_err());
     Ok(())
@@ -948,12 +1163,261 @@ fn prepared_source<F>(
 where
     F: FnOnce(&std::path::Path) -> Result<Vec<RemoteUnit>>,
 {
+    prepared_source_at(key, now, 1, tier, local, build)
+}
+
+fn prepared_source_at<F>(
+    key: &SigningKey,
+    now: u64,
+    sequence: u64,
+    tier: RemoteTier,
+    local: &LocalEnvironment,
+    build: F,
+) -> Result<(tempfile::TempDir, SignedIndex)>
+where
+    F: FnOnce(&std::path::Path) -> Result<Vec<RemoteUnit>>,
+{
     let source = tempfile::tempdir()?;
     let units = build(source.path())?;
-    let body = body_for_local(key, now, 1, tier, units, local);
+    let body = body_for_local(key, now, sequence, tier, units, local);
     let index = make_index(body, key, now)?;
     write_index_tree(source.path(), &index)?;
     Ok((source, index))
+}
+
+struct PausedBlobSource<'a> {
+    inner: &'a DirSource,
+    reached: &'a std::sync::mpsc::SyncSender<()>,
+    release: &'a std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    paused: std::sync::atomic::AtomicBool,
+}
+
+impl RemoteSource for PausedBlobSource<'_> {
+    fn fetch_pointer(&self) -> Result<Vec<u8>> {
+        self.inner.fetch_pointer()
+    }
+
+    fn fetch_body(&self, sha256: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        self.inner.fetch_body(sha256, max_bytes)
+    }
+
+    fn fetch_blob(&self, sha256: &str, max_bytes: u64, out: &mut dyn std::io::Write) -> Result<()> {
+        if !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.reached
+                .send(())
+                .map_err(|_| anyhow::anyhow!("replay test receiver disappeared"))?;
+            self.release
+                .lock()
+                .map_err(|_| anyhow::anyhow!("replay test release lock was poisoned"))?
+                .recv()
+                .map_err(|_| anyhow::anyhow!("replay test release sender disappeared"))?;
+        }
+        self.inner.fetch_blob(sha256, max_bytes, out)
+    }
+}
+
+fn replay_lock_path(root: &std::path::Path, policy: &settings::RemotePolicy) -> Result<PathBuf> {
+    Ok(root
+        .join(STATE_DIR)
+        .join(format!("{}.json", state::endpoint_id(policy)?))
+        .with_extension("json.lock"))
+}
+
+#[test]
+fn reader_does_not_import_when_replay_state_cannot_be_recorded() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(25);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) = prepared_source(&key, now, RemoteTier::Libraries, &local, |root| {
+        Ok(vec![lib_unit(root)?])
+    })?;
+
+    // The advisory pre-check does not take the lock, so the fetch reaches the
+    // accepted-state transaction. A directory at the lock path makes durable
+    // state recording fail there, before any unit can be imported.
+    let lock_path = replay_lock_path(state.path(), &policy)?;
+    fs::create_dir_all(lock_path.parent().expect("lock parent"))?;
+    fs::create_dir(&lock_path)?;
+
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+
+    assert_eq!(report.imported, 0);
+    assert!(report.fallback.is_some(), "{report:?}");
+    assert!(crate::vault::stored_units(store.path())?.is_empty());
+    assert!(state::load_state_at(state.path(), &policy)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn older_concurrent_fetch_cannot_import_after_newer_sequence_is_accepted() -> Result<()> {
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(26);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _older_index) =
+        prepared_source_at(&key, now, 8, RemoteTier::Libraries, &local, |root| {
+            Ok(vec![lib_unit(root)?])
+        })?;
+    let dir_source = DirSource::new(source.path());
+    let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let paused = PausedBlobSource {
+        inner: &dir_source,
+        reached: &reached_tx,
+        release: &release_rx,
+        paused: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    let newer_body = body_for_local(&key, now, 9, RemoteTier::Libraries, Vec::new(), &local);
+    let newer_index = make_index(newer_body, &key, now)?;
+
+    let report = std::thread::scope(|scope| -> Result<FetchReport> {
+        let handle = scope.spawn(|| {
+            fetch_and_import(&FetchRequest {
+                remote: &policy,
+                source: &paused,
+                store_root: store.path(),
+                state_root: Some(state.path()),
+                packages: None,
+                selector: None,
+                layout: None,
+                profile: None,
+                unit_filter: None,
+                local: Some(&local),
+                generation: Some(&generation),
+                now,
+                dry_run: false,
+            })
+        });
+
+        // The older fetch has passed pointer verification and the advisory
+        // pre-check and is paused before importing.
+        if let Err(err) = reached_rx.recv_timeout(Duration::from_secs(10)) {
+            let _ = release_tx.send(());
+            let _ = handle.join();
+            return Err(anyhow::anyhow!(
+                "older fetch did not reach blob import: {err}"
+            ));
+        }
+        let accepted = state::record_state_at(state.path(), &policy, &newer_index, now);
+        let _ = release_tx.send(());
+        let report = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("older fetch panicked"))??;
+        accepted?;
+        Ok(report)
+    })?;
+
+    assert_eq!(report.imported, 0, "{report:?}");
+    assert!(
+        report
+            .fallback
+            .as_deref()
+            .is_some_and(|reason| reason.contains("rolled back")),
+        "{report:?}"
+    );
+    assert!(crate::vault::stored_units(store.path())?.is_empty());
+    assert_eq!(
+        state::load_state_at(state.path(), &policy)?
+            .expect("accepted sequence")
+            .sequence,
+        9
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_keeps_the_watermark_ahead_when_import_fails() -> Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let key = signing_key(27);
+    let local = LocalEnvironment::gather()?;
+    let now = now_secs();
+    let policy = policy_at(&public_key(&key), cache.path());
+    let generation = crate::vault::parity_key()?;
+    let (source, _index) =
+        prepared_source_at(&key, now, 8, RemoteTier::Libraries, &local, |root| {
+            Ok(vec![lib_unit(root)?])
+        })?;
+
+    // A conflicting regular file at the final unit path makes the content
+    // import fail after the accepted sequence has been recorded.
+    let units = crate::vault::units_dir(store.path(), &generation);
+    fs::create_dir_all(&units)?;
+    fs::write(units.join("demo-0011223344556677"), b"not a directory")?;
+
+    let report = fetch_and_import(&FetchRequest {
+        remote: &policy,
+        source: &DirSource::new(source.path()),
+        store_root: store.path(),
+        state_root: Some(state.path()),
+        packages: None,
+        selector: None,
+        layout: None,
+        profile: None,
+        unit_filter: None,
+        local: Some(&local),
+        generation: Some(&generation),
+        now,
+        dry_run: false,
+    })?;
+
+    assert_eq!(report.imported, 0, "{report:?}");
+    assert!(
+        report
+            .fallback
+            .as_deref()
+            .is_some_and(|reason| reason.contains("import failed")),
+        "{report:?}"
+    );
+    assert!(crate::vault::stored_units(store.path())?.is_empty());
+
+    assert_eq!(
+        state::load_state_at(state.path(), &policy)?
+            .expect("watermark survives an import failure")
+            .sequence,
+        8
+    );
+
+    let older_body = body_for_local(&key, now, 7, RemoteTier::Libraries, Vec::new(), &local);
+    let older_index = make_index(older_body, &key, now)?;
+    let mut applied = false;
+    let result = state::with_accepted_state(state.path(), &policy, &older_index, now, || {
+        applied = true;
+        Ok(())
+    });
+    assert!(result.is_err(), "the older sequence must stay rejected");
+    assert!(!applied, "rejected content must never run");
+    Ok(())
 }
 
 #[test]

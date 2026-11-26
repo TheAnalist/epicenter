@@ -54,8 +54,6 @@ pub use self::nofollow::{DirChainGuard, create_dir_chain_nofollow};
 pub(crate) use self::nofollow::{open_dir_chain_at, open_file_nofollow, set_stamp_fd};
 pub(crate) use self::nofollow::{open_regular, remove_empty_dir, remove_file, remove_tree};
 
-#[cfg(windows)]
-pub use self::platform::windows_acl_is_private;
 pub(crate) use self::platform::{
     PathKind, Probed, TrustPolicy, check_trusted_path, probe_dir, probe_file, probe_kind,
     probe_lenient,
@@ -64,6 +62,8 @@ pub use self::platform::{
     ensure_windows_user_path, euid, io_error, is_not_found, is_reparse_point, is_windows_reserved,
     metadata_nofollow, owned_by_us, probe,
 };
+#[cfg(windows)]
+pub use self::platform::{windows_acl_is_private, windows_acl_is_secret};
 
 pub use self::proc::{command_for, on_path, tool_path, which, which_path};
 

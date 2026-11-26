@@ -63,7 +63,18 @@ fn restore_falls_back_to_copy_across_filesystems() -> Result<()> {
     let copied = view
         .path()
         .join("debug/deps/libserde-102a33f055a8d229.rlib");
-    assert_ne!(fs::metadata(&stored)?.ino(), fs::metadata(&copied)?.ino());
+    // Inode numbers are per filesystem: comparing the raw number across
+    // devices proves nothing. A private copy owns its inode (nlink 1).
+    assert_eq!(
+        fs::metadata(&copied)?.nlink(),
+        1,
+        "a cross-device restore is a private copy"
+    );
+    assert_eq!(
+        fs::read(&stored)?.len(),
+        64,
+        "the store source stays in place"
+    );
     assert_eq!(fs::read(&copied)?.len(), 64);
     Ok(())
 }

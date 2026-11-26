@@ -9,8 +9,8 @@ use crate::util::{self, FileLock, now_secs};
 
 use super::identity::parity_key;
 use super::layout::{
-    check_store_trust, ensure_writable_store, generation_names, remove_generation_lock,
-    store_chain_has_reparse, store_lock_path, units_dir,
+    check_store_trust, ensure_writable_store, generation_names, store_chain_has_reparse,
+    store_lock_path, units_dir,
 };
 use super::manifest::{Manifest, UnitEntry, load_manifest, load_manifest_at, save_manifest};
 
@@ -130,8 +130,6 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
         Some(meta) if meta.is_dir() => {}
         Some(_) => anyhow::bail!("generation {} is not a directory", generation_dir.display()),
         None => {
-            drop(lock);
-            remove_generation_lock(store_root, generation);
             return Ok(0);
         }
     }
@@ -217,8 +215,7 @@ pub fn drop_units(store_root: &Path, generation: &str, names: &[String]) -> Resu
     }
     drop(lock);
     if empty {
-        // The parity-key store is gone; its outside lock file is debris.
-        remove_generation_lock(store_root, generation);
+        // The lock file deliberately outlives the generation (see layout.rs).
     }
     Ok(dropped)
 }
@@ -238,13 +235,14 @@ fn sweep_blobs(store_root: &Path, generation: &str, manifest: &Manifest) {
     // walk would traverse the subtree before filtering it: walkdir applies the
     // predicate only after descending.
     let mut entries = Vec::new();
-    for entry in util::SafeWalk::new(&blobs).walk() {
-        if !budget.take() {
-            break;
-        }
-        if let Ok(entry) = entry {
-            entries.push(entry);
-        }
+    let mut walk = util::SafeWalk::new(&blobs).walk_with(&mut budget);
+    for entry in walk.by_ref().flatten() {
+        entries.push(entry);
+    }
+    // A truncated sweep cannot prove which blobs are unreferenced, so leave
+    // the tree untouched rather than deleting from an incomplete view.
+    if walk.truncated() {
+        return;
     }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.depth()));
     for entry in entries {
@@ -289,7 +287,7 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
     }
     let active = parity_key().ok();
     let mut out = Vec::new();
-    let mut scanned = 0u64;
+    let mut budget = util::ScanBudget::new("store tree");
     for parity in generation_names(store_root)? {
         let mut info = GenerationInfo {
             parity: parity.clone(),
@@ -301,21 +299,21 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
             info.created = Some(manifest.created);
             info.updated = Some(manifest.updated);
         }
-        let units = units_dir(store_root, &parity);
-        if !util::has_reparse_component(store_root, &units) && units.is_dir() {
-            #[cfg(any(unix, windows))]
-            let mut seen_inodes = std::collections::HashSet::new();
-            let walker = util::SafeWalk::new(&units).walk();
-            for entry in walker {
+        let generation_root = store_root.join(&parity);
+        #[cfg(any(unix, windows))]
+        let mut seen_inodes = std::collections::HashSet::new();
+        for tree in ["units", "blobs"] {
+            let tree = generation_root.join(tree);
+            if util::has_reparse_component(store_root, &tree) {
+                continue;
+            }
+            match util::metadata_nofollow(&tree) {
+                Ok(meta) if meta.is_dir() => {}
+                _ => continue,
+            }
+            let mut walk = util::SafeWalk::new(&tree).walk_with(&mut budget);
+            for entry in walk.by_ref() {
                 let entry = entry?;
-                scanned = scanned.saturating_add(1);
-                if scanned > util::MAX_SCAN_FILES {
-                    anyhow::bail!(
-                        "store {} has more than {} files — refusing an unbounded scan",
-                        store_root.display(),
-                        util::MAX_SCAN_FILES
-                    );
-                }
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -338,6 +336,13 @@ pub fn generations(store_root: &Path) -> Result<Vec<GenerationInfo>> {
                 if link_count(entry.path(), &meta) > 1 {
                     info.linked += 1;
                 }
+            }
+            if walk.truncated() {
+                anyhow::bail!(
+                    "store {} has more than {} files — refusing an unbounded scan",
+                    store_root.display(),
+                    util::MAX_SCAN_FILES
+                );
             }
         }
         out.push(info);

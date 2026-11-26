@@ -13,7 +13,7 @@ use super::{
 use crate::fingerprint::UnitLayout;
 use crate::lockfile::{LockIndex, LockSource};
 use crate::settings::{RemotePolicy, RemoteTier};
-use crate::vault::{self, ImportFile, ImportSource, ImportUnit};
+use crate::vault::{self, ImportFile, ImportReport, ImportSource, ImportUnit};
 
 /// Everything one fetch/import needs. Tests inject `local`, `generation` and
 /// `state_root`; production derives them from the child toolchain.
@@ -173,12 +173,6 @@ pub fn fetch_and_import(request: &FetchRequest<'_>) -> Result<FetchReport> {
         Err(err) => return Ok(tampered(report, format!("{err:#}"))),
     };
 
-    if !request.dry_run
-        && let Err(err) = cache.install_pointer(&pointer_bytes)
-    {
-        return Ok(fallback(report, format!("caching index pointer: {err:#}")));
-    }
-
     let local = match request.local {
         Some(local) => local.clone(),
         None => LocalEnvironment::gather_for(request.selector)?,
@@ -205,14 +199,12 @@ pub fn fetch_and_import(request: &FetchRequest<'_>) -> Result<FetchReport> {
         return Ok(report);
     }
     if candidates.is_empty() {
-        finish_state(
-            &state_root,
-            request.remote,
-            &index,
-            request.now,
-            &mut report,
-        );
-        return Ok(report);
+        match state::with_accepted_state(&state_root, request.remote, &index, request.now, || {
+            cache.install_pointer(&pointer_bytes)
+        }) {
+            Ok(_) => return Ok(report),
+            Err(err) => return Ok(fallback(report, format!("{err:#}"))),
+        }
     }
 
     let generation = match request.generation {
@@ -223,14 +215,13 @@ pub fn fetch_and_import(request: &FetchRequest<'_>) -> Result<FetchReport> {
     let all_imports = build_imports(&candidates, &cache)?;
 
     let main_writable = vault::store_accepts_imports(request.store_root);
-    let mut used_cache = !main_writable;
-    let target = if used_cache {
+    let target = if !main_writable {
         &cache_store_root
     } else {
         request.store_root
     };
     let missing = vault::missing_import_units(target, &generation, &all_imports)?;
-    if used_cache {
+    if !main_writable {
         report.cache_store = Some(cache_store_root.clone());
     }
     if missing.is_empty() {
@@ -240,29 +231,30 @@ pub fn fetch_and_import(request: &FetchRequest<'_>) -> Result<FetchReport> {
         report.skipped += all_imports.len();
         report.files = 0;
         report.bytes = 0;
-        finish_state(
-            &state_root,
-            request.remote,
-            &index,
-            request.now,
-            &mut report,
-        );
-        return Ok(report);
+
+        match state::with_accepted_state(&state_root, request.remote, &index, request.now, || {
+            cache.install_pointer(&pointer_bytes)
+        }) {
+            Ok(_) => return Ok(report),
+            Err(err) => return Ok(fallback(report, format!("{err:#}"))),
+        }
     }
-    if used_cache && !vault::store_accepts_imports(&cache_store_root) {
+    if !main_writable && !vault::store_accepts_imports(&cache_store_root) {
         report.fallback = Some(if cache_store_root.exists() {
             "store is read-only and the cache store is read-only; missing units were not imported"
                 .to_string()
         } else {
             "store is read-only and the cache store is not writable".to_string()
         });
-        finish_state(
-            &state_root,
-            request.remote,
-            &index,
-            request.now,
-            &mut report,
-        );
+        if let Err(err) =
+            state::with_accepted_state(&state_root, request.remote, &index, request.now, || {
+                cache.install_pointer(&pointer_bytes)
+            })
+        {
+            // No content was imported. Preserve the actionable read-only fallback
+            // and report that the accepted sequence could not be recorded.
+            report.warning = Some(format!("recording remote state: {err:#}"));
+        }
         return Ok(report);
     }
 
@@ -303,44 +295,49 @@ pub fn fetch_and_import(request: &FetchRequest<'_>) -> Result<FetchReport> {
     }
     let imports = build_imports(&selected, &cache)?;
 
-    let imported = match vault::import_units(target, &generation, &toolchain, &imports) {
-        Ok(imported) => Some(imported),
-        Err(err) if !used_cache && vault::store_accepts_imports(&cache_store_root) => {
-            // A writable-looking store can still reject a write (ACL, mount
-            // remount, disk policy). Use the local cache store rather than
-            // failing the build.
-            match vault::import_units(&cache_store_root, &generation, &toolchain, &imports) {
-                Ok(imported) => {
-                    used_cache = true;
-                    report.warning = Some(format!("store import failed, used cache: {err:#}"));
-                    Some(imported)
-                }
-                Err(cache_err) => {
-                    return Ok(fallback(
-                        report,
-                        format!("import failed ({err:#}); cache import failed ({cache_err:#})"),
-                    ));
-                }
-            }
-        }
-        Err(err) => return Ok(fallback(report, format!("import failed: {err:#}"))),
-    };
-    if let Some(imported) = imported {
-        report.imported = imported.stored;
-        report.skipped += imported.skipped;
-        report.files = imported.files;
-        report.bytes = imported.bytes;
-    }
-    if used_cache {
-        report.cache_store = Some(cache_store_root);
-    }
-    finish_state(
+    let (imported, cache_used) = match state::with_accepted_state(
         &state_root,
         request.remote,
         &index,
         request.now,
-        &mut report,
-    );
+        || -> Result<(ImportReport, bool)> {
+            // The watermark is already durable, and the replay lock is still held.
+            cache.install_pointer(&pointer_bytes)?;
+
+            match vault::import_units(target, &generation, &toolchain, &imports) {
+                Ok(imported) => Ok((imported, !main_writable)),
+
+                Err(err) if !main_writable && vault::store_accepts_imports(&cache_store_root) => {
+                    match vault::import_units(&cache_store_root, &generation, &toolchain, &imports)
+                    {
+                        Ok(imported) => {
+                            report.warning =
+                                Some(format!("store import failed, used cache: {err:#}"));
+                            Ok((imported, true))
+                        }
+                        Err(cache_err) => anyhow::bail!(
+                            "import failed ({err:#}); cache import failed ({cache_err:#})"
+                        ),
+                    }
+                }
+
+                Err(err) => Err(err).context("import failed"),
+            }
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return Ok(fallback(report, format!("{err:#}"))),
+    };
+
+    report.imported = imported.stored;
+    report.skipped += imported.skipped;
+    report.files = imported.files;
+    report.bytes = imported.bytes;
+
+    if cache_used {
+        report.cache_store = Some(cache_store_root);
+    }
+
     if let Err(err) = cache.sweep(&index) {
         report.warning = Some(format!("cache sweep failed: {err:#}"));
     }
@@ -422,18 +419,6 @@ fn build_imports(candidates: &[&RemoteUnit], cache: &cache::Cache) -> Result<Vec
         });
     }
     Ok(out)
-}
-
-fn finish_state(
-    root: &Path,
-    remote: &RemotePolicy,
-    index: &SignedIndex,
-    now: u64,
-    report: &mut FetchReport,
-) {
-    if let Err(err) = state::record_state_at(root, remote, index, now) {
-        report.warning = Some(format!("recording remote state: {err:#}"));
-    }
 }
 
 fn fallback(mut report: FetchReport, reason: impl Into<String>) -> FetchReport {

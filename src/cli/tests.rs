@@ -360,3 +360,130 @@ fn fetch_accepts_dry_run_unit_and_all() {
         _ => panic!("expected store fetch"),
     }
 }
+
+#[test]
+fn setup_revert_is_detected_before_policy_load() {
+    let cli = Cli::try_parse_from(["epicenter", "setup", "--revert"]).unwrap();
+    assert!(super::setup_revert(&cli.command).is_some());
+
+    let cli = Cli::try_parse_from(["epicenter", "setup", "--dry-run"]).unwrap();
+    assert!(super::setup_revert(&cli.command).is_none());
+}
+
+#[test]
+fn exec_target_dir_takes_its_value_only_after_equals() {
+    let cli = Cli::try_parse_from(["epicenter", "exec", "--target-dir", "cargo", "test"]).unwrap();
+    match cli.command {
+        Command::Exec {
+            target_dir,
+            command,
+            ..
+        } => {
+            assert_eq!(target_dir.as_deref(), Some("job"));
+            assert_eq!(command, vec!["cargo".to_string(), "test".to_string()]);
+        }
+        _ => panic!("expected exec"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "epicenter",
+        "exec",
+        "--target-dir=out",
+        "--",
+        "cargo",
+        "test",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Exec {
+            target_dir,
+            command,
+            ..
+        } => {
+            assert_eq!(target_dir.as_deref(), Some("out"));
+            assert_eq!(command, vec!["cargo".to_string(), "test".to_string()]);
+        }
+        _ => panic!("expected exec"),
+    }
+
+    let cli = Cli::try_parse_from(["epicenter", "exec", "--target-dir", "--", "true"]).unwrap();
+    match cli.command {
+        Command::Exec {
+            target_dir,
+            command,
+            ..
+        } => {
+            assert_eq!(target_dir.as_deref(), Some("job"));
+            assert_eq!(command, vec!["true".to_string()]);
+        }
+        _ => panic!("expected exec"),
+    }
+}
+
+#[test]
+fn wrapper_from_environment_or_config_counts() {
+    use std::ffi::OsString;
+
+    let none: [Option<OsString>; 2] = [None, None];
+    assert!(!super::build::wrapper_configured(&none, None));
+    assert!(!super::build::wrapper_configured(&none, Some("")));
+    assert!(super::build::wrapper_configured(&none, Some("sccache")));
+
+    let env: [Option<OsString>; 2] = [Some(OsString::from("sccache")), None];
+    assert!(super::build::wrapper_configured(&env, None));
+
+    let env: [Option<OsString>; 2] = [None, Some(OsString::from("kache"))];
+    assert!(super::build::wrapper_configured(&env, None));
+}
+
+#[test]
+fn profile_summary_matches_the_written_dev_debug() {
+    use epicenter_cli::profile::DevDebug;
+
+    assert_eq!(super::setup::dev_profile_label(DevDebug::Full), "debug=2");
+    assert_eq!(
+        super::setup::dev_profile_label(DevDebug::None),
+        "debug=false"
+    );
+    let line = super::setup::dev_profile_label(DevDebug::Line);
+    if cfg!(unix) {
+        assert!(line.contains("split-debuginfo=unpacked"));
+    } else {
+        assert!(!line.contains("split-debuginfo"));
+    }
+}
+
+#[test]
+fn doctor_renders_a_policy_error_as_a_check() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let global = dir.path().join("epicenter.toml");
+    std::fs::write(&global, "[remote]\nurl = \"https://cache.example/root\"\n")?;
+    let settings = epicenter_cli::settings::Settings::load_at(dir.path(), Some(&global))?;
+    let (checks, profile) = super::build::read_policy_checks(&settings);
+    assert!(profile.is_none(), "an invalid policy has no summary");
+    assert_eq!(checks.len(), 1);
+    assert!(matches!(
+        checks[0].level,
+        epicenter_cli::doctor::Level::Fail
+    ));
+    assert!(checks[0].message.contains("policy"));
+    Ok(())
+}
+
+#[test]
+fn dry_run_always_wins_over_confirmation_flags() {
+    for dry_run in [false, true] {
+        for yes in [false, true] {
+            for y in [false, true] {
+                assert_eq!(
+                    super::confirmed_delete(dry_run, yes, y),
+                    !dry_run && (yes || y)
+                );
+            }
+        }
+    }
+    assert!(!super::confirmed_delete(true, false, true));
+    assert!(!super::confirmed_delete(true, true, false));
+    assert!(super::confirmed_delete(false, false, true));
+    assert!(super::confirmed_delete(false, true, false));
+}

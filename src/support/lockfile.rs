@@ -40,12 +40,14 @@ pub struct LockIndex {
 }
 
 impl LockIndex {
-    /// Nearest `Cargo.lock` at or above `cwd` (or above `manifest`).
+    /// The lock Cargo resolves the project against.
     ///
-    /// `None` means "cannot tell" — no lock, unreadable, or empty — and the
-    /// caller keeps the whole-generation seed.
+    /// A workspace member is built against the workspace root's lock, not a
+    /// member-local `Cargo.lock` left over from a standalone checkout, so the
+    /// root wins whenever one is found. `None` means "cannot tell" — no lock,
+    /// unreadable, or empty — and the caller keeps the whole-generation seed.
     pub fn load(cwd: &Path, manifest: Option<&Path>) -> Option<Self> {
-        let mut dir = match manifest {
+        let start = match manifest {
             Some(manifest) => {
                 let manifest = if manifest.is_absolute() {
                     manifest.to_path_buf()
@@ -59,6 +61,12 @@ impl LockIndex {
             }
             None => cwd.to_path_buf(),
         };
+        if let Some(root) = workspace_root(&start) {
+            // The workspace root owns the lockfile: an absent lock is "cannot
+            // tell", never a fallback to a member-local file Cargo ignores.
+            return Self::parse(&root.join("Cargo.lock"));
+        }
+        let mut dir = start;
         loop {
             let lock = dir.join("Cargo.lock");
             if lock.is_file() {
@@ -219,6 +227,25 @@ impl LockIndex {
     }
 }
 
+/// The nearest `Cargo.toml` at or above `start` that declares a `[workspace]`.
+/// Cargo resolves members against that root's `Cargo.lock`, not against a
+/// member-local file. A symlinked, oversized or unreadable manifest is not a
+/// workspace marker.
+fn workspace_root(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        let Ok(text) = util::read_small_text(&manifest, 4 * 1024 * 1024) else {
+            continue;
+        };
+        if let Ok(value) = toml::from_str::<toml::Value>(&text)
+            && value.get("workspace").is_some()
+        {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
 /// `--manifest-path <p>` or `--manifest-path=<p>` from a child's argv.
 pub fn manifest_arg(command: &[String]) -> Option<PathBuf> {
     let mut args = command.iter();
@@ -366,7 +393,15 @@ mod tests {
     fn a_symlinked_lock_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.lock");
-        std::fs::write(&real, "version = 4\n").unwrap();
+        std::fs::write(
+            &real,
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n",
+        )
+        .unwrap();
+        assert!(
+            LockIndex::parse(&real).is_some(),
+            "the fixture must itself be a readable lockfile"
+        );
         let link = dir.path().join("Cargo.lock");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -385,5 +420,77 @@ mod tests {
             }
         }
         assert!(LockIndex::parse(&link).is_none());
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_workspace_member_uses_the_workspace_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("crates/member");
+        std::fs::create_dir_all(&member).unwrap();
+        write(
+            &root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n",
+        );
+        write(
+            &root.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n",
+        );
+        write(
+            &member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        );
+        // A standalone-era lock in the member must not filter the restore.
+        write(
+            &member.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"0.9.0\"\n",
+        );
+
+        let index = LockIndex::load(&member, None).expect("workspace lock");
+        assert!(index.matches("serde", Some("1.0.219")));
+        assert!(!index.matches("serde", Some("0.9.0")));
+
+        let manifest = member.join("Cargo.toml");
+        let index = LockIndex::load(root.path(), Some(&manifest)).expect("workspace lock");
+        assert!(index.matches("serde", Some("1.0.219")));
+    }
+
+    #[test]
+    fn a_workspace_without_a_lock_is_cannot_tell() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        write(
+            &root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        );
+        write(
+            &member.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"0.9.0\"\n",
+        );
+
+        assert!(
+            LockIndex::load(&member, None).is_none(),
+            "the workspace root owns the lock, so a member-local file is ignored"
+        );
+    }
+
+    #[test]
+    fn a_standalone_package_still_uses_its_own_lock() {
+        let root = tempfile::tempdir().unwrap();
+        write(
+            &root.path().join("Cargo.toml"),
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            &root.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+
+        let index = LockIndex::load(root.path(), None).expect("standalone lock");
+        assert!(index.matches("solo", Some("0.1.0")));
     }
 }

@@ -68,7 +68,13 @@ pub fn overlap(
         let mut paths = Vec::with_capacity(stored.entry.files.len());
         for file in &stored.entry.files {
             bytes = bytes.saturating_add(file.size);
-            paths.push(stored.dir.join(&file.path));
+            // A compressed file's bytes live in a content-addressed blob under
+            // the generation root, not in the unit directory. Count the real
+            // inode so shared blobs are not credited per reference.
+            paths.push(match &file.object {
+                Some(object) => stored.store_root.join(&stored.generation).join(object),
+                None => stored.dir.join(&file.path),
+            });
         }
         let is_active = active.contains(&stored.entry.name);
         let row = OverlapUnit {

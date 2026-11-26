@@ -582,38 +582,31 @@ pub fn restore_with(
                 continue;
             }
         }
-        // The memo's destination in the manifest is layout-agnostic.
-        let already = entry
-            .files
-            .iter()
-            .find(|file| file.path == entry.memo)
-            .and_then(|file| read_small_regular(&view_root.join(&entry.profile).join(&file.dest)))
-            .map(|text| text.trim() == entry.hash)
-            .unwrap_or(false);
-        if already {
+        // A fresh memo only proves the files already present in the view. If
+        // the vault lost one of the recorded sources, restoring the unit must
+        // still happen so the missing files are reported and the rest landed.
+        if memo_can_skip(view_root, &units, &generation_root, entry) {
             report.units_already += 1;
             continue;
         }
         jobs.push((at, entry));
     }
 
+    let workers = crate::settings::copy_workers();
+    let parallel = !dry_run && jobs.len() > 1 && workers > 1;
     // Two units can share fingerprint files (and a manifest is not required
     // to prove uniqueness). Give every destination to the first selected unit
-    // in manifest order, so concurrent restores never write the same path.
-    let mut owners: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::with_capacity(
-            jobs.iter().map(|(_, entry)| entry.files.len()).sum(),
-        );
-    if !dry_run {
-        for (at, entry) in &jobs {
-            for file in &entry.files {
-                owners.entry(dest_key(entry, file)).or_insert(*at);
-            }
-        }
-    }
+    // that can actually supply it, so a missing provider never reserves a
+    // path that a later, present provider would have installed.
+    let owners = if parallel {
+        destination_owners(&jobs, |entry, file| {
+            source_available(&units, &generation_root, entry, file)
+        })
+    } else {
+        std::collections::HashMap::new()
+    };
 
-    let workers = crate::settings::copy_workers();
-    let outcomes: Vec<RestoreUnitResult> = if dry_run || jobs.len() <= 1 || workers <= 1 {
+    let outcomes: Vec<RestoreUnitResult> = if !parallel {
         jobs.iter()
             .map(|(at, entry)| {
                 restore_unit(
@@ -665,8 +658,115 @@ pub fn restore_with(
     Ok(report)
 }
 
+/// Windows view paths compare case-insensitively, so two units must reserve
+/// the same destination under either spelling there. Unix keys stay exact.
 fn dest_key(entry: &UnitEntry, file: &FileEntry) -> String {
-    format!("{}/{}", entry.profile, file.dest)
+    dest_key_with(&entry.profile, &file.dest, cfg!(windows))
+}
+
+fn dest_key_with(profile: &str, dest: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        format!("{}/{}", profile.to_lowercase(), dest.to_lowercase())
+    } else {
+        format!("{profile}/{dest}")
+    }
+}
+
+/// A unit may be skipped as already fresh only when its memo matches and every
+/// recorded source is still present. A partial vault must restore what remains
+/// instead of hiding the missing files behind a fresh memo.
+fn memo_can_skip(
+    view_root: &Path,
+    units: &Path,
+    generation_root: &Path,
+    entry: &UnitEntry,
+) -> bool {
+    let memo_fresh = entry
+        .files
+        .iter()
+        .find(|file| file.path == entry.memo)
+        .and_then(|file| read_small_regular(&view_root.join(&entry.profile).join(&file.dest)))
+        .map(|text| text.trim() == entry.hash)
+        .unwrap_or(false);
+    memo_fresh
+        && entry
+            .files
+            .iter()
+            .all(|file| source_available(units, generation_root, entry, file))
+}
+
+/// True when the recorded bytes for a file are still in the vault. Only a
+/// definitive absence makes a provider unavailable; a present-but-unsafe
+/// source stays with the restoring worker so its integrity check can fail.
+fn source_available(
+    units: &Path,
+    generation_root: &Path,
+    entry: &UnitEntry,
+    file: &FileEntry,
+) -> bool {
+    let src = match &file.object {
+        Some(object) => generation_root.join(object),
+        None => units.join(&entry.name).join(&file.path),
+    };
+    match util::metadata_nofollow(&src) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Resolve shared destinations in manifest order. Only destinations claimed
+/// by more than one selected unit need a provider probe; a uniquely owned
+/// destination is left to its unit, which reports its own outcome. A unit
+/// whose source is absent never owns the path, so a later provider can land.
+fn destination_owners<F>(
+    jobs: &[(usize, &UnitEntry)],
+    available: F,
+) -> std::collections::HashMap<String, usize>
+where
+    F: Fn(&UnitEntry, &FileEntry) -> bool,
+{
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, entry) in jobs {
+        for file in &entry.files {
+            *counts.entry(dest_key(entry, file)).or_default() += 1;
+        }
+    }
+    let mut owners = std::collections::HashMap::with_capacity(counts.len());
+    for (at, entry) in jobs {
+        for file in &entry.files {
+            let key = dest_key(entry, file);
+            if counts.get(&key).copied().unwrap_or(0) < 2 || owners.contains_key(&key) {
+                continue;
+            }
+            if available(entry, file) {
+                owners.insert(key, *at);
+            }
+        }
+    }
+    owners
+}
+
+/// Classification of a view path found before installing an artifact.
+enum DestinationState {
+    /// A regular file is an artifact a previous restore already left here.
+    Artifact,
+    Missing,
+    /// A directory or special file occupies the destination; it is not an
+    /// already-restored artifact and must not be reported as one.
+    Conflict,
+    /// A symlink or reparse point in the destination chain.
+    Refused,
+    Failed(std::io::Error),
+}
+
+fn inspect_destination(dst: &Path) -> DestinationState {
+    match util::metadata_nofollow(dst) {
+        Ok(meta) if meta.is_file() => DestinationState::Artifact,
+        Ok(_) => DestinationState::Conflict,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => DestinationState::Refused,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DestinationState::Missing,
+        Err(err) => DestinationState::Failed(err),
+    }
 }
 
 #[derive(Default)]
@@ -726,12 +826,20 @@ fn restore_unit(
         // join explicit and reject any symlink in the destination chain.
         let dest_rel = Path::new(&entry.profile).join(&file.dest);
         let dst = view_root.join(&dest_rel);
-        match util::metadata_nofollow(&dst) {
-            Ok(_) => {
+        match inspect_destination(&dst) {
+            DestinationState::Artifact => {
                 out.files_existing += 1;
                 continue;
             }
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            DestinationState::Conflict => {
+                out.errors += 1;
+                out.messages.push(format!(
+                    "restore: destination {} is not a regular file",
+                    dst.display()
+                ));
+                continue;
+            }
+            DestinationState::Refused => {
                 out.errors += 1;
                 out.fatal_errors += 1;
                 out.messages.push(format!(
@@ -740,8 +848,8 @@ fn restore_unit(
                 ));
                 continue;
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
+            DestinationState::Missing => {}
+            DestinationState::Failed(err) => {
                 out.errors += 1;
                 out.messages
                     .push(format!("restore: inspecting {}: {err}", dst.display()));
@@ -815,10 +923,16 @@ fn restore_unit(
         #[cfg(unix)]
         {
             if let Err(err) = util::check_regular_chain(&units, &rel) {
-                out.errors += 1;
-                out.fatal_errors += 1;
-                out.messages
-                    .push(format!("restore: writing {}: {err:#}", dst.display()));
+                if util::is_not_found(&err) {
+                    // The vault lost this recorded source: a partial vault is
+                    // fail-open and Cargo rebuilds the unit.
+                    out.files_missing += 1;
+                } else {
+                    out.errors += 1;
+                    out.fatal_errors += 1;
+                    out.messages
+                        .push(format!("restore: writing {}: {err:#}", dst.display()));
+                }
                 continue;
             }
             match restore_file_at(
@@ -866,34 +980,44 @@ fn restore_unit(
                 }
                 Err(err) => {
                     out.errors += 1;
+                    if refused_source(&err) {
+                        out.fatal_errors += 1;
+                    }
                     out.messages
                         .push(format!("restore: inspecting {}: {err}", src.display()));
                     continue;
                 }
             }
-            let result = if shared && link.windows_link() {
+            // The hard-link-to-copy fallback needs a cross-volume view to
+            // exercise; count the operation that actually ran, never the
+            // planned one.
+            let result: Result<bool> = if shared && link.windows_link() {
                 util::check_regular_chain(&units, &rel)
                     .and_then(|_| verify_store_file(&src, file, link.read_only))
                     .and_then(|_| match fs::hard_link(&src, &dst) {
-                        Ok(()) => Ok(()),
+                        Ok(()) => Ok(true),
                         // Cross-volume or a filesystem without links: a
                         // verified private copy is the fallback.
                         Err(_) => {
                             install_private_copy(&src, &dst, entry.stamp, file, link.read_only)
+                                .map(|()| false)
                         }
                     })
             } else {
-                util::check_regular_chain(&units, &rel).and_then(|_| {
-                    install_private_copy(&src, &dst, entry.stamp, file, link.read_only)
-                })
+                util::check_regular_chain(&units, &rel)
+                    .and_then(|_| {
+                        install_private_copy(&src, &dst, entry.stamp, file, link.read_only)
+                    })
+                    .map(|()| false)
             };
             match result {
-                Ok(()) => {
-                    if shared {
-                        out.files_linked += 1;
-                    } else {
-                        out.files_copied += 1;
-                    }
+                Ok(true) => {
+                    out.files_linked += 1;
+                    out.bytes = out.bytes.saturating_add(file.size);
+                    out.touched = true;
+                }
+                Ok(false) => {
+                    out.files_copied += 1;
                     out.bytes = out.bytes.saturating_add(file.size);
                     out.touched = true;
                 }
@@ -908,6 +1032,13 @@ fn restore_unit(
     }
 
     out
+}
+
+/// A refused reparse point in a stored source is an integrity failure, not a
+/// warning: the recorded bytes cannot be verified without following the link.
+#[cfg(not(unix))]
+fn refused_source(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidInput
 }
 
 #[cfg(not(unix))]
@@ -971,4 +1102,252 @@ fn install_private_copy(
 /// Read a small regular file without following a symlink.
 pub(crate) fn read_small_regular(path: &Path) -> Option<String> {
     util::read_small_text(path, 4 * 1024 * 1024).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(path: &str, dest: &str) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            dest: dest.into(),
+            size: 0,
+            sha256: String::new(),
+            role: "artifact".into(),
+            object: None,
+        }
+    }
+
+    fn unit(name: &str, files: Vec<FileEntry>) -> UnitEntry {
+        UnitEntry {
+            name: name.into(),
+            profile: "debug".into(),
+            memo: "lib-crate".into(),
+            hash: "0000000000000000".into(),
+            version: None,
+            stamp: 0,
+            layout: None,
+            files,
+        }
+    }
+
+    fn copy_plan() -> LinkPlan {
+        LinkPlan {
+            policy: LinkPolicy::Copy,
+            read_only: true,
+            mount_read_only: false,
+            shared_mount: false,
+            private_store: true,
+        }
+    }
+
+    #[test]
+    fn destination_key_folds_case_for_windows_identity() {
+        assert_eq!(
+            dest_key_with("debug", "deps/Foo.rlib", true),
+            dest_key_with("DEBUG", "deps/foo.rlib", true)
+        );
+        assert_ne!(
+            dest_key_with("debug", "deps/Foo.rlib", false),
+            dest_key_with("debug", "deps/foo.rlib", false)
+        );
+    }
+
+    #[test]
+    fn destination_owner_skips_an_unavailable_provider() {
+        let missing = unit(
+            "a-0000000000000000",
+            vec![file_entry("lib-a", "deps/libx.rlib")],
+        );
+        let present = unit(
+            "b-1111111111111111",
+            vec![file_entry("lib-b", "deps/libx.rlib")],
+        );
+        let jobs = [(0usize, &missing), (1usize, &present)];
+        let owners = destination_owners(&jobs, |entry, _| entry.name.starts_with('b'));
+        assert_eq!(
+            owners.get(&dest_key(&missing, &missing.files[0])),
+            Some(&1),
+            "the provider that can supply the file owns the destination"
+        );
+    }
+
+    #[test]
+    fn destination_owner_keeps_manifest_order() {
+        let first = unit(
+            "a-0000000000000000",
+            vec![file_entry("lib-a", "deps/libx.rlib")],
+        );
+        let second = unit(
+            "b-1111111111111111",
+            vec![file_entry("lib-b", "deps/libx.rlib")],
+        );
+        let jobs = [(0usize, &first), (1usize, &second)];
+        let owners = destination_owners(&jobs, |_, _| true);
+        assert_eq!(
+            owners.get(&dest_key(&first, &first.files[0])),
+            Some(&0),
+            "the first available provider keeps the destination"
+        );
+    }
+
+    #[test]
+    fn unique_destinations_need_no_provider_probe() {
+        let left = unit(
+            "a-0000000000000000",
+            vec![file_entry("lib-a", "deps/left.rlib")],
+        );
+        let right = unit(
+            "b-1111111111111111",
+            vec![file_entry("lib-b", "deps/right.rlib")],
+        );
+        let jobs = [(0usize, &left), (1usize, &right)];
+        let probes = std::cell::Cell::new(0);
+        let owners = destination_owners(&jobs, |_, _| {
+            probes.set(probes.get() + 1);
+            true
+        });
+        assert!(owners.is_empty());
+        assert_eq!(probes.get(), 0, "an unshared destination needs no probe");
+    }
+
+    #[test]
+    fn memo_skip_requires_every_recorded_source() -> Result<()> {
+        let units = tempfile::tempdir()?;
+        let generation = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        let entry = unit(
+            "crate-0000000000000000",
+            vec![
+                file_entry("lib-crate", ".fingerprint/crate-0000000000000000/lib-crate"),
+                file_entry("deps/libcrate.rlib", "deps/libcrate.rlib"),
+            ],
+        );
+        let memo = view.path().join("debug").join(&entry.files[0].dest);
+        fs::create_dir_all(memo.parent().unwrap())?;
+        fs::write(&memo, &entry.hash)?;
+        for file in &entry.files {
+            let src = units.path().join(&entry.name).join(&file.path);
+            fs::create_dir_all(src.parent().unwrap())?;
+            fs::write(&src, b"x")?;
+        }
+        assert!(memo_can_skip(
+            view.path(),
+            units.path(),
+            generation.path(),
+            &entry
+        ));
+        fs::remove_file(units.path().join(&entry.name).join("deps/libcrate.rlib"))?;
+        assert!(
+            !memo_can_skip(view.path(), units.path(), generation.path(), &entry),
+            "a missing recorded source must force a restore even with a fresh memo"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_unit_treats_a_missing_source_as_a_miss() -> Result<()> {
+        let units = tempfile::tempdir()?;
+        let generation = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        let entry = unit(
+            "crate-0000000000000000",
+            vec![file_entry("deps/libcrate.rlib", "deps/libcrate.rlib")],
+        );
+        fs::create_dir_all(units.path().join(&entry.name))?;
+        let out = restore_unit(
+            view.path(),
+            units.path(),
+            generation.path(),
+            0,
+            &entry,
+            None,
+            false,
+            copy_plan(),
+        );
+        assert_eq!(out.files_missing, 1);
+        assert_eq!(out.errors, 0);
+        assert_eq!(out.fatal_errors, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_unit_does_not_count_a_directory_as_an_artifact() -> Result<()> {
+        let units = tempfile::tempdir()?;
+        let generation = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        let entry = unit(
+            "crate-0000000000000000",
+            vec![file_entry("deps/libcrate.rlib", "deps/libcrate.rlib")],
+        );
+        fs::create_dir_all(view.path().join("debug/deps/libcrate.rlib"))?;
+        let out = restore_unit(
+            view.path(),
+            units.path(),
+            generation.path(),
+            0,
+            &entry,
+            None,
+            false,
+            copy_plan(),
+        );
+        assert_eq!(out.files_existing, 0, "a directory is not an artifact");
+        assert_eq!(out.errors, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_unit_counts_a_regular_file_as_existing() -> Result<()> {
+        let units = tempfile::tempdir()?;
+        let generation = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        let entry = unit(
+            "crate-0000000000000000",
+            vec![file_entry("deps/libcrate.rlib", "deps/libcrate.rlib")],
+        );
+        let dst = view.path().join("debug/deps/libcrate.rlib");
+        fs::create_dir_all(dst.parent().unwrap())?;
+        fs::write(&dst, b"already here")?;
+        let out = restore_unit(
+            view.path(),
+            units.path(),
+            generation.path(),
+            0,
+            &entry,
+            None,
+            false,
+            copy_plan(),
+        );
+        assert_eq!(out.files_existing, 1);
+        assert_eq!(out.errors, 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_destination_identity_has_one_owner() {
+        let upper = unit(
+            "a-0000000000000000",
+            vec![file_entry("deps/Foo.rlib", "deps/Foo.rlib")],
+        );
+        let lower = unit(
+            "b-1111111111111111",
+            vec![file_entry("deps/foo.rlib", "deps/foo.rlib")],
+        );
+        let jobs = [(0usize, &upper), (1usize, &lower)];
+        let owners = destination_owners(&jobs, |_, _| true);
+        assert_eq!(owners.len(), 1, "one destination, one owner");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refused_source_reparse_is_fatal() {
+        assert!(refused_source(&std::io::Error::from(
+            std::io::ErrorKind::InvalidInput
+        )));
+        assert!(!refused_source(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
 }

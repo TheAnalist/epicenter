@@ -41,37 +41,16 @@ pub(crate) fn lock_generation(store_root: &Path, generation: &str) -> Result<Fil
     FileLock::acquire(&store_lock_path(store_root, generation))
 }
 
-/// Remove the per-generation lock file when its generation directory is
-/// gone and no live process holds the lock. A held lock is left alone.
-pub(crate) fn remove_generation_lock(store_root: &Path, generation: &str) {
-    let dir = store_root.join(generation);
-    let path = store_lock_path(store_root, generation);
-    if dir.exists() || !path.exists() {
-        return;
-    }
-    let Ok(Some(_lock)) = FileLock::try_acquire(&path) else {
-        return; // a live harvest holds it
-    };
-    if !dir.exists() {
-        let _ = fs::remove_file(&path);
-    }
-}
-
+// Lock files are NEVER unlinked. A writer can open the path and block in
+// flock before a remover unlinks it; that writer would then hold a lock on an
+// unlinked inode while a third writer locks a fresh file at the same path,
+// and both would enter the critical section. `.lock-<parity>` files are
+// empty, bounded by the number of generations, and outlive their generation
+// on purpose.
 /// Clean the debris a crash or a manual deletion leaves in the store root:
-/// `.lock-*` files whose generation is gone, and empty manifest-less
-/// generation directories. Existing generations and held locks are kept.
+/// empty manifest-less generation directories. Existing generations and held
+/// locks are kept, and `.lock-*` files always survive (see above).
 pub fn sweep_store_debris(store_root: &Path) {
-    let Ok(entries) = fs::read_dir(store_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(generation) = name.strip_prefix(".lock-") {
-            if !generation.is_empty() {
-                remove_generation_lock(store_root, generation);
-            }
-        }
-    }
     let Ok(names) = generation_names(store_root) else {
         return;
     };
@@ -109,10 +88,10 @@ pub fn sweep_store_debris(store_root: &Path) {
         let still_empty = fs::read_dir(&units)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true);
-        if still_empty {
+        // Recheck the manifest under the lock: a writer may have installed one
+        // between the pre-lock check and acquiring the lock.
+        if still_empty && !manifest_path(store_root, &generation).is_file() {
             let _ = util::remove_tree(store_root, &dir);
-            drop(_lock);
-            remove_generation_lock(store_root, &generation);
         }
     }
 }
@@ -130,12 +109,12 @@ pub fn drop_generation(store_root: &Path, parity: &str) -> Result<bool> {
         anyhow::bail!("refusing symlinked/reparse generation {}", dir.display());
     }
     let lock_path = store_lock_path(store_root, parity);
-    let Ok(Some(lock)) = FileLock::try_acquire(&lock_path) else {
+    // Bind the guard to `_lock` so it lives to the end of the scope and holds
+    // the lock through removal, without an unused-binding warning.
+    let Ok(Some(_lock)) = FileLock::try_acquire(&lock_path) else {
         return Ok(false);
     };
     util::remove_tree(store_root, &dir)?;
-    drop(lock);
-    remove_generation_lock(store_root, parity);
     Ok(true)
 }
 
@@ -325,8 +304,9 @@ fn parent_is_private(path: &Path) -> bool {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StoreAccess {
-    /// Kernel/OS-enforced: the mount is read-only, or Windows denied a
-    /// write-open. Strong enough to share inodes (hard links).
+    /// Kernel/OS-enforced: the mount (or Windows volume) is read-only. Strong
+    /// enough to share inodes (hard links). A DACL that merely denies writes
+    /// is NOT an immutable mount and must stay out of this flag.
     pub(crate) mount_read_only: bool,
     /// Reader mode: treat the store as read-only for epicenter's own behavior.
     /// True for an OS-enforced read-only store, or a directory on a writable
@@ -402,7 +382,9 @@ pub(crate) fn store_access(store_root: &Path) -> StoreAccess {
     {
         // Windows has no statvfs. Open the directory for write access with
         // FILE_FLAG_BACKUP_SEMANTICS; this checks the DACL without creating
-        // or modifying anything. A denied open is a read-only reader mount.
+        // or modifying anything. A denied open is either a read-only volume
+        // or a DACL that forbids writes: only a read-only volume is an
+        // immutable mount; an ACL denial is a reader mode, not immutable.
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         match fs::OpenOptions::new()
@@ -416,7 +398,7 @@ pub(crate) fn store_access(store_root: &Path) -> StoreAccess {
             }
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                 access.read_only = true;
-                access.mount_read_only = true;
+                access.mount_read_only = volume_is_read_only(store_root) == Some(true);
                 access
             }
             Err(_) => access,
@@ -432,8 +414,8 @@ pub(crate) fn store_access(store_root: &Path) -> StoreAccess {
 /// A store on a read-only mount cannot be mutated through a view link, so
 /// sharing its inodes is safe even across principals. A writable mount is
 /// copied from: the owner could chmod a 0444 inode and rewrite it through the
-/// view. Windows checks directory write access with FILE_FLAG_BACKUP_SEMANTICS
-/// because it has no `statvfs`; a denied open is a read-only reader mount.
+/// view. Windows has no `statvfs`; its volume's read-only flag is the mount
+/// fact, while a DACL-denied write-open is only a reader mode.
 pub(crate) fn store_is_read_only(store_root: &Path) -> bool {
     store_access(store_root).read_only
 }
@@ -566,33 +548,93 @@ pub(crate) fn store_is_shared_mount(store_root: &Path) -> bool {
     )
 }
 
+/// The volume root (`C:\`, `\\server\share\`) that the volume query APIs
+/// require. They reject a directory path, so a store below the root must be
+/// reduced to its mount point first.
+#[cfg(windows)]
+fn volume_root_wide(path: &Path) -> Option<Vec<u16>> {
+    use std::path::{Component, Prefix};
+    let root = match path.components().next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                format!("{}:\\", char::from(drive))
+            }
+            Prefix::UNC(server, share) => format!(
+                "\\\\{}\\{}\\",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ),
+            Prefix::VerbatimUNC(server, share) => format!(
+                "\\\\?\\UNC\\{}\\{}\\",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(root.encode_utf16().chain(std::iter::once(0)).collect())
+}
+
 #[cfg(windows)]
 pub(crate) fn store_is_shared_mount(store_root: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = store_root
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let Some(root) = volume_root_wide(store_root) else {
+        // Unknown volume: copy rather than risk sharing an inode.
+        return true;
+    };
     // DRIVE_REMOTE = 4.
-    unsafe { GetDriveTypeW(wide.as_ptr()) == 4 }
+    unsafe { GetDriveTypeW(root.as_ptr()) == 4 }
+}
+
+/// Whether the volume holding `store_root` is mounted read-only. `None` when
+/// the volume cannot be inspected, so a denied write-open is not mistaken for
+/// an immutable mount.
+#[cfg(windows)]
+fn volume_is_read_only(store_root: &Path) -> Option<bool> {
+    // FILE_READ_ONLY_VOLUME.
+    const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
+    let root = volume_root_wide(store_root)?;
+    let mut flags: u32 = 0;
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (ok != 0).then_some(flags & FILE_READ_ONLY_VOLUME != 0)
 }
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetDriveTypeW(root_path_name: *const u16) -> u32;
+    fn GetVolumeInformationW(
+        root_path_name: *const u16,
+        volume_name_buffer: *mut u16,
+        volume_name_size: u32,
+        volume_serial_number: *mut u32,
+        maximum_component_length: *mut u32,
+        file_system_flags: *mut u32,
+        file_system_name_buffer: *mut u16,
+        file_system_name_size: u32,
+    ) -> i32;
 }
 
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
-fn store_is_shared_mount(_store_root: &Path) -> bool {
+pub(crate) fn store_is_shared_mount(_store_root: &Path) -> bool {
     // Unknown mount semantics on this Unix: copy rather than risk a shared
     // inode across a network filesystem.
     true
 }
 
 #[cfg(not(any(unix, windows)))]
-fn store_is_shared_mount(_store_root: &Path) -> bool {
+pub(crate) fn store_is_shared_mount(_store_root: &Path) -> bool {
     true
 }
 
@@ -708,4 +750,145 @@ pub(crate) fn unit_name_matches(name: &str, query: &str) -> bool {
 pub(crate) fn unit_package(name: &str) -> Option<&str> {
     let (package, hash) = name.rsplit_once('-')?;
     (hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(package)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marked_generation(store: &Path, name: &str) -> Result<()> {
+        fs::create_dir_all(units_dir(store, name))?;
+        fs::write(store.join(name).join(GENERATION_MARKER), b"")?;
+        Ok(())
+    }
+
+    #[test]
+    fn drop_generation_honors_a_held_lock_and_keeps_the_lock_file() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+        marked_generation(&store, "gen")?;
+
+        let held = FileLock::acquire(&store_lock_path(&store, "gen"))?;
+        assert!(
+            !drop_generation(&store, "gen")?,
+            "a live lock refuses the drop"
+        );
+        assert!(store.join("gen").is_dir(), "the locked generation survives");
+        drop(held);
+
+        assert!(
+            drop_generation(&store, "gen")?,
+            "the unlocked generation drops"
+        );
+        assert!(!store.join("gen").exists());
+        assert!(
+            store_lock_path(&store, "gen").is_file(),
+            "lock files are never unlinked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_keeps_a_manifest_and_removes_a_marked_husk() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+        marked_generation(&store, "husk")?;
+        marked_generation(&store, "kept")?;
+        fs::write(manifest_path(&store, "kept"), b"{}")?;
+
+        sweep_store_debris(&store);
+
+        assert!(
+            !store.join("husk").exists(),
+            "a manifest-less husk is swept"
+        );
+        assert!(
+            store.join("kept").is_dir(),
+            "a manifest-backed generation is kept"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_denied_directory_is_reader_mode_not_an_immutable_mount() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if util::euid() == 0 {
+            return Ok(()); // root can write 0555; the mode probe does not apply
+        }
+        let home = tempfile::tempdir()?;
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o555))?;
+
+        let access = store_access(&store);
+        assert!(access.read_only, "a denied write is reader mode");
+        assert!(
+            !access.mount_read_only,
+            "a mode/ACL denial is not an immutable mount"
+        );
+
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_accessible_store_is_not_private() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir()?;
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700))?;
+        assert!(store_is_private(&store));
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o770))?;
+        assert!(!store_is_private(&store), "group access is not private");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_generation_refuses_a_symlinked_generation() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = home.path().join("store");
+        fs::create_dir(&store)?;
+        let target = home.path().join("target");
+        fs::create_dir(&target)?;
+        std::os::unix::fs::symlink(&target, store.join("gen"))?;
+
+        let err = drop_generation(&store, "gen").unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert!(target.is_dir(), "the symlink target survives");
+        Ok(())
+    }
+
+    // The volume-root helpers can only be exercised on a live Windows host:
+    // `GetDriveTypeW`/`GetVolumeInformationW` need a real volume, and a
+    // DACL-denied directory cannot be fabricated in a portable unit test.
+    #[cfg(windows)]
+    #[test]
+    fn a_volume_root_ends_in_a_separator() {
+        let path = Path::new(r"C:\Users\someone\store");
+        let wide = volume_root_wide(path).expect("a drive path has a volume root");
+        assert_eq!(String::from_utf16_lossy(&wide[..wide.len() - 1]), r"C:\");
+
+        let unc = Path::new(r"\\server\share\dir");
+        let wide = volume_root_wide(unc).expect("a UNC path has a volume root");
+        assert_eq!(
+            String::from_utf16_lossy(&wide[..wide.len() - 1]),
+            r"\\server\share\"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_volume_read_only_probe_answers_on_a_local_drive() {
+        assert!(
+            volume_is_read_only(&std::env::temp_dir()).is_some(),
+            "a local volume must be inspectable"
+        );
+    }
 }

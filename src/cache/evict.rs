@@ -7,7 +7,7 @@
 //!   removing it would force a rebuild of units cargo may be using right now;
 //! - at least one selector is required — there is no "evict everything".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -70,6 +70,22 @@ impl Tier {
 
     fn touches_view(self) -> bool {
         matches!(self, Tier::All | Tier::View)
+    }
+}
+
+/// Interpret a view's Cargo-lock probe right before deletion. A failed scan
+/// skips this one view: an unreadable view must not abort the whole loop.
+fn view_locks(label: &str, probe: Result<Option<Vec<fs::File>>>) -> Option<Vec<fs::File>> {
+    match probe {
+        Ok(Some(locks)) => Some(locks),
+        Ok(None) => {
+            eprintln!("view {label} is in use by a live build — skipped");
+            None
+        }
+        Err(err) => {
+            eprintln!("view {label} lock scan failed: {err:#} — skipped");
+            None
+        }
     }
 }
 
@@ -500,10 +516,12 @@ pub fn run(build_root: &Path, opts: &Options<'_>) -> Result<()> {
                     },
                     None => None,
                 };
-                let Some(_cargo_locks) = crate::job::cargo_locks(root)? else {
-                    errors += 1;
-                    eprintln!("view {label} is in use by a live build — skipped");
-                    continue;
+                let _cargo_locks = match view_locks(label, crate::job::cargo_locks(root)) {
+                    Some(locks) => locks,
+                    None => {
+                        errors += 1;
+                        continue;
+                    }
                 };
                 remove_dir(root, unit_dir, &mut errors);
                 for anchor in anchors {
@@ -578,6 +596,7 @@ struct WorkDir {
     newest: Option<SystemTime>,
     locked: bool,
     old_enough: bool,
+    truncated: bool,
     bytes: u64,
     unique: u64,
     shared: u64,
@@ -605,24 +624,15 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
             path.display()
         );
     }
-    let job_lock =
-        match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(&work_root, &name))? {
-            Some(lock) => lock,
-            None => bail!(
-                "job dir {} is in use by an epicenter process — remove it when it finishes",
-                path.display()
-            ),
-        };
-    // Hold Cargo's own lock files through the rename/delete. A boolean check
-    // here would release the locks immediately and let a build start in the
-    // window before `rename`.
-    let cargo_locks = match crate::job::cargo_locks(&path)? {
-        Some(locks) => locks,
-        None => bail!(
+    // Refuse a live build (or a view we cannot inspect) even for a dry run, but
+    // keep the check read-only: acquiring Cargo's sentinel here would create
+    // `.cargo-build-lock` in a view the user only asked to inspect.
+    if crate::exec::dir_locked(&path) {
+        bail!(
             "job dir {} is in use by a live build — remove it when it finishes",
             path.display()
-        ),
-    };
+        );
+    }
     let stats = tree_stats(&path);
 
     if delete {
@@ -664,6 +674,24 @@ fn evict_work_dir(build_root: &Path, target: &str, delete: bool) -> Result<()> {
         println!("  {}", util::dim("run again with -y or --yes to remove it"));
         return Ok(());
     }
+    // Hold the job lock and Cargo's own locks through the rename/delete. A
+    // boolean check would release them immediately and let a build start in
+    // the window before `rename`.
+    let job_lock =
+        match crate::util::FileLock::try_acquire(&crate::exec::job_lock_path(&work_root, &name))? {
+            Some(lock) => lock,
+            None => bail!(
+                "job dir {} is in use by an epicenter process — remove it when it finishes",
+                path.display()
+            ),
+        };
+    let cargo_locks = match crate::job::cargo_locks(&path)? {
+        Some(locks) => locks,
+        None => bail!(
+            "job dir {} is in use by a live build — remove it when it finishes",
+            path.display()
+        ),
+    };
     // Rename out of the way first: a hidden tombstone is not a job dir any
     // later GC/exec can guess, and a build that races the check fails rather
     // than writing into a directory being deleted.
@@ -862,16 +890,16 @@ fn evict_work_dirs(
         let empty = fs::read_dir(&path)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(false);
-        let old_enough = match newest {
-            Some(modified) => now.duration_since(modified).map_or(true, |age| age > limit),
-            None => empty,
-        };
+        // A truncated scan never authorizes removal, and a timestamp newer
+        // than the reference clock means the job is still being written.
+        let old_enough = collectible(newest, empty, stats.truncated, now, limit);
         rows.push(WorkDir {
             name,
             path,
             newest,
             locked,
             old_enough,
+            truncated: stats.truncated,
             bytes: stats.bytes,
             unique: stats.unique,
             shared: stats.shared,
@@ -894,6 +922,12 @@ fn evict_work_dirs(
             (
                 util::warn(util::GLYPH_WARN),
                 util::warn("in use by a live build — never collected").to_string(),
+            )
+        } else if row.truncated {
+            report.young += 1;
+            (
+                util::warn(util::GLYPH_WARN),
+                util::warn("scan truncated — never collected").to_string(),
             )
         } else if row.old_enough {
             report.eligible += 1;
@@ -1032,19 +1066,45 @@ fn evict_work_dirs(
 #[derive(Debug, Default)]
 struct TreeStats {
     newest: Option<SystemTime>,
+    /// The scan budget stopped the walk: the stats describe a prefix only.
+    truncated: bool,
     bytes: u64,
     unique: u64,
     shared: u64,
     files: u64,
 }
 
+/// Whether a job dir is old enough to collect. A truncated scan and a clock
+/// that runs backwards both answer "no": the budget is a performance guard,
+/// not evidence about the tree.
+fn collectible(
+    newest: Option<SystemTime>,
+    empty: bool,
+    truncated: bool,
+    now: SystemTime,
+    limit: std::time::Duration,
+) -> bool {
+    if truncated {
+        return false;
+    }
+    match newest {
+        Some(modified) => now.duration_since(modified).is_ok_and(|age| age > limit),
+        None => empty,
+    }
+}
+
 fn tree_stats(dir: &Path) -> TreeStats {
-    let mut stats = TreeStats::default();
     let mut budget = crate::util::ScanBudget::new("work dir tree");
-    for entry in crate::util::SafeWalk::new(dir).walk().flatten() {
-        if !budget.take() {
-            break;
-        }
+    tree_stats_with(dir, &mut budget)
+}
+
+fn tree_stats_with(dir: &Path, budget: &mut crate::util::ScanBudget) -> TreeStats {
+    let mut stats = TreeStats::default();
+    // Last-link accounting spans the whole tree: when every link of an inode
+    // lives in this view they are all removed together, so its bytes are freed.
+    let mut inodes: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+    let mut walk = crate::util::SafeWalk::new(dir).walk_with(budget);
+    for entry in walk.by_ref().flatten() {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1057,10 +1117,25 @@ fn tree_stats(dir: &Path) -> TreeStats {
                 stats.newest = Some(modified);
             }
         }
-        if crate::vault::link_count(entry.path(), &meta) > 1 {
-            stats.shared = stats.shared.saturating_add(size);
+        match crate::util::file_identity(entry.path(), &meta) {
+            Some(identity) => {
+                let slot = inodes
+                    .entry(identity)
+                    .or_insert_with(|| (size, crate::vault::link_count(entry.path(), &meta), 0));
+                slot.2 += 1;
+            }
+            // No stable identity: treat the path as its own inode.
+            None => stats.unique = stats.unique.saturating_add(size),
+        }
+    }
+    if walk.truncated() {
+        stats.truncated = true;
+    }
+    for (size, links, planned) in inodes.values() {
+        if planned >= links {
+            stats.unique = stats.unique.saturating_add(*size);
         } else {
-            stats.unique = stats.unique.saturating_add(size);
+            stats.shared = stats.shared.saturating_add(*size);
         }
     }
     stats
@@ -1149,10 +1224,8 @@ fn view_unit_files(unit: &Unit, arts: &ArtifactInfo) -> Vec<PathBuf> {
 
 fn collect_tree_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut budget = crate::util::ScanBudget::new("store tree");
-    for entry in crate::util::SafeWalk::new(dir).walk().flatten() {
-        if !budget.take() {
-            return;
-        }
+    let mut walk = crate::util::SafeWalk::new(dir).walk_with(&mut budget);
+    for entry in walk.by_ref().flatten() {
         if entry.file_type().is_file() {
             out.push(entry.path().to_path_buf());
         }

@@ -18,7 +18,9 @@
 //! Apple's `ld64.lld` is not a drop-in for the system linker, so
 //! `--linker lld` refuses macOS instead of producing fragile builds.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{Result, bail};
 
@@ -64,7 +66,8 @@ pub struct FastLinker {
     pub flavor: Flavor,
     /// Host target flags.
     pub flags: Vec<String>,
-    /// Optional `wasm32-unknown-unknown` flags (Wild only, when installed).
+    /// Optional `wasm32-unknown-unknown` flags (Wild only, when both the
+    /// target is installed and the binary was built with wasm support).
     pub wasm: Option<Vec<String>>,
 }
 
@@ -79,7 +82,7 @@ impl FastLinker {
         toml_array(&self.flags)
     }
 
-    /// All target edits this plan owns: host, plus wasm for Wild.
+    /// All target edits this plan owns: host, plus wasm for a capable Wild.
     pub fn plans(&self) -> Vec<TargetPlan> {
         let mut plans = vec![TargetPlan {
             target: self.host.clone(),
@@ -149,6 +152,18 @@ fn toml_array(items: &[String]) -> String {
     out
 }
 
+/// Flags that point rustc at a probed clang and let it pass `--ld-path` to
+/// the probed standalone linker. Both paths are absolute because Cargo's bin
+/// directory is not always on `PATH`.
+fn clang_driver_flags(linker: &Path, clang: &Path) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        format!("linker={}", forward(clang)),
+        "-C".to_string(),
+        format!("link-arg=-fuse-ld={}", forward(linker)),
+    ]
+}
+
 /// Detect the bundled LLD for the active toolchain's host.
 pub fn detect() -> Result<FastLinker> {
     let (host, sysroot) = rustc_host_and_sysroot()?;
@@ -179,19 +194,13 @@ fn detect_external(kind: LinkerKind, label: &str, names: &[&str]) -> Result<Fast
     let clang = usable_clang().ok_or_else(|| {
         anyhow::anyhow!("{label} needs clang as the driver — install clang or use --linker lld")
     })?;
-    let flags = vec![
-        "-C".to_string(),
-        "linker=clang".to_string(),
-        "-C".to_string(),
-        format!("link-arg=-fuse-ld={}", forward(&linker)),
-    ];
+    let flags = clang_driver_flags(&linker, &clang);
     let lld_dir = sysroot
         .join("lib")
         .join("rustlib")
         .join(&host)
         .join("bin")
         .join("gcc-ld");
-    let _ = clang;
     Ok(FastLinker {
         kind,
         host,
@@ -224,22 +233,19 @@ fn detect_wild_at(sysroot: &Path, host: &str) -> Result<FastLinker> {
     let wild = crate::util::which_path("wild")
         .ok_or_else(|| anyhow::anyhow!("`wild` is not on PATH — install it or use --linker lld"))?;
     let cc = command_version("cc");
-    let has_clang = usable_clang().is_some();
+    let clang = usable_clang();
     let flags = if cc
         .as_deref()
         .is_some_and(|text| text.to_ascii_lowercase().contains("clang"))
     {
         // `cc` is already clang; keep it as the driver.
-        vec!["-C".to_string(), "link-arg=--ld-path=wild".to_string()]
-    } else if has_clang {
+        wild_ld_path_flags(&wild)
+    } else if let Some(clang) = &clang {
         // Wild's documented Rust integration: clang is the driver and
         // resolves wild through `--ld-path`.
-        vec![
-            "-C".to_string(),
-            "linker=clang".to_string(),
-            "-C".to_string(),
-            "link-arg=--ld-path=wild".to_string(),
-        ]
+        let mut flags = vec!["-C".to_string(), format!("linker={}", forward(clang))];
+        flags.extend(wild_ld_path_flags(&wild));
+        flags
     } else if let Some((major, minor)) = cc.as_deref().and_then(parse_compiler_version) {
         if (major, minor) >= (16, 1) {
             vec!["-C".to_string(), "link-arg=-fuse-ld=wild".to_string()]
@@ -255,19 +261,12 @@ fn detect_wild_at(sysroot: &Path, host: &str) -> Result<FastLinker> {
             wild.display()
         );
     };
-    let wasm = sysroot
+    let wasm_target = sysroot
         .join("lib")
         .join("rustlib")
         .join("wasm32-unknown-unknown")
-        .is_dir()
-        .then(|| {
-            vec![
-                "-C".to_string(),
-                format!("linker={}", forward(&wild)),
-                "-C".to_string(),
-                "linker-flavor=wasm-ld".to_string(),
-            ]
-        });
+        .is_dir();
+    let wasm = wild_wasm_plan(&wild, wasm_target, wasm_target && wild_wasm_capable(&wild));
     let lld_dir = sysroot
         .join("lib")
         .join("rustlib")
@@ -283,6 +282,57 @@ fn detect_wild_at(sysroot: &Path, host: &str) -> Result<FastLinker> {
         flags,
         wasm,
     })
+}
+
+/// `--ld-path` must name the resolved binary: a bare `wild` is invisible when
+/// Cargo's bin directory is not on `PATH`.
+fn wild_ld_path_flags(wild: &Path) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        format!("link-arg=--ld-path={}", forward(wild)),
+    ]
+}
+
+/// Wasm edits are planned only when the target is installed and this Wild
+/// build actually supports wasm; otherwise the existing wasm settings stay.
+fn wild_wasm_plan(wild: &Path, target_installed: bool, capable: bool) -> Option<Vec<String>> {
+    (target_installed && capable).then(|| {
+        vec![
+            "-C".to_string(),
+            format!("linker={}", forward(wild)),
+            "-C".to_string(),
+            "linker-flavor=wasm-ld".to_string(),
+        ]
+    })
+}
+
+/// Does this Wild build contain wasm support? Wasm is a compile-time feature:
+/// an ELF-only build refuses the flavor before reading inputs, while a capable
+/// build reaches its wasm parser and rejects the binary as a non-wasm object.
+/// The probe is one short-lived process reading at most 4 KiB of stderr.
+fn wild_wasm_capable(wild: &Path) -> bool {
+    let Ok(mut child) = std::process::Command::new(wild)
+        .args(["-flavor", "wasm", "-o", "/dev/null"])
+        .arg(wild)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let mut stderr = String::new();
+    if let Some(pipe) = child.stderr.take() {
+        let _ = pipe.take(4096).read_to_string(&mut stderr);
+    }
+    let failed = child.wait().is_ok_and(|status| !status.success());
+    failed && wasm_supported(&stderr)
+}
+
+/// Only the wasm parser's own complaint proves the feature is compiled in.
+/// Anything else is unproven, so the caller keeps the current wasm settings.
+fn wasm_supported(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("wasm") && !stderr.contains("support isn't included")
 }
 
 fn command_version(program: &str) -> Option<String> {
@@ -500,9 +550,9 @@ mod tests {
             flavor: Flavor::Gnu,
             flags: vec![
                 "-C".to_string(),
-                "linker=clang".to_string(),
+                "linker=/cargo/bin/clang".to_string(),
                 "-C".to_string(),
-                "link-arg=--ld-path=wild".to_string(),
+                "link-arg=--ld-path=/bin/wild".to_string(),
             ],
             wasm: Some(vec![
                 "-C".to_string(),
@@ -516,5 +566,68 @@ mod tests {
         assert_eq!(plans[0].target, "x86_64-unknown-linux-gnu");
         assert_eq!(plans[1].target, "wasm32-unknown-unknown");
         assert!(plans[1].literal.contains("wasm-ld"));
+    }
+
+    #[test]
+    fn external_drivers_serialize_the_probed_paths() {
+        let flags = clang_driver_flags(Path::new("/tools/mold"), Path::new("/cargo/bin/clang"));
+        assert_eq!(
+            flags,
+            vec![
+                "-C".to_string(),
+                "linker=/cargo/bin/clang".to_string(),
+                "-C".to_string(),
+                "link-arg=-fuse-ld=/tools/mold".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wild_ld_path_serializes_the_probed_binary() {
+        let flags = wild_ld_path_flags(Path::new("/cargo/bin/wild"));
+        assert_eq!(
+            flags,
+            vec![
+                "-C".to_string(),
+                "link-arg=--ld-path=/cargo/bin/wild".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wild_wasm_requires_proven_capability() {
+        let wild = Path::new("/cargo/bin/wild");
+        assert!(wild_wasm_plan(wild, true, false).is_none());
+        assert!(wild_wasm_plan(wild, false, true).is_none());
+        let flags = wild_wasm_plan(wild, true, true).expect("capable Wild plans wasm");
+        assert_eq!(flags[1], "linker=/cargo/bin/wild");
+        assert_eq!(flags[3], "linker-flavor=wasm-ld");
+    }
+
+    #[test]
+    fn wild_keeps_wasm_settings_when_support_is_unproven() {
+        let linker = FastLinker {
+            kind: LinkerKind::Wild,
+            host: "x86_64-unknown-linux-gnu".to_string(),
+            lld_dir: PathBuf::from("/sysroot/gcc-ld"),
+            linker: PathBuf::from("/cargo/bin/wild"),
+            flavor: Flavor::Gnu,
+            flags: wild_ld_path_flags(Path::new("/cargo/bin/wild")),
+            wasm: wild_wasm_plan(Path::new("/cargo/bin/wild"), true, false),
+        };
+        let plans = linker.plans();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].target, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn wasm_probe_requires_positive_evidence() {
+        assert!(!wasm_supported(
+            "wild: error: Wasm support isn't included in this build. Rebuild with `--features wasm` to enable it."
+        ));
+        assert!(!wasm_supported("wild: error: permission denied"));
+        assert!(wasm_supported(
+            "wild: error: Failed to parse object file `/cargo/bin/wild`\n  Caused by:\n    failed to parse Wasm object file\n    missing Wasm magic header"
+        ));
     }
 }

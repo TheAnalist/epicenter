@@ -22,6 +22,10 @@ use super::layout::{
 };
 use super::{hex_decode, hex_encode};
 
+/// One ceiling for readers and writers: a signed manifest above this is not
+/// published, because `load_manifest_at` would refuse to read it back.
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
 // ── manifest ────────────────────────────────────────────────────────────────
 
 /// `manifest.json` of one generation.
@@ -248,6 +252,43 @@ fn store_is_owned(store_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Authenticate the manifest body. A foreign (read-only) store has no local
+/// HMAC key in common with the reader, so it must carry Ed25519.
+fn verify_manifest_trust(
+    store_root: &Path,
+    manifest: &Manifest,
+    path: &Path,
+    foreign: bool,
+) -> Result<()> {
+    if !manifest.signature.is_empty() {
+        return verify_manifest_signature(store_root, manifest, path);
+    }
+    if foreign {
+        anyhow::bail!(
+            "manifest {} has no Ed25519 signature; a foreign store must be signed",
+            path.display()
+        );
+    }
+    let local_hmac_key = manifest_key_path()?.is_file() || legacy_manifest_key_path()?.is_file();
+    if !local_hmac_key {
+        anyhow::bail!(
+            "manifest {} has no Ed25519 signature and the local HMAC key is missing; re-harvest it on the writer",
+            path.display()
+        );
+    }
+    if manifest.mac.len() != 64 {
+        anyhow::bail!(
+            "manifest {} is unsigned (re-harvest this generation)",
+            path.display()
+        );
+    }
+    let expected = manifest_mac(manifest)?;
+    if !constant_time_eq(manifest.mac.as_bytes(), expected.as_bytes()) {
+        anyhow::bail!("manifest {} failed its MAC check", path.display());
+    }
+    Ok(())
+}
+
 pub(crate) fn load_manifest(store_root: &Path, parity: &str) -> Result<Option<Manifest>> {
     load_manifest_at(store_root, parity, false)
 }
@@ -319,45 +360,26 @@ pub(crate) fn load_manifest_at(
         require_private_windows_acl(&path, "manifest")?;
     }
     let text = if read_only {
-        crate::util::read_small_text(&path, 16 * 1024 * 1024)
+        crate::util::read_small_text(&path, MAX_MANIFEST_BYTES)
             .with_context(|| format!("reading {}", path.display()))?
     } else {
-        crate::util::read_trusted_config(&path, 16 * 1024 * 1024)
+        crate::util::read_trusted_config(&path, MAX_MANIFEST_BYTES)
             .with_context(|| format!("reading {}", path.display()))?
     };
     let mut manifest: Manifest =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    if !manifest.signature.is_empty() {
-        verify_manifest_signature(store_root, &manifest, &path)?;
-    } else {
-        let local_hmac_key =
-            manifest_key_path()?.is_file() || legacy_manifest_key_path()?.is_file();
-        if !local_hmac_key {
-            anyhow::bail!(
-                "manifest {} has no Ed25519 signature and the local HMAC key is missing; re-harvest it on the writer",
-                path.display()
-            );
-        }
-        if manifest.mac.len() != 64 {
-            anyhow::bail!(
-                "manifest {} is unsigned (re-harvest this generation)",
-                path.display()
-            );
-        }
-        let expected = manifest_mac(&manifest)?;
-        if !constant_time_eq(manifest.mac.as_bytes(), expected.as_bytes()) {
-            anyhow::bail!("manifest {} failed its MAC check", path.display());
-        }
-    }
+    verify_manifest_trust(store_root, &manifest, &path, read_only)?;
     // A valid signature/MAC with an invalid entry used to brick the whole
     // generation. A writer may repair in place; a reader only filters the
-    // invalid entries in memory and never writes the store.
+    // invalid entries in memory and never writes the store. Filtering shares
+    // the manifest-level identity, so a case collision drops the later unit.
     if let Err(err) = manifest.validate() {
         let can_repair = repair && !read_only && owned;
         let mut kept = Vec::with_capacity(manifest.units.len());
         let mut dropped = Vec::new();
+        let mut names = std::collections::HashSet::with_capacity(manifest.units.len());
         for unit in manifest.units.drain(..) {
-            if unit.validate().is_ok() {
+            if unit.validate().is_ok() && names.insert(unit.name.to_lowercase()) {
                 kept.push(unit);
             } else {
                 dropped.push(unit);
@@ -393,17 +415,25 @@ pub(crate) fn load_manifest_at(
 pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest) -> Result<()> {
     util::validate_component(parity, "generation")?;
     manifest.validate()?;
-    let dir = store_root.join(parity);
-    util::create_private_dir_all(&dir)?;
-    write_marker(&dir.join(GENERATION_MARKER))?;
     let signing_key = manifest_signing_key()?;
-    write_store_public_key(store_root, &signing_key)?;
     let mut signed = manifest.clone();
     signed.mac.clear();
     signed.signature.clear();
     signed.mac = manifest_mac(&signed)?;
     signed.signature = manifest_signature(&signed, &signing_key)?;
     let what = serde_json::to_string_pretty(&signed)?;
+    // Refuse before any store write: a manifest the reader cannot load would
+    // make the generation unusable.
+    let durable_len = what.len() as u64 + 1;
+    if durable_len > MAX_MANIFEST_BYTES {
+        anyhow::bail!(
+            "manifest for {parity} would be {durable_len} bytes (cap {MAX_MANIFEST_BYTES})"
+        );
+    }
+    let dir = store_root.join(parity);
+    util::create_private_dir_all(&dir)?;
+    write_marker(&dir.join(GENERATION_MARKER))?;
+    write_store_public_key(store_root, &signing_key)?;
     // O_EXCL + a random, symlink-free temp path: never write through a
     // planted temp link.
     let (tmp, ()) = util::with_temp_file(&dir, "manifest.json.tmp", "", 0o600, |file| {
@@ -422,4 +452,101 @@ pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest
         let _ = parent.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_unit(name: &str) -> UnitEntry {
+        UnitEntry {
+            name: name.into(),
+            profile: "debug".into(),
+            memo: "lib-demo".into(),
+            hash: "0123456789abcdef".into(),
+            version: None,
+            stamp: 1,
+            layout: None,
+            files: vec![FileEntry {
+                path: "lib-demo".into(),
+                dest: "deps/lib-demo".into(),
+                size: 1,
+                sha256: String::new(),
+                role: "artifact".into(),
+                object: None,
+            }],
+        }
+    }
+
+    fn sample_manifest(units: Vec<UnitEntry>) -> Manifest {
+        Manifest {
+            parity_key: "p".into(),
+            toolchain: "t".into(),
+            created: 1,
+            updated: 1,
+            units,
+            mac: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    fn write_signed_store(store: &Path, parity: &str, manifest: &Manifest) -> Result<()> {
+        let dir = store.join(parity);
+        util::create_private_dir_all(&dir)?;
+        write_marker(&dir.join(GENERATION_MARKER))?;
+        let key = manifest_signing_key()?;
+        write_store_public_key(store, &key)?;
+        let mut signed = manifest.clone();
+        signed.mac.clear();
+        signed.signature.clear();
+        signed.mac = manifest_mac(&signed)?;
+        signed.signature = manifest_signature(&signed, &key)?;
+        fs::write(
+            manifest_path(store, parity),
+            serde_json::to_string_pretty(&signed)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_load_drops_case_colliding_units() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let first = sample_unit("demo-0123456789abcdef");
+        let mut second = first.clone();
+        second.name = "DEMO-0123456789ABCDEF".into();
+        write_signed_store(
+            store.path(),
+            "generation",
+            &sample_manifest(vec![first, second]),
+        )?;
+
+        let manifest = load_manifest(store.path(), "generation")?.expect("manifest");
+        assert_eq!(manifest.units.len(), 1);
+        assert_eq!(manifest.units[0].name, "demo-0123456789abcdef");
+        Ok(())
+    }
+
+    #[test]
+    fn save_refuses_an_oversized_manifest_before_writing() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let mut unit = sample_unit("demo-0123456789abcdef");
+        unit.files[0].role = "x".repeat(MAX_MANIFEST_BYTES as usize);
+        let err = save_manifest(store.path(), "generation", &sample_manifest(vec![unit]))
+            .expect_err("oversized manifest must be refused");
+        assert!(format!("{err:#}").contains("cap"));
+        assert!(!manifest_path(store.path(), "generation").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_manifest_must_carry_ed25519() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let mut manifest = sample_manifest(Vec::new());
+        manifest.mac = manifest_mac(&manifest)?;
+        let path = store.path().join("manifest.json");
+        let err = verify_manifest_trust(store.path(), &manifest, &path, true)
+            .expect_err("a MAC-only foreign manifest must be refused");
+        assert!(format!("{err:#}").contains("Ed25519"));
+        Ok(())
+    }
 }

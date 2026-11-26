@@ -137,8 +137,20 @@ fn windows_owner_is_trusted(path: &Path) -> Option<bool> {
 /// inspected; callers must treat that as not private.
 #[cfg(windows)]
 pub fn windows_acl_is_private(path: &Path) -> Option<bool> {
+    windows_acl_check(path, false)
+}
+
+/// A secrets policy: neither read nor mutation rights may reach an untrusted
+/// principal. Credential files need this, not the config-file rule.
+#[cfg(windows)]
+pub fn windows_acl_is_secret(path: &Path) -> Option<bool> {
+    windows_acl_check(path, true)
+}
+
+#[cfg(windows)]
+fn windows_acl_check(path: &Path, secret: bool) -> Option<bool> {
     use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, LocalFree};
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT, ACL,
@@ -149,8 +161,9 @@ pub fn windows_acl_is_private(path: &Path) -> Option<bool> {
         WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_READ_EA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC,
+        WRITE_OWNER,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
@@ -227,6 +240,15 @@ pub fn windows_acl_is_private(path: &Path) -> Option<bool> {
             | GENERIC_WRITE
             | GENERIC_ALL;
 
+        // Secret files additionally refuse foreign readers. READ_CONTROL is
+        // deliberately absent: reading the DACL is not reading the secret.
+        const READ_MASK: u32 = FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | GENERIC_READ;
+        let access_mask = if secret {
+            WRITE_MASK | READ_MASK
+        } else {
+            WRITE_MASK
+        };
+
         for index in 0..info.AceCount {
             let mut ace: *mut c_void = std::ptr::null_mut();
             if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
@@ -272,7 +294,7 @@ pub fn windows_acl_is_private(path: &Path) -> Option<bool> {
                 ACCESS_ALLOWED_COMPOUND_ACE_TYPE => return Some(false),
                 _ => continue,
             };
-            if mask & WRITE_MASK == 0 {
+            if mask & access_mask == 0 {
                 continue;
             }
             if sid_offset + 8 > size {
@@ -358,6 +380,29 @@ fn normalize_windows_path_text(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Volume serial number and file index for a file or directory. Directories
+/// are opened with backup semantics so the handle is a directory handle.
+#[cfg(windows)]
+fn windows_path_identity(path: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
+}
+
 #[cfg(windows)]
 pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
     use std::path::PathBuf;
@@ -365,6 +410,12 @@ pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
     let profile = std::env::var_os("USERPROFILE")
         .with_context(|| format!("{what}: USERPROFILE is not set"))?;
     let profile = fs::canonicalize(&profile).unwrap_or_else(|_| PathBuf::from(profile));
+    let profile_id = windows_path_identity(&profile).with_context(|| {
+        format!(
+            "{what}: cannot read the filesystem identity of %USERPROFILE% ({})",
+            profile.display()
+        )
+    })?;
     let profile_text = normalize_windows_path_text(&profile.to_string_lossy());
 
     let full = if path.is_absolute() {
@@ -434,6 +485,21 @@ pub fn ensure_windows_user_path(path: &Path, what: &str) -> Result<()> {
         anyhow::bail!(
             "{what} {} is %USERPROFILE% itself — choose a dedicated subdirectory",
             full.display()
+        );
+    }
+    // Spelling is not containment: the directory at the profile's depth must
+    // be the same filesystem object as `%USERPROFILE%`, so a case-folded or
+    // short-name spelling reached through another volume is refused.
+    let profile_depth = profile.components().count();
+    let canonical_depth = canonical.components().count();
+    let anchor = canonical
+        .ancestors()
+        .nth(canonical_depth.saturating_sub(profile_depth));
+    if anchor.and_then(windows_path_identity) != Some(profile_id) {
+        anyhow::bail!(
+            "{what} {} is not inside %USERPROFILE% ({}); Windows shared caches are unsupported",
+            canonical.display(),
+            profile.display()
         );
     }
     Ok(())

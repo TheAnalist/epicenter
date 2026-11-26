@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -168,16 +168,9 @@ pub(crate) fn install_put_if_absent(
 ) -> Result<()> {
     match metadata_nofollow(final_path) {
         Ok(meta) if meta.is_file() => {
-            if meta.len() != expected_size || crate::util::sha256_file(final_path)? != expected_blob
-            {
-                let _ = fs::remove_file(tmp);
-                bail!(
-                    "CAS object {} already exists with different bytes; refusing to overwrite",
-                    final_path.display()
-                );
-            }
+            let result = verify_existing_blob(final_path, &meta, expected_blob, expected_size);
             let _ = fs::remove_file(tmp);
-            Ok(())
+            result
         }
         Ok(_) => {
             let _ = fs::remove_file(tmp);
@@ -215,18 +208,44 @@ pub(crate) fn install_put_if_absent(
     }
 }
 
+fn verify_existing_blob(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    expected_blob: &str,
+    expected_size: u64,
+) -> Result<()> {
+    #[cfg(test)]
+    BEFORE_EXISTING_HASH.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path);
+        }
+    });
+    if meta.len() != expected_size || crate::util::sha256_file(path)? != expected_blob {
+        bail!(
+            "CAS object {} already exists with different bytes; refusing to overwrite",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn verify_blob_file(path: &Path, expected_blob: &str, expected_size: u64) -> Result<()> {
     crate::util::verify_file_hash(path, expected_size, expected_blob, "CAS object")
 }
 
-/// Verify the stored object without decoding it.
-pub fn verify_blob(root: &Path, blob: &BlobRef) -> Result<()> {
+fn verify_blob_fields(blob: &BlobRef) -> Result<()> {
     ensure_sha256(&blob.blob, "blob SHA-256")?;
     ensure_sha256(&blob.sha256, "decoded SHA-256")?;
     ensure!(
         blob.blob_size <= MAX_BLOB_BYTES && blob.size <= MAX_BLOB_BYTES,
         "blob exceeds the maximum artifact size"
     );
+    Ok(())
+}
+
+/// Verify the stored object without decoding it.
+pub fn verify_blob(root: &Path, blob: &BlobRef) -> Result<()> {
+    verify_blob_fields(blob)?;
     verify_blob_file(&blob_path(root, &blob.blob)?, &blob.blob, blob.blob_size)
 }
 
@@ -237,15 +256,73 @@ pub const MAX_IN_MEMORY_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 /// signed `blob.size`, so a gzip bomb cannot expand past the expected artifact
 /// size, and both the stored and decoded SHA-256 are checked.
 pub fn decode_blob<W: Write>(root: &Path, blob: &BlobRef, writer: &mut W) -> Result<()> {
-    verify_blob(root, blob)?;
+    verify_blob_fields(blob)?;
     let path = blob_path(root, &blob.blob)?;
-    let input = open_nofollow(&path)?;
+    let mut input = open_nofollow(&path)?;
+    #[cfg(test)]
+    AFTER_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(&path);
+        }
+    });
+    // Verify and decode through the same descriptor: a path swap between the
+    // stored-bytes check and the decode cannot substitute another object.
+    verify_open_blob(&mut input, &path, &blob.blob, blob.blob_size)?;
+    input.seek(SeekFrom::Start(0))?;
     let mut reader: Box<dyn Read> = match blob.compression {
         Compression::Raw => Box::new(input),
         Compression::Gzip => Box::new(flate2::read::GzDecoder::new(input)),
     };
 
     crate::util::copy_verified(&mut reader, writer, blob.size, &blob.sha256, &path)
+}
+
+fn verify_open_blob(
+    file: &mut File,
+    path: &Path,
+    expected_blob: &str,
+    expected_size: u64,
+) -> Result<()> {
+    use sha2::Digest;
+
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspecting CAS object {}", path.display()))?;
+    ensure!(
+        meta.is_file(),
+        "CAS object {} is not a regular file",
+        path.display()
+    );
+    ensure!(
+        meta.len() == expected_size,
+        "CAS object {} has the wrong size (expected {expected_size}, found {})",
+        path.display(),
+        meta.len()
+    );
+    let mut hasher = sha2::Sha256::new();
+    let mut size = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("hashing CAS object {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        hasher.update(&buf[..n]);
+    }
+    ensure!(
+        size == expected_size,
+        "CAS object {} changed while it was being verified",
+        path.display()
+    );
+    ensure!(
+        crate::vault::hex_encode(&hasher.finalize()) == expected_blob,
+        "CAS object {} failed its SHA-256 check",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Buffer a small blob. Artifacts above [`MAX_IN_MEMORY_BLOB_BYTES`] must use
@@ -403,5 +480,86 @@ impl Sha256Writer {
     fn finish(self) -> (u64, String) {
         use sha2::Digest;
         (self.size, crate::vault::hex_encode(&self.hasher.finalize()))
+    }
+}
+
+#[cfg(test)]
+type TestHook = std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_OPEN: TestHook = std::cell::RefCell::new(None);
+    static BEFORE_EXISTING_HASH: TestHook = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_open(hook: impl Fn(&Path) + 'static) {
+    AFTER_OPEN.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_after_open() {
+    AFTER_OPEN.with(|cell| *cell.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn set_before_existing_hash(hook: impl Fn(&Path) + 'static) {
+    BEFORE_EXISTING_HASH.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_before_existing_hash() {
+    BEFORE_EXISTING_HASH.with(|cell| *cell.borrow_mut() = None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_verifies_and_decodes_the_same_opened_object() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = vec![b'a'; 256 * 1024];
+        let source = dir.path().join("artifact.rlib");
+        fs::write(&source, &payload)?;
+        let blob = write_blob(&source, dir.path())?;
+        let moved = dir.path().join("swapped-away");
+
+        set_after_open(move |opened| {
+            fs::rename(opened, &moved).expect("move the opened blob");
+            fs::write(opened, b"substituted object").expect("plant a replacement");
+        });
+        let mut decoded = Vec::new();
+        let result = decode_blob(dir.path(), &blob, &mut decoded);
+        clear_after_open();
+
+        result?;
+        assert_eq!(
+            decoded, payload,
+            "the decode must read the object verified through the same handle"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_blob_hash_failure_removes_the_temp_blob() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let final_path = dir.path().join("blob");
+        fs::write(&final_path, b"same-size")?;
+        let tmp = dir.path().join("staged");
+        fs::write(&tmp, b"same-size")?;
+
+        set_before_existing_hash(|path| {
+            fs::remove_file(path).expect("remove the existing object before hashing");
+        });
+        let result = install_put_if_absent(&tmp, &final_path, "deadbeef", 9);
+        clear_before_existing_hash();
+
+        assert!(result.is_err(), "a vanished object cannot be verified");
+        assert!(
+            !tmp.exists(),
+            "the staged temp blob must be removed when hashing the installed object fails"
+        );
+        Ok(())
     }
 }

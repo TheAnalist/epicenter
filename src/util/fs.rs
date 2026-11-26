@@ -19,7 +19,7 @@ use super::platform::{
     Probed, ensure_windows_user_path, metadata_nofollow, owned_by_us, probe, probe_dir, probe_file,
     probe_kind,
 };
-use super::scan::MAX_FILE_BYTES;
+use super::scan::{MAX_FILE_BYTES, check_copied_size};
 
 /// Remove a tree robustly: read-only files (a wrapper's store, copies that
 /// inherited the read-only attribute) block `remove_dir_all` on Windows, so
@@ -453,6 +453,7 @@ pub(crate) fn copy_fd_verified(
         dst.seek(SeekFrom::Start(0))?;
         let hash = sha256_file_fd(dst)?;
         let size = dst.metadata()?.len();
+        check_copied_size(size)?;
         if size != expected_size || hash != expected_hash {
             anyhow::bail!(
                 "integrity check failed (recorded {expected_size} bytes/{}, found {size} bytes/{})",
@@ -470,9 +471,10 @@ pub(crate) fn copy_fd_verified(
         if n == 0 {
             break;
         }
+        size = size.checked_add(n as u64).context("copied size overflow")?;
+        check_copied_size(size)?;
         hasher.update(&buf[..n]);
         dst.write_all(&buf[..n])?;
-        size += n as u64;
     }
     dst.flush()?;
     let hash = format!("{:x}", hasher.finalize());
@@ -778,8 +780,14 @@ fn copy_file_hashed_mode(src: &Path, dst: &Path, require_owner: bool) -> Result<
     // Copy-on-write clone when the filesystem supports it. The clone is a
     // new inode (no shared mutable state) and costs no duplicate blocks.
     if try_reflink(&input, &output).is_ok() {
+        let size = output.metadata()?.len();
+        if let Err(err) = check_copied_size(size) {
+            drop(output);
+            let _ = fs::remove_file(dst);
+            return Err(err).with_context(|| format!("copying {}", src.display()));
+        }
         let hash = sha256_file(dst).with_context(|| format!("hashing cloned {}", dst.display()))?;
-        return Ok((output.metadata()?.len(), hash));
+        return Ok((size, hash));
     }
 
     let mut hasher = Sha256::new();
@@ -793,9 +801,14 @@ fn copy_file_hashed_mode(src: &Path, dst: &Path, require_owner: bool) -> Result<
         if n == 0 {
             break;
         }
+        size = size.checked_add(n as u64).context("copied size overflow")?;
+        if let Err(err) = check_copied_size(size) {
+            drop(output);
+            let _ = fs::remove_file(dst);
+            return Err(err).with_context(|| format!("copying {}", src.display()));
+        }
         hasher.update(&buf[..n]);
         output.write_all(&buf[..n])?;
-        size += n as u64;
     }
     output.flush()?;
     Ok((size, format!("{:x}", hasher.finalize())))
@@ -859,7 +872,10 @@ pub(crate) fn compress_file_hashed(
                 }
                 hasher.update(&buf[..n]);
                 encoder.write_all(&buf[..n])?;
-                size += n as u64;
+                size = size
+                    .checked_add(n as u64)
+                    .context("compressed size overflow")?;
+                check_copied_size(size)?;
             }
             encoder.finish()?;
             file.sync_all()?;
@@ -875,7 +891,10 @@ pub(crate) fn compress_file_hashed(
     let object = format!("blobs/{}/{sha}.gz", &sha[..2]);
     let final_path = generation_root.join(&object);
     if let Some(parent) = final_path.parent() {
-        create_private_dir_all(parent)?;
+        if let Err(err) = create_private_dir_all(parent) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
     }
     // The blob name is its content hash. Never follow or replace a planted
     // symlink, and never silently accept bytes that do not match the name.
@@ -1080,9 +1099,9 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
         use std::collections::{HashMap, HashSet};
 
         // NTFS reports the volume/file index and link count; dedupe by inode
-        // exactly like the Unix branch. A filesystem that cannot report them
-        // is treated as one link per path (fail-open, never over-credits a
-        // released link as freed).
+        // exactly like the Unix branch. When the filesystem cannot report an
+        // identity or link count, treat the count as unknown so a path is never
+        // credited as freeing the inode.
         let mut per_inode: HashMap<(u32, u64), (u64, u64, u64)> = HashMap::new();
         let mut seen: HashSet<&Path> = HashSet::new();
         let mut count = 0u64;
@@ -1095,8 +1114,15 @@ pub(crate) fn account_files(files: &[PathBuf]) -> (u64, u64, u64, u64) {
             };
             count += 1;
             let (key, size, links) = match windows_file_identity(path) {
-                Some((volume, index, links, size)) => ((volume, index), size, u64::from(links)),
-                None => ((0, u64::MAX - count), meta.len(), 1),
+                Some((volume, index, links, size)) => {
+                    let links = if links == 0 {
+                        u64::MAX
+                    } else {
+                        u64::from(links)
+                    };
+                    ((volume, index), size, links)
+                }
+                None => ((0, u64::MAX - count), meta.len(), u64::MAX),
             };
             let entry = per_inode.entry(key).or_insert((size, links, 0));
             entry.2 += 1;
@@ -1315,4 +1341,32 @@ pub(crate) fn verify_file_hash(path: &Path, size: u64, sha256: &str, what: &str)
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn compression_failure_removes_the_staged_blob() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("generation");
+        let blobs = root.join("blobs");
+        fs::create_dir_all(&blobs)?;
+        let src = dir.path().join("artifact");
+        fs::write(&src, vec![b'x'; 8 * 1024])?;
+        let sha = sha256_file(&src)?;
+        // Block the prefix directory so installing the blob fails after the
+        // gzip temp has been staged.
+        fs::write(blobs.join(&sha[..2]), b"blocker")?;
+
+        assert!(
+            compress_file_hashed(&src, &root).is_err(),
+            "the blocked prefix must fail the install"
+        );
+        let entries: Vec<_> = fs::read_dir(&blobs)?.collect::<std::io::Result<_>>()?;
+        assert_eq!(entries.len(), 1, "the staged gzip blob was removed");
+        Ok(())
+    }
 }

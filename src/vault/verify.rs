@@ -67,6 +67,34 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
         };
         let units = units_dir(store_root, &parity);
         let generation_root = store_root.join(&parity);
+        // One no-follow probe decides every `units/` traversal below: a
+        // symlinked or missing directory is never followed, and the audit
+        // reports it instead of reading whatever it points at.
+        let units_traversable = match util::metadata_nofollow(&units) {
+            Ok(meta) if meta.is_dir() => true,
+            Ok(_) => {
+                report.problems.push(format!(
+                    "units directory {} is a symlink/reparse or not a directory",
+                    units.display()
+                ));
+                false
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                report.problems.push(format!(
+                    "units directory {} is a symlink/reparse or not a directory",
+                    units.display()
+                ));
+                false
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                report.problems.push(format!(
+                    "unreadable units directory {}: {err}",
+                    units.display()
+                ));
+                false
+            }
+        };
 
         // Content-addressed blobs are shared between units. Verify each
         // object once (decode cap = the largest recorded size) and compare
@@ -112,41 +140,51 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
 
         // Reject extra files in recorded unit dirs too: a manifest hash
         // list is only meaningful if the set of files is exact.
-        for entry in &manifest.units {
-            let unit_dir = units.join(&entry.name);
-            let expected: std::collections::BTreeSet<String> =
-                entry.files.iter().map(|file| file.path.clone()).collect();
-            let walk = util::SafeWalk::new(&unit_dir).walk();
-            for file in walk {
-                if budget.spend().is_err() {
+        if units_traversable {
+            for entry in &manifest.units {
+                let unit_dir = units.join(&entry.name);
+                let expected: std::collections::BTreeSet<String> =
+                    entry.files.iter().map(|file| file.path.clone()).collect();
+                let mut walk = util::SafeWalk::new(&unit_dir).walk_with(&mut budget);
+                for file in walk.by_ref() {
+                    let file = match file {
+                        Ok(file) => file,
+                        Err(err) => {
+                            report
+                                .problems
+                                .push(format!("unreadable unit dir: units/{} ({err})", entry.name));
+                            continue;
+                        }
+                    };
+                    let rel = file
+                        .path()
+                        .strip_prefix(&unit_dir)
+                        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    match metadata_nofollow(file.path()) {
+                        Ok(meta) if !meta.is_file() => continue,
+                        Ok(_) => (),
+                        Err(err) => {
+                            // An entry we cannot stat is still a candidate
+                            // extra file: never drop it from the audit.
+                            report.problems.push(format!(
+                                "unreadable entry in units/{}/{}: {err}",
+                                entry.name, rel
+                            ));
+                            continue;
+                        }
+                    }
+                    if !expected.contains(&rel) {
+                        report
+                            .problems
+                            .push(format!("unrecorded file: units/{}/{}", entry.name, rel));
+                    }
+                }
+                if walk.truncated() {
                     report
                         .problems
                         .push("scan budget exceeded — extra-file audit truncated".to_string());
                     break;
-                }
-                let file = match file {
-                    Ok(file) => file,
-                    Err(err) => {
-                        report
-                            .problems
-                            .push(format!("unreadable unit dir: units/{} ({err})", entry.name));
-                        continue;
-                    }
-                };
-                match metadata_nofollow(&file.path()) {
-                    Ok(meta) if !meta.is_file() => continue,
-                    Ok(_) => (),
-                    Err(_) => continue,
-                }
-                let rel = file
-                    .path()
-                    .strip_prefix(&unit_dir)
-                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                if !expected.contains(&rel) {
-                    report
-                        .problems
-                        .push(format!("unrecorded file: units/{}/{}", entry.name, rel));
                 }
             }
         }
@@ -157,63 +195,45 @@ pub fn verify(store_root: &Path) -> Result<Vec<VerifyReport>> {
         // fingerprints; the join key is the dependency's memo hash — the
         // same value serde's `serde_core` edge (9416646317397223793) and
         // serde_core's memo file (71a9f323efa5ae82) share.
-        let by_hash: std::collections::HashMap<&str, usize> = manifest
-            .units
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.hash.as_str(), index))
-            .collect();
-        for entry in &manifest.units {
-            let json = entry
-                .files
+        if units_traversable {
+            let by_hash: std::collections::HashMap<&str, usize> = manifest
+                .units
                 .iter()
-                .find(|file| file.path.ends_with(".json"))
-                .and_then(|file| read_small_regular(&units.join(&entry.name).join(&file.path)))
-                .and_then(|text| crate::fingerprint::parse_fingerprint(&text));
-            let Some(json) = json else { continue };
-            for dep in &json.deps {
-                let Some(dep_index) = dep
-                    .memo_hash()
-                    .and_then(|hash| by_hash.get(hash.as_str()))
-                    .copied()
-                else {
-                    continue;
-                };
-                let dep_entry = &manifest.units[dep_index];
-                if dep_entry.stamp > entry.stamp {
-                    report.ordering.push(format!(
-                        "{} is older than its dependency {} ({} older) — cargo recompiles it after a restore",
-                        entry.name,
-                        dep_entry.name,
-                        crate::util::human_duration(Duration::from_secs(dep_entry.stamp - entry.stamp))
-                    ));
+                .enumerate()
+                .map(|(index, entry)| (entry.hash.as_str(), index))
+                .collect();
+            for entry in &manifest.units {
+                let json = entry
+                    .files
+                    .iter()
+                    .find(|file| file.path.ends_with(".json"))
+                    .and_then(|file| read_small_regular(&units.join(&entry.name).join(&file.path)))
+                    .and_then(|text| crate::fingerprint::parse_fingerprint(&text));
+                let Some(json) = json else { continue };
+                for dep in &json.deps {
+                    let Some(dep_index) = dep
+                        .memo_hash()
+                        .and_then(|hash| by_hash.get(hash.as_str()))
+                        .copied()
+                    else {
+                        continue;
+                    };
+                    let dep_entry = &manifest.units[dep_index];
+                    if dep_entry.stamp > entry.stamp {
+                        report.ordering.push(format!(
+                            "{} is older than its dependency {} ({} older) — cargo recompiles it after a restore",
+                            entry.name,
+                            dep_entry.name,
+                            crate::util::human_duration(Duration::from_secs(dep_entry.stamp - entry.stamp))
+                        ));
+                    }
                 }
             }
         }
         report.units = manifest.units.len();
 
         // Unit groups on disk that the manifest doesn't record.
-        match util::metadata_nofollow(&units) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => {
-                report.problems.push(format!(
-                    "units directory {} is a symlink/reparse or not a directory",
-                    units.display()
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
-                report.problems.push(format!(
-                    "units directory {} is a symlink/reparse or not a directory",
-                    units.display()
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => report.problems.push(format!(
-                "unreadable units directory {}: {err}",
-                units.display()
-            )),
-        }
-        if units.is_dir() {
+        if units_traversable {
             let known: std::collections::BTreeSet<&str> = manifest
                 .units
                 .iter()
@@ -250,20 +270,11 @@ pub(crate) struct AuditCtx<'a> {
     pub(crate) read_only: bool,
 }
 
+#[derive(Default)]
 pub(crate) struct UnitAudit {
     pub(crate) problems: Vec<String>,
     pub(crate) files: usize,
     pub(crate) bytes: u64,
-}
-
-impl Default for UnitAudit {
-    fn default() -> Self {
-        Self {
-            problems: Vec::new(),
-            files: 0,
-            bytes: 0,
-        }
-    }
 }
 
 /// The verified content of one blob, or why it could not be read.

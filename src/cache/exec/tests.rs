@@ -83,6 +83,7 @@ fn seeded_profiles_store() -> Result<(tempfile::TempDir, tempfile::TempDir)> {
 fn exec_seeds_the_job_and_propagates_the_exit_code() -> Result<()> {
     let (_build, store) = seeded_store()?;
     let work = tempfile::tempdir()?;
+    let work_root = work.path().canonicalize()?;
     // The synthetic store unit is for package `x`: name it in a lock so
     // this test does not depend on whatever Cargo.lock exists above /tmp.
     let project = tempfile::tempdir()?;
@@ -92,7 +93,7 @@ fn exec_seeds_the_job_and_propagates_the_exit_code() -> Result<()> {
          source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
          checksum = \"abababababababababababababababababababababababababababababababab\"\n",
     )?;
-    let job_dir = work.path().join("jobtest");
+    let job_dir = work_root.join("jobtest");
     let command = vec![
         "sh".to_string(),
         "-c".to_string(),
@@ -116,7 +117,7 @@ fn exec_seeds_the_job_and_propagates_the_exit_code() -> Result<()> {
         remote: None,
         command: &command,
     };
-    let code = run(store.path(), work.path(), &opts)?;
+    let code = run(store.path(), &work_root, &opts)?;
     assert_eq!(code, 7, "the command's exit code is the job's exit code");
     assert!(
         job_dir
@@ -241,6 +242,7 @@ fn exec_seeds_only_the_child_profile() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn exec_seeds_only_the_packages_in_the_project_lock() -> Result<()> {
     let (_build, store) = seeded_store()?;
@@ -387,6 +389,140 @@ fn exec_rm_removes_the_job_dir_either_way() -> Result<()> {
     assert!(
         work.path().join(".lock-j-keep").exists(),
         "a kept job keeps its lock for the next --reuse"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_rm_cleans_up_after_a_missing_program() -> Result<()> {
+    let (_build, store) = seeded_store()?;
+    let work = tempfile::tempdir()?;
+    let missing: Vec<String> = vec!["epicenter-no-such-program-xyz".into()];
+
+    let remove = Options {
+        job_id: Some("missing"),
+        cwd: None,
+        harvest_back: false,
+        compress: true,
+        remove_on_success: true,
+        reuse: false,
+        target_dir: None,
+        incremental: None,
+        link: LinkPolicy::Auto,
+        cargo_home: None,
+        no_remote: false,
+        remote: None,
+        command: &missing,
+    };
+    let err = run(store.path(), work.path(), &remove).unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
+    assert!(
+        !work.path().join("missing").exists(),
+        "--rm removes the job dir when the program cannot be found"
+    );
+    assert!(
+        !work.path().join(".exec-missing.json").exists(),
+        "--rm removes the record too"
+    );
+    assert!(
+        !work.path().join(".lock-missing").exists(),
+        "--rm releases and removes the job lock"
+    );
+
+    // Without --rm the half-initialized job stays for inspection, as before.
+    let keep = Options {
+        job_id: Some("kept-missing"),
+        remove_on_success: false,
+        ..remove
+    };
+    let err = run(store.path(), work.path(), &keep).unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
+    assert!(
+        work.path().join("kept-missing").exists(),
+        "a kept job dir survives an early failure"
+    );
+    assert!(
+        work.path().join(".exec-kept-missing.json").is_file(),
+        "and so does its provenance record"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_rm_record_does_not_outlive_its_dir() -> Result<()> {
+    let (_build, store) = seeded_store()?;
+    let work = tempfile::tempdir()?;
+    let ok: Vec<String> = vec!["true".into()];
+    let remove = Options {
+        job_id: Some("same"),
+        cwd: None,
+        harvest_back: false,
+        compress: true,
+        remove_on_success: true,
+        reuse: false,
+        target_dir: None,
+        incremental: None,
+        link: LinkPolicy::Auto,
+        cargo_home: None,
+        no_remote: false,
+        remote: None,
+        command: &ok,
+    };
+    assert_eq!(run(store.path(), work.path(), &remove)?, 0);
+    assert!(!work.path().join(".exec-same.json").exists());
+
+    // A successor reuses the id: its record is written after the earlier
+    // cleanup, so it must survive.
+    let keep = Options {
+        remove_on_success: false,
+        ..remove
+    };
+    assert_eq!(run(store.path(), work.path(), &keep)?, 0);
+    assert!(
+        work.path().join(".exec-same.json").is_file(),
+        "the successor's record survives the earlier --rm cleanup"
+    );
+    Ok(())
+}
+
+#[test]
+fn exec_does_not_delete_a_record_it_does_not_own() -> Result<()> {
+    let (_build, store) = seeded_store()?;
+    let work = tempfile::tempdir()?;
+    let dir = work.path().join("held");
+    crate::util::create_private_dir_all(&dir)?;
+    write_job_marker(&dir)?;
+    record_for_test(&dir)?;
+    let record = work.path().join(".exec-held.json");
+    assert!(record.is_file());
+
+    // Another process holds the job lock: this run must refuse before it can
+    // touch the dir or its record.
+    let _held = crate::util::FileLock::acquire(&job_lock_path(work.path(), "held"))?;
+    let command: Vec<String> = vec!["true".into()];
+    let opts = Options {
+        job_id: Some("held"),
+        cwd: None,
+        harvest_back: false,
+        compress: true,
+        remove_on_success: true,
+        reuse: true,
+        target_dir: None,
+        incremental: None,
+        link: LinkPolicy::Auto,
+        cargo_home: None,
+        no_remote: false,
+        remote: None,
+        command: &command,
+    };
+    let err = run(store.path(), work.path(), &opts).unwrap_err();
+    assert!(err.to_string().contains("in use"), "{err}");
+    assert!(dir.exists(), "a refused run leaves the owned dir alone");
+    assert!(
+        record.is_file(),
+        "a refused run never deletes another owner's record"
     );
     Ok(())
 }
@@ -645,6 +781,7 @@ fn new_job_dirs_are_marked_and_reuse_requires_the_marker() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn exec_reuse_adopts_a_marker_only_dir() -> Result<()> {
     let (_build, store) = seeded_store()?;
@@ -812,7 +949,8 @@ fn default_work_root_is_not_derived_from_the_build_root() -> Result<()> {
 fn exec_exports_a_per_job_target_dir() -> Result<()> {
     let (_build, store) = seeded_store()?;
     let work = tempfile::tempdir()?;
-    let job_dir = work.path().join("t1");
+    let work_root = work.path().canonicalize()?;
+    let job_dir = work_root.join("t1");
     let command = vec![
         "sh".to_string(),
         "-c".to_string(),
@@ -836,7 +974,7 @@ fn exec_exports_a_per_job_target_dir() -> Result<()> {
         remote: None,
         command: &command,
     };
-    assert_eq!(run(store.path(), work.path(), &opts)?, 0);
+    assert_eq!(run(store.path(), &work_root, &opts)?, 0);
     Ok(())
 }
 
@@ -850,46 +988,86 @@ fn child_cargo_reads_profile_target_and_subcommand() {
         "--target".to_string(),
         "wasm32-unknown-unknown".to_string(),
     ];
-    let child = child_cargo(&command);
+    let child = child_cargo(&command, None);
     assert!(child.builds_units);
     assert_eq!(child.selector.as_deref(), Some("nightly"));
     assert_eq!(child.profile.as_deref(), Some("release"));
     assert_eq!(child.target.as_deref(), Some("wasm32-unknown-unknown"));
 
-    let child = child_cargo(&[
-        "cargo".to_string(),
-        "build".to_string(),
-        "--profile=dev".to_string(),
-    ]);
+    let child = child_cargo(
+        &[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--profile=dev".to_string(),
+        ],
+        None,
+    );
     assert_eq!(child.profile.as_deref(), Some("debug"));
     assert!(child.target.is_none());
 
-    let child = child_cargo(&["cargo".to_string(), "bench".to_string()]);
+    let child = child_cargo(&["cargo".to_string(), "bench".to_string()], None);
     assert_eq!(
         child.profile.as_deref(),
         Some("release"),
         "the bench subcommand defaults to the release profile"
     );
 
-    let child = child_cargo(&["cargo".to_string(), "test".to_string(), "bench".to_string()]);
+    let child = child_cargo(
+        &["cargo".to_string(), "test".to_string(), "bench".to_string()],
+        None,
+    );
     assert_eq!(
         child.profile.as_deref(),
         Some("debug"),
         "a literal bench test filter is not the bench subcommand"
     );
 
-    let child = child_cargo(&[
-        "cargo".to_string(),
-        "build".to_string(),
-        "--profile".to_string(),
-        "bench".to_string(),
-    ]);
+    let child = child_cargo(
+        &[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--profile".to_string(),
+            "bench".to_string(),
+        ],
+        None,
+    );
     assert_eq!(child.profile.as_deref(), Some("release"));
 
-    let child = child_cargo(&["cargo".to_string(), "build".to_string(), "-r".to_string()]);
+    let child = child_cargo(
+        &["cargo".to_string(), "build".to_string(), "-r".to_string()],
+        None,
+    );
     assert_eq!(child.profile.as_deref(), Some("release"));
 
-    let child = child_cargo(&["cargo".to_string(), "metadata".to_string()]);
+    let child = child_cargo(&["cargo".to_string(), "metadata".to_string()], None);
     assert!(!child.builds_units);
     assert!(child.profile.is_none());
+}
+
+#[test]
+fn a_held_cargo_lock_marks_the_profile_as_a_live_build() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let job = home.path().join("job");
+    let profile = job.join("debug");
+    fs::create_dir_all(profile.join("deps"))?;
+    let legacy = profile.join(".cargo-lock");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&legacy)?;
+    held.lock()?;
+    assert!(
+        cargo_locks(&job)?.is_none(),
+        "a held .cargo-lock must be detected like .cargo-build-lock"
+    );
+    assert!(existing_cargo_locks(&job)?.is_none());
+    drop(held);
+    assert!(
+        cargo_locks(&job)?.is_some(),
+        "a released lock is not a live build"
+    );
+    assert!(existing_cargo_locks(&job)?.is_some());
+    Ok(())
 }

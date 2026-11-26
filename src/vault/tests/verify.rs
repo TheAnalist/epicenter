@@ -176,3 +176,69 @@ fn verify_ordering_is_quiet_when_units_are_current() -> Result<()> {
     assert!(reports[0].ordering.is_empty(), "{:?}", reports[0].ordering);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn verify_does_not_traverse_a_symlinked_units_dir() -> Result<()> {
+    let build = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    synthetic_build_dir(build.path())?;
+    harvest(build.path(), store.path(), None, false)?;
+
+    let parity = parity_key()?;
+    let units = units_dir(store.path(), &parity);
+    let real = store.path().join("units.real");
+    fs::rename(&units, &real)?;
+    let victim = tempfile::tempdir()?;
+    fs::create_dir_all(victim.path().join("stray-0000000000000000"))?;
+    std::os::unix::fs::symlink(victim.path(), &units)?;
+
+    let reports = verify(store.path())?;
+    let problems = &reports[0].problems;
+    assert!(
+        problems
+            .iter()
+            .any(|line| line.contains("units directory") && line.contains("symlink")),
+        "{problems:?}"
+    );
+    assert!(
+        !problems
+            .iter()
+            .any(|line| line.contains("unrecorded unit group")),
+        "a symlinked units dir must not be enumerated: {problems:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_reports_an_unreadable_extra_entry() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if util::euid() == 0 {
+        return Ok(()); // root bypasses the search-bit check
+    }
+    let build = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    synthetic_build_dir(build.path())?;
+    harvest(build.path(), store.path(), None, false)?;
+
+    let unit_dir = units_dir(store.path(), &parity_key()?).join("serde-102a33f055a8d229");
+    let locked = unit_dir.join("locked");
+    fs::create_dir_all(&locked)?;
+    fs::write(locked.join("stray"), b"x")?;
+    // Readable but not searchable: the walk lists the child, yet a no-follow
+    // stat of it fails. The audit must report the entry, not skip it.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o400))?;
+
+    let reports = verify(store.path())?;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
+    let problems = &reports[0].problems;
+    assert!(
+        problems
+            .iter()
+            .any(|line| line
+                .contains("unreadable entry in units/serde-102a33f055a8d229/locked/stray")),
+        "{problems:?}"
+    );
+    Ok(())
+}

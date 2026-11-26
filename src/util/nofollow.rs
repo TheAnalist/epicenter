@@ -404,6 +404,9 @@ impl AtDir {
             Some(EntryKind::Directory) => {
                 let child = match self.open_child(name) {
                     Ok(child) => child,
+                    // The directory vanished between the lookup and the open:
+                    // it is already removed, so there is nothing left to do.
+                    Err(err) if is_not_found(&err) => return Ok(()),
                     Err(err) if is_nofollow_open_error(&err) => {
                         // The name changed to a symlink/non-directory after the
                         // lookup. Remove the entry itself; never follow it.
@@ -558,7 +561,11 @@ fn open_dir_path(path: &Path) -> Result<AtDir> {
 #[cfg(unix)]
 fn open_parent_at(root: &Path, target: &Path) -> Result<Option<(AtDir, std::ffi::OsString)>> {
     let rel = relative_under(root, target)?;
-    let mut dir = open_dir_path(root)?;
+    let mut dir = match open_dir_path(root) {
+        Ok(dir) => dir,
+        Err(err) if is_not_found(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
     let mut components = rel.components().peekable();
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
@@ -592,7 +599,11 @@ pub(crate) fn remove_tree(root: &Path, target: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let rel = relative_under(root, target)?;
-        let mut dir = open_dir_path(root)?;
+        let mut dir = match open_dir_path(root) {
+            Ok(dir) => dir,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
         let mut components = rel.components().peekable();
         while let Some(component) = components.next() {
             let Component::Normal(name) = component else {
@@ -758,8 +769,9 @@ pub(super) fn open_delete_dir_handle(path: &Path) -> Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     const GENERIC_READ: u32 = 0x8000_0000;
     const DELETE: u32 = 0x0001_0000;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
     let file = fs::OpenOptions::new()
-        .access_mode(GENERIC_READ | DELETE)
+        .access_mode(GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -769,6 +781,20 @@ pub(super) fn open_delete_dir_handle(path: &Path) -> Result<File> {
         anyhow::bail!("{} is not a real directory", path.display());
     }
     Ok(file)
+}
+
+/// Clear the read-only attribute through the held handle, never by path. A
+/// read-only file or directory cannot be marked for deletion on Windows, and
+/// a path-based `set_permissions` could follow a planted link.
+#[cfg(windows)]
+fn clear_readonly(file: &File) -> Result<()> {
+    let mut perms = file.metadata()?.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        file.set_permissions(perms)
+            .context("clearing the read-only attribute")?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -801,8 +827,9 @@ fn remove_entry_by_handle(target: &Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     const GENERIC_READ: u32 = 0x8000_0000;
     const DELETE: u32 = 0x0001_0000;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
     let file = fs::OpenOptions::new()
-        .access_mode(GENERIC_READ | DELETE)
+        .access_mode(GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(target)
@@ -811,6 +838,7 @@ fn remove_entry_by_handle(target: &Path) -> Result<()> {
     if meta.is_dir() && !meta.file_type().is_symlink() && !is_reparse_point(&meta) {
         anyhow::bail!("{} changed to a real directory", target.display());
     }
+    clear_readonly(&file)?;
     mark_delete_on_close(&file)
 }
 
@@ -825,23 +853,32 @@ fn remove_tree_path(target: &Path) -> Result<()> {
         #[cfg(windows)]
         let guard = match open_delete_dir_handle(target) {
             Ok(guard) => guard,
+            Err(err) if is_not_found(&err) => return Ok(()),
             Err(err) => {
                 // The name changed type after the lookup. Remove the exact
                 // replacement entry (a link/file) by handle; a new real
                 // directory is refused by remove_entry_by_handle.
-                return remove_entry_by_handle(target).with_context(|| {
-                    format!(
-                        "removing {} after it changed type: {err:#}",
-                        target.display()
-                    )
-                });
+                return match remove_entry_by_handle(target) {
+                    Ok(()) => Ok(()),
+                    Err(err) if is_not_found(&err) => Ok(()),
+                    Err(err) => Err(err).with_context(|| {
+                        format!(
+                            "removing {} after it changed type: {err:#}",
+                            target.display()
+                        )
+                    }),
+                };
             }
         };
         // `read_dir` is path-based, but `guard` prevents this directory from
         // being renamed/replaced while its entries are enumerated.
-        let entries: Vec<_> = std::fs::read_dir(target)
-            .with_context(|| format!("reading {}", target.display()))?
-            .collect::<std::io::Result<_>>()?;
+        let entries: Vec<_> = match std::fs::read_dir(target) {
+            Ok(entries) => entries.collect::<std::io::Result<_>>()?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", target.display()));
+            }
+        };
         for entry in entries {
             remove_tree_path(&entry.path())?;
         }
@@ -849,22 +886,45 @@ fn remove_tree_path(target: &Path) -> Result<()> {
         {
             // Delete through the same pinned handle, not by path: a swap after
             // enumeration cannot redirect the final remove.
+            clear_readonly(&guard)?;
             mark_delete_on_close(&guard)?;
         }
         #[cfg(not(windows))]
-        std::fs::remove_dir(target).with_context(|| format!("removing {}", target.display()))?;
+        match std::fs::remove_dir(target) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("removing {}", target.display()));
+            }
+        }
     } else {
         // Junction/reparse directory, symlink, or regular file: a handle pins
         // the entry and `FILE_FLAG_OPEN_REPARSE_POINT` keeps links as links.
         #[cfg(windows)]
-        remove_entry_by_handle(target).with_context(|| format!("removing {}", target.display()))?;
+        match remove_entry_by_handle(target) {
+            Ok(()) => {}
+            Err(err) if is_not_found(&err) => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("removing {}", target.display()));
+            }
+        }
         #[cfg(not(windows))]
         if meta.is_dir() {
-            std::fs::remove_dir(target)
-                .with_context(|| format!("removing {}", target.display()))?;
+            match std::fs::remove_dir(target) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", target.display()));
+                }
+            }
         } else {
-            std::fs::remove_file(target)
-                .with_context(|| format!("removing {}", target.display()))?;
+            match std::fs::remove_file(target) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", target.display()));
+                }
+            }
         }
     }
     Ok(())
@@ -933,4 +993,45 @@ pub(crate) fn set_stamp_fd(file: &File, stamp: u64) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(windows)]
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_is_a_no_op_when_the_root_vanished() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let missing = root.path().join("gone");
+        assert!(remove_tree(root.path(), &missing.join("unit")).is_ok());
+        assert!(remove_file(root.path(), &missing.join("file")).is_ok());
+        assert!(remove_empty_dir(root.path(), &missing.join("dir")).is_ok());
+
+        let gone = tempfile::tempdir()?;
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        assert!(remove_tree(&gone_path, &gone_path.join("unit")).is_ok());
+        assert!(remove_file(&gone_path, &gone_path.join("file")).is_ok());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_tree_clears_a_read_only_entry() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let unit = root.path().join("unit");
+        fs::create_dir(&unit)?;
+        let file = unit.join("locked");
+        fs::write(&file, b"x")?;
+        let mut perms = fs::metadata(&file)?.permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&file, perms)?;
+
+        remove_tree(root.path(), &unit)?;
+        assert!(!unit.exists(), "the read-only file must not block removal");
+        Ok(())
+    }
 }

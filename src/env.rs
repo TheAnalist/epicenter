@@ -10,17 +10,37 @@ use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 
-/// The user's home directory (`$HOME`, with a portable fallback).
+/// The user's home directory (`$HOME`, with a portable fallback), always
+/// absolute. A relative `HOME` is resolved against the current directory so
+/// every per-user root derived from it stays absolute.
 pub fn home() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
+    let raw = if let Some(home) = std::env::var_os("HOME") {
         if !home.is_empty() {
-            return Ok(PathBuf::from(home));
+            Some(PathBuf::from(home))
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    let raw = match raw {
+        Some(raw) => raw,
+        // Fallback (also correct when running natively on Windows).
+        None => std::env::home_dir()
+            .filter(|p| !p.as_os_str().is_empty())
+            .with_context(|| "could not determine the user home directory")?,
+    };
+    absolute_home(raw)
+}
+
+/// Resolve a home path against the current directory when it is relative.
+fn absolute_home(raw: PathBuf) -> Result<PathBuf> {
+    if raw.is_absolute() {
+        return Ok(raw);
     }
-    // Fallback (also correct when running natively on Windows).
-    std::env::home_dir()
-        .filter(|p| !p.as_os_str().is_empty())
-        .with_context(|| "could not determine the user home directory")
+    Ok(std::env::current_dir()
+        .context("resolving the current directory")?
+        .join(raw))
 }
 
 #[derive(Clone, Copy)]
@@ -127,4 +147,24 @@ pub fn ambient_cargo_home() -> Result<PathBuf> {
         }
     }
     Ok(home()?.join(".cargo"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_home_is_resolved_to_an_absolute_root() -> Result<()> {
+        let resolved = absolute_home(PathBuf::from("relative/home"))?;
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("relative/home"));
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_home_is_left_unchanged() -> Result<()> {
+        let raw = std::env::temp_dir().join("epicenter-home");
+        assert_eq!(absolute_home(raw.clone())?, raw);
+        Ok(())
+    }
 }

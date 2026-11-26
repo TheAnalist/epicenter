@@ -457,9 +457,17 @@ pub(super) enum Command {
         #[arg(long)]
         reuse: bool,
         /// Finals dir for fully parallel jobs: bare `--target-dir` uses
-        /// `<work dir>/target`; a value selects that path instead (relative
-        /// paths resolve against the working directory).
-        #[arg(long, num_args = 0..=1, default_missing_value = "job", value_name = "DIR")]
+        /// `<work dir>/target`; `--target-dir=DIR` selects that path instead
+        /// (relative paths resolve against the working directory). A value is
+        /// only accepted after `=`, so `--target-dir cargo test` keeps
+        /// `cargo` as the child command; put `--` before the child if needed.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "job",
+            value_name = "DIR"
+        )]
         target_dir: Option<String>,
         /// Remove the work dir after the run — success or failure (default: keep it for inspection).
         #[arg(long)]

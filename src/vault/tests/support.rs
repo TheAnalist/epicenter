@@ -206,6 +206,7 @@ pub(crate) fn synthetic_edge_dir(root: &Path, dep_at: u64, unit_at: u64) -> Resu
     fs::write(&unit_rlib, [1u8; 32])?;
 
     set_stamp(&core.join("lib-serde_core"), dep_at)?;
+    set_stamp(&core.join("lib-serde_core.json"), dep_at)?;
     set_stamp(&core.join("dep-lib-serde_core"), dep_at)?;
     set_stamp(&core_rlib, dep_at)?;
     set_stamp(&unit.join("lib-serde"), unit_at)?;

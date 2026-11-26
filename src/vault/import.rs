@@ -11,8 +11,7 @@ use crate::util::{self, metadata_nofollow, now_secs};
 
 use super::harvest::{make_read_only, set_stamp, sweep_staging};
 use super::layout::{
-    GENERATION_MARKER, ensure_store_root, lock_generation, remove_generation_lock, units_dir,
-    write_marker,
+    GENERATION_MARKER, ensure_store_root, lock_generation, units_dir, write_marker,
 };
 use super::manifest::{FileEntry, Manifest, UnitEntry, load_manifest, save_manifest};
 
@@ -102,11 +101,13 @@ pub fn import_units(
         manifest.toolchain = toolchain.to_string();
     }
 
+    // Match the manifest's case-insensitive identity: a differently-cased
+    // name is the same unit on the filesystems the store targets.
     let mut index: std::collections::HashMap<String, usize> = manifest
         .units
         .iter()
         .enumerate()
-        .map(|(at, entry)| (entry.name.clone(), at))
+        .map(|(at, entry)| (unit_identity(&entry.name), at))
         .collect();
     let mut owners: std::collections::HashMap<String, String> = manifest
         .units
@@ -127,7 +128,7 @@ pub fn import_units(
         for unit in units {
             let entry = import_entry(unit)?;
 
-            if let Some(&slot) = index.get(&unit.name) {
+            if let Some(&slot) = index.get(&unit_identity(&unit.name)) {
                 if same_import_unit(&manifest.units[slot], &entry) {
                     report.skipped += 1;
                 } else {
@@ -159,7 +160,8 @@ pub fn import_units(
                 util::temp_nonce()
             ));
             util::create_private_dir_all(&stage)?;
-            let staged = (|| -> Result<()> {
+            let final_dir = units_root.join(&unit.name);
+            let installed = (|| -> Result<()> {
                 for file in &unit.files {
                     let rel = util::validate_rel(&file.path, "import file path")?;
                     let dst = stage.join(&rel);
@@ -194,27 +196,27 @@ pub fn import_units(
                         }
                     }
                 }
+
+                match metadata_nofollow(&final_dir) {
+                    Ok(meta) if meta.is_dir() => util::remove_tree(store_root, &final_dir)?,
+                    Ok(_) => anyhow::bail!(
+                        "import target {} is not a real directory",
+                        final_dir.display()
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("inspecting {}", final_dir.display()));
+                    }
+                }
+                fs::rename(&stage, &final_dir)
+                    .with_context(|| format!("installing imported unit {}", final_dir.display()))?;
                 Ok(())
             })();
-            if let Err(err) = staged {
+            if let Err(err) = installed {
                 let _ = util::remove_tree(store_root, &stage);
                 return Err(err).with_context(|| format!("importing unit {}", unit.name));
             }
-
-            let final_dir = units_root.join(&unit.name);
-            match metadata_nofollow(&final_dir) {
-                Ok(meta) if meta.is_dir() => util::remove_tree(store_root, &final_dir)?,
-                Ok(_) => anyhow::bail!(
-                    "import target {} is not a real directory",
-                    final_dir.display()
-                ),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err).with_context(|| format!("inspecting {}", final_dir.display()));
-                }
-            }
-            fs::rename(&stage, &final_dir)
-                .with_context(|| format!("installing imported unit {}", final_dir.display()))?;
             renamed.push(final_dir);
 
             for file in &entry.files {
@@ -228,7 +230,7 @@ pub fn import_units(
                 .bytes
                 .saturating_add(entry.files.iter().map(|file| file.size).sum::<u64>());
             report.stored += 1;
-            index.insert(entry.name.clone(), manifest.units.len());
+            index.insert(unit_identity(&entry.name), manifest.units.len());
             manifest.units.push(entry);
         }
 
@@ -247,16 +249,14 @@ pub fn import_units(
             let _ = util::remove_tree(store_root, dir);
         }
         if !had_manifest {
-            drop(_lock);
+            // Keep the generation lock through cleanup: a concurrent import
+            // must not save a manifest this failed import then deletes.
             let _ = util::remove_tree(store_root, &generation_root);
-            remove_generation_lock(store_root, generation);
         }
         return Err(err);
     }
     if !had_manifest && report.stored == 0 {
-        drop(_lock);
         let _ = util::remove_tree(store_root, &generation_root);
-        remove_generation_lock(store_root, generation);
     }
     Ok(report)
 }
@@ -321,6 +321,10 @@ fn import_entry(unit: &ImportUnit) -> Result<UnitEntry> {
     }
     entry.validate()?;
     Ok(entry)
+}
+
+fn unit_identity(name: &str) -> String {
+    name.to_lowercase()
 }
 
 fn import_dest_key(profile: &str, dest: &str) -> String {
@@ -442,4 +446,101 @@ fn verify_import_blob(path: &Path, size: u64, sha256: &str) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn raw_unit(
+        name: &str,
+        memo: &str,
+        dest: &str,
+        body: &[u8],
+        source: &Path,
+    ) -> Result<ImportUnit> {
+        let file = source.join(memo);
+        fs::write(&file, body)?;
+        Ok(ImportUnit {
+            name: name.into(),
+            profile: "debug".into(),
+            memo: memo.into(),
+            hash: "aabbccddeeff0011".into(),
+            version: None,
+            stamp: now_secs(),
+            layout: fingerprint::UnitLayout::Classic,
+            files: vec![ImportFile {
+                path: memo.into(),
+                dest: dest.into(),
+                size: body.len() as u64,
+                sha256: crate::vault::hex_encode(&Sha256::digest(body)),
+                role: "memo".into(),
+                source: ImportSource::Raw(file),
+            }],
+        })
+    }
+
+    #[test]
+    fn failed_final_install_removes_the_staged_unit() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let source = tempfile::tempdir()?;
+        let first = raw_unit(
+            "first-0000000000000001",
+            "lib-first",
+            "deps/libfirst",
+            b"first",
+            source.path(),
+        )?;
+        import_units(store.path(), "generation", "test", &[first])?;
+
+        let units_root = units_dir(store.path(), "generation");
+        fs::write(units_root.join("second-0000000000000002"), b"occupied")?;
+        let second = raw_unit(
+            "second-0000000000000002",
+            "lib-second",
+            "deps/libsecond",
+            b"second",
+            source.path(),
+        )?;
+        assert!(import_units(store.path(), "generation", "test", &[second]).is_err());
+
+        let leftovers: Vec<_> = fs::read_dir(&units_root)?
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".import.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover staging: {leftovers:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn case_variant_unit_is_kept_before_replacement() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let source = tempfile::tempdir()?;
+        let local = raw_unit(
+            "Demo-0000000000000001",
+            "lib-demo",
+            "deps/libdemo",
+            b"local",
+            source.path(),
+        )?;
+        import_units(store.path(), "generation", "test", &[local])?;
+
+        let remote = raw_unit(
+            "demo-0000000000000001",
+            "lib-demo-other",
+            "deps/libdemo-other",
+            b"remote",
+            source.path(),
+        )?;
+        let report = import_units(store.path(), "generation", "test", &[remote])?;
+        assert_eq!(report.stored, 0);
+        assert_eq!(report.skipped, 1);
+
+        let manifest = load_manifest(store.path(), "generation")?.expect("manifest");
+        assert_eq!(manifest.units.len(), 1);
+        assert_eq!(manifest.units[0].name, "Demo-0000000000000001");
+        Ok(())
+    }
 }

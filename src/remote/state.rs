@@ -121,7 +121,7 @@ impl RemoteState {
             "remote state has no timestamps"
         );
         ensure!(
-            self.expires > self.fetched_at,
+            self.expires >= self.fetched_at,
             "remote state was recorded after its index expired"
         );
         ensure!(
@@ -146,37 +146,26 @@ pub(crate) fn record_state_at(
     index: &SignedIndex,
     now: u64,
 ) -> Result<()> {
-    let pointer = index.pointer();
-    let body = index.body();
-    // Serialize the load-check-write per endpoint/key. Without this, two
-    // concurrent fetches can both read the old sequence and accept different
-    // bodies at the same sequence, or write a lower sequence after a higher
-    // one. The lock is held through the atomic write.
+    with_accepted_state(root, remote, index, now, || Ok(()))
+}
+
+pub(crate) fn with_accepted_state<T>(
+    root: &Path,
+    remote: &RemotePolicy,
+    index: &SignedIndex,
+    now: u64,
+    apply: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let path = state_file(root, remote)?;
-    let lock_path = path.with_extension("json.lock");
-    let _state_lock = crate::util::FileLock::acquire(&lock_path)?;
+    let _lock = crate::util::FileLock::acquire(&path.with_extension("json.lock"))?;
+    // Decisive replay check: this happens while holding the lock.
     let existing = load_state_at(root, remote)?;
-    check_replay(existing.as_ref(), pointer)?;
-    if existing.as_ref().is_some_and(|state| {
-        state.sequence == pointer.sequence && state.body_sha256 == pointer.body_sha256
-    }) {
-        return Ok(());
-    }
-    let state = RemoteState {
-        schema: SCHEMA_VERSION,
-        endpoint: remote.url.clone().context("remote has no endpoint")?,
-        key_id: pointer.key_id.clone(),
-        sequence: pointer.sequence,
-        body_sha256: pointer.body_sha256.clone(),
-        expires: pointer.expires,
-        fetched_at: now,
-        publisher: body.publisher.clone(),
-        compatibility: body.compatibility.clone(),
-    };
-    state.validate(remote)?;
-    let bytes = serde_json::to_vec_pretty(&state)?;
-    crate::util::write_atomic_private(&path, &bytes)?;
-    Ok(())
+    check_replay(existing.as_ref(), index.pointer())?;
+
+    // Durable watermark write: failure prevents apply from running.
+    record_state_while_locked(root, remote, index, now, existing)?;
+    // The lock remains held until the content operation completes.
+    apply()
 }
 
 fn check_replay(existing: Option<&RemoteState>, pointer: &IndexPointer) -> Result<()> {
@@ -195,6 +184,64 @@ fn check_replay(existing: Option<&RemoteState>, pointer: &IndexPointer) -> Resul
         ),
         _ => Ok(()),
     }
+}
+
+fn write_state_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::util::write_atomic_private(path, bytes)?;
+
+    #[cfg(unix)]
+    {
+        let parent = path.parent().context("remote state path has no parent")?;
+        let directory = std::fs::File::open(parent)
+            .with_context(|| format!("opening state directory {}", parent.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("syncing state directory {}", parent.display()))?;
+    }
+
+    Ok(())
+}
+
+fn record_state_while_locked(
+    root: &Path,
+    remote: &RemotePolicy,
+    index: &SignedIndex,
+    now: u64,
+    existing: Option<RemoteState>,
+) -> Result<()> {
+    let pointer = index.pointer();
+
+    if existing.as_ref().is_some_and(|state| {
+        state.sequence == pointer.sequence && state.body_sha256 == pointer.body_sha256
+    }) {
+        return Ok(());
+    }
+
+    let state = RemoteState {
+        schema: SCHEMA_VERSION,
+        endpoint: remote.url.clone().context("remote has no endpoint")?,
+        key_id: pointer.key_id.clone(),
+        sequence: pointer.sequence,
+        body_sha256: pointer.body_sha256.clone(),
+        expires: pointer.expires,
+        fetched_at: now,
+        publisher: index.body().publisher.clone(),
+        compatibility: index.body().compatibility.clone(),
+    };
+
+    state.validate(remote)?;
+    let bytes = serde_json::to_vec_pretty(&state)?;
+    // The record must fit the same cap the reader applies and must parse back
+    // into an equivalent state; otherwise fail before replacing a valid file.
+    ensure!(
+        bytes.len() as u64 <= MAX_STATE_BYTES,
+        "remote replay state is {} bytes (cap {MAX_STATE_BYTES})",
+        bytes.len()
+    );
+    let recorded: RemoteState =
+        serde_json::from_slice(&bytes).context("round-tripping the remote replay state")?;
+    recorded.validate(remote)?;
+    write_state_durably(&state_file(root, remote)?, &bytes)
 }
 
 /// Advisory status for `doctor`: last verified sequence plus machine-level

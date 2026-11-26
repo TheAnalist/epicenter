@@ -17,8 +17,17 @@ use epicenter_cli::{config, exec, paths, settings, util, vault};
 use args::{Cli, Command, StoreCommand};
 use build::{cmd_compact, cmd_doctor, cmd_exec, cmd_overlap, cmd_prune, cmd_status};
 use remote::{cmd_fetch, cmd_publish, cmd_restore};
-use setup::cmd_setup;
+use setup::{cmd_setup, cmd_setup_revert};
 use store::{cmd_evict, cmd_harvest, cmd_vault, cmd_verify};
+
+/// A `setup --revert` request, resolved before any policy is loaded so a
+/// malformed current policy cannot block restoring its backup.
+fn setup_revert(command: &Command) -> Option<&args::SetupArgs> {
+    match command {
+        Command::Setup(args) if args.revert => Some(args),
+        _ => None,
+    }
+}
 
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -26,6 +35,9 @@ pub(super) fn run() -> Result<()> {
         Command::Exec { cwd, .. } => cwd.clone().unwrap_or(std::env::current_dir()?),
         _ => std::env::current_dir()?,
     };
+    if let Some(args) = setup_revert(&cli.command) {
+        return cmd_setup_revert(args);
+    }
     let settings = settings::load(&cwd)?;
     match settings.cargo_home()? {
         (path, settings::Source::Global) => paths::set_cargo_home_override(Some(path)),
@@ -121,6 +133,12 @@ fn cmd_store(command: StoreCommand, settings: &settings::Settings) -> Result<()>
         StoreCommand::Fetch(args) => cmd_fetch(&args, settings),
         StoreCommand::Publish(args) => cmd_publish(&args, settings),
     }
+}
+
+/// A deletion runs only when it was confirmed AND not asked as a dry run.
+/// The dry-run flag always wins, including the short `-y` spelling.
+pub(super) fn confirmed_delete(dry_run: bool, yes: bool, y: bool) -> bool {
+    !dry_run && (yes || y)
 }
 
 /// A dim, aligned label column (13 chars, matching the other commands).

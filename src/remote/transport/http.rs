@@ -143,9 +143,11 @@ impl HttpResponse {
         Ok(total)
     }
 
-    /// Map a non-2xx status to a classified error. A 304 is left to callers.
+    /// Map a non-2xx status to a classified error. `304 Not Modified` is not a
+    /// success here: an unconditional request never sends a validator, so a
+    /// caller handling a conditional GET must inspect the status explicitly.
     pub fn ensure_success(self, what: &str) -> Result<Self, TransportError> {
-        if self.is_success() || self.status == 304 {
+        if self.is_success() {
             return Ok(self);
         }
         let status = self.status;
@@ -449,5 +451,42 @@ fn map_ureq(err: ureq::Error) -> TransportError {
             TransportError::new(ErrorKind::Redirect, "redirect refused")
         }
         _ => TransportError::new(ErrorKind::Protocol, "HTTP request failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(status: u16) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: ureq::Body::builder().data(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn unconditional_get_and_head_reject_304() {
+        for what in ["HTTPS GET", "HTTPS blob GET", "S3 GET", "S3 HEAD"] {
+            let err = response(304)
+                .ensure_success(what)
+                .err()
+                .expect("a 304 must not pass ensure_success");
+            assert_eq!(err.status, Some(304));
+            assert_eq!(err.kind, ErrorKind::Redirect);
+        }
+    }
+
+    #[test]
+    fn unconditional_get_and_head_accept_only_2xx() {
+        for status in [200, 201, 204] {
+            assert!(response(status).ensure_success("HTTPS GET").is_ok());
+        }
+        let err = response(302)
+            .ensure_success("HTTPS GET")
+            .err()
+            .expect("a redirect must not pass ensure_success");
+        assert_eq!(err.kind, ErrorKind::Redirect);
     }
 }

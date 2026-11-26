@@ -20,7 +20,7 @@ pub(super) fn cmd_evict(args: &EvictArgs) -> Result<()> {
         crate_name: args.crate_name.as_deref(),
         tier: args.tier,
         force: args.force,
-        delete: !args.dry_run && args.yes || args.y,
+        delete: super::confirmed_delete(args.dry_run, args.yes, args.y),
     };
     epicenter_cli::evict::run(&config::cache_root()?, &opts)
 }
@@ -117,7 +117,9 @@ pub(super) fn cmd_harvest(
 pub(super) fn cmd_vault() -> Result<()> {
     let root = config::cache_root()?;
     let store = vault::store_root(&root);
-    metadata_nofollow(&store)?;
+    // A store that has never been harvested is simply empty; a symlink or
+    // reparse point is still refused by the no-follow probe.
+    util::probe(&store, "store")?;
     println!(
         "{}",
         util::heading("epicenter vault — durable store of Cargo unit groups")

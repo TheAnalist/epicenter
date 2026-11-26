@@ -215,10 +215,7 @@ pub fn run() -> Result<Vec<Check>> {
     };
     checks.push(check_rustc());
     checks.push(check_locking());
-    checks.extend(check_incremental_state(
-        &root,
-        rows.as_deref().unwrap_or(&[]),
-    ));
+    checks.extend(incremental_checks(&root, rows.as_deref()));
     if let Some(rows) = &rows {
         checks.extend(check_mtime_ordering(rows));
     }
@@ -230,6 +227,12 @@ pub fn run() -> Result<Vec<Check>> {
 /// templated and must resolve to the dir cargo actually builds into.
 fn check_build_dir(root: &Path) -> Check {
     let section: &'static str = SEC_CONFIG;
+    // Cargo lets the environment win over every config file. When the
+    // override is present, the config template says nothing about the
+    // effective build-dir, so judge the value cargo will actually use.
+    if let Some(raw) = std::env::var_os("CARGO_BUILD_BUILD_DIR") {
+        return check_build_dir_override(root, &raw.to_string_lossy());
+    }
     let value = match crate::paths::cargo_build_dir() {
         Ok(Some(value)) => value,
         Ok(None) => {
@@ -297,6 +300,41 @@ fn check_build_dir(root: &Path) -> Check {
             format!(
                 "could not expand the build-dir template locally ({e:#}) — cargo still \
                  expands it at build time; only epicenter's local view failed"
+            ),
+        ),
+    }
+}
+
+/// Judge the effective build-dir when `CARGO_BUILD_BUILD_DIR` overrides the
+/// config file; the resolved path is compared against the shared cache.
+fn check_build_dir_override(root: &Path, value: &str) -> Check {
+    let section: &'static str = SEC_CONFIG;
+    match paths::resolve_template(value) {
+        Ok(resolved) if resolved == root => check(
+            section,
+            Level::Pass,
+            format!(
+                "CARGO_BUILD_BUILD_DIR resolves to the shared cache: {}",
+                root.display()
+            ),
+        ),
+        Ok(resolved) => check(
+            section,
+            Level::Warn,
+            format!(
+                "CARGO_BUILD_BUILD_DIR={value} overrides the config build-dir and resolves to \
+                 {} — cargo builds outside the shared cache {}; unset it or restore the \
+                 build-dir template",
+                resolved.display(),
+                root.display()
+            ),
+        ),
+        Err(e) => check(
+            section,
+            Level::Info,
+            format!(
+                "CARGO_BUILD_BUILD_DIR={value} is set but could not be expanded locally ({e:#}) \
+                 — cargo expands it at build time"
             ),
         ),
     }
@@ -488,7 +526,7 @@ fn check_rustc_wrapper() -> Vec<Check> {
             Level::Info,
             "no rustc-wrapper configured — kache/sccache are optional layers (`epicenter setup --with-wrapper kache`)",
         )),
-        Ok(Some(name)) => match crate::util::which_path(&name) {
+        Ok(Some(name)) => match wrapper_location(&name) {
             None => out.push(check(section,
                 Level::Warn,
                 format!(
@@ -501,7 +539,9 @@ fn check_rustc_wrapper() -> Vec<Check> {
                     Level::Pass,
                     format!("rustc-wrapper '{name}' discovered: {}", path.display()),
                 ));
-                if !crate::util::on_path(&name) {
+                // A wrapper configured as an absolute path is invoked directly;
+                // only a bare name is spawned through PATH.
+                if !Path::new(&name).is_absolute() && !crate::util::on_path(&name) {
                     out.push(check(section,
                         Level::Warn,
                         format!(
@@ -514,6 +554,17 @@ fn check_rustc_wrapper() -> Vec<Check> {
         },
     }
     out
+}
+
+/// Locate the configured wrapper: an absolute path is checked as-is (Cargo
+/// invokes it directly), a bare name is resolved through PATH and the cargo
+/// bin dir.
+fn wrapper_location(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    crate::util::which_path(name)
 }
 
 /// EXDEV class: cache on a different filesystem than this project's
@@ -731,6 +782,21 @@ fn check_store_generations(store: &Path) -> Vec<Check> {
 /// Incremental directories are not fingerprinted by the vault. Older rustc
 /// session directories can outlive the unit that created them; wrapper
 /// `incremental.*` state is opaque but reclaimable as a family.
+///
+/// Liveness comes from the unit scan: when it failed there are no rows, so a
+/// missing row cannot be read as an orphan. Say the check was skipped instead
+/// of warning about every session.
+fn incremental_checks(root: &Path, rows: Option<&[(Unit, ArtifactInfo)]>) -> Vec<Check> {
+    match rows {
+        Some(rows) => check_incremental_state(root, rows),
+        None => vec![check(
+            SEC_CACHE,
+            Level::Info,
+            "incremental orphan check skipped — the unit scan failed, so session liveness is unknown",
+        )],
+    }
+}
+
 fn check_incremental_state(root: &Path, rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
     let live: std::collections::HashSet<String> = rows
         .iter()
@@ -813,9 +879,8 @@ fn check_incremental_state(root: &Path, rows: &[(Unit, ArtifactInfo)]) -> Vec<Ch
 fn directory_bytes(root: &Path) -> u64 {
     let mut budget = crate::util::ScanBudget::new("doctor");
     crate::util::SafeWalk::new(root)
-        .walk()
+        .walk_with(&mut budget)
         .filter_map(|entry| entry.ok())
-        .take_while(|_| budget.take())
         .filter_map(|entry| entry.metadata().ok())
         .filter(|meta| meta.is_file())
         .fold(0u64, |total, meta| total.saturating_add(meta.len()))
@@ -835,17 +900,29 @@ fn check_mtime_ordering(rows: &[(Unit, ArtifactInfo)]) -> Vec<Check> {
 
     let mut checked = 0usize;
     let mut violations: Vec<(usize, usize)> = Vec::new();
+    let mut flagged = std::collections::HashSet::new();
     for (dependent, deps) in edges.iter().enumerate() {
         let own = rows[dependent].1.newest;
         for &dep in deps {
-            checked += 1;
+            // An edge is only evidence when both ends carry a timestamp.
             let (Some(own), Some(dep_newest)) = (own, rows[dep].1.newest) else {
                 continue;
             };
-            if dep_newest > own {
+            checked += 1;
+            // One unit recompiles once per build, however many of its
+            // dependencies are newer, so report each dependent once.
+            if dep_newest > own && flagged.insert(dependent) {
                 violations.push((dependent, dep));
             }
         }
+    }
+
+    if checked == 0 {
+        return vec![check(
+            SEC_MTIME,
+            Level::Info,
+            "mtime ordering not checked — no dependency edge has timestamps for both units",
+        )];
     }
 
     if violations.is_empty() {
@@ -1782,7 +1859,7 @@ fn effective_jobs(cores: usize, cap: usize) -> (usize, String) {
     }
     if let Some(raw) = project_cargo_jobs() {
         if let Some(jobs) = parse_jobs(&raw, cores) {
-            return (jobs, "project .cargo/config.toml".to_string());
+            return (jobs, "project .cargo/config".to_string());
         }
     }
     if let Ok(Some(raw)) = crate::config::cargo_configured_in("build", "jobs") {
@@ -1805,13 +1882,27 @@ fn parse_jobs(raw: &str, cores: usize) -> Option<usize> {
 }
 
 fn project_cargo_jobs() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    for ancestor in cwd.ancestors() {
-        let path = ancestor.join(".cargo").join("config.toml");
-        if path.is_file() {
-            if let Some(value) = crate::config::read_build_table_key(&path, "jobs") {
-                return Some(value);
+    cargo_jobs_between(&std::env::current_dir().ok()?)
+}
+
+/// Nearest ancestor `.cargo` config that sets `build.jobs`, matching Cargo's
+/// per-key merge. Cargo reads one file per directory and the extensionless
+/// `config` wins when both files exist, so never consult `config.toml` in a
+/// directory that has `config`.
+fn cargo_jobs_between(start: &Path) -> Option<String> {
+    for ancestor in start.ancestors() {
+        let dir = ancestor.join(".cargo");
+        let path = if dir.join("config").is_file() {
+            dir.join("config")
+        } else {
+            let toml = dir.join("config.toml");
+            if !toml.is_file() {
+                continue;
             }
+            toml
+        };
+        if let Some(value) = crate::config::read_build_table_key(&path, "jobs") {
+            return Some(value);
         }
     }
     None
@@ -1832,9 +1923,7 @@ fn active_linker() -> (String, Option<String>) {
         .ok()
         .flatten();
     let active = match raw.as_deref() {
-        Some(value) if value.contains("--ld-path=wild") || value.contains("-fuse-ld=wild") => {
-            "wild"
-        }
+        Some(value) if linker_flags_target_wild(value) => "wild",
         Some(value)
             if value.contains("-fuse-ld=lld")
                 || value.contains("rust-lld")
@@ -1846,6 +1935,26 @@ fn active_linker() -> (String, Option<String>) {
         None => "system",
     };
     (active.to_string(), raw)
+}
+
+/// Does the rustflags value select Wild? `--ld-path` may hold the bare name
+/// (legacy) or a resolved absolute path written by setup; compare the path's
+/// file name so a directory or sibling containing "wild" never matches.
+/// The linker is also selected through the whole `-fuse-ld=` rustflag token,
+/// either bare or wrapped as the `-C link-arg=-fuse-ld=wild` option pair.
+fn linker_flags_target_wild(raw: &str) -> bool {
+    raw.split(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '"' | '\'' | ','))
+        .any(|flag| {
+            if let Some(path) = flag.strip_prefix("--ld-path=") {
+                let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                let name = name.to_ascii_lowercase();
+                return name == "wild" || name == "wild.exe";
+            }
+            let flag = flag.strip_prefix("-C").unwrap_or(flag);
+            let arg = flag.strip_prefix("link-arg=").unwrap_or(flag);
+            arg.strip_prefix("-fuse-ld=")
+                .is_some_and(|value| value.eq_ignore_ascii_case("wild"))
+        })
 }
 
 pub(crate) fn workspace_root() -> Option<PathBuf> {
@@ -1911,3 +2020,247 @@ fn nightly_available() -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    fn stamp(path: &Path, secs: u64) -> Result<()> {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(time)?;
+        Ok(())
+    }
+
+    fn le_hex(value: u64) -> String {
+        value
+            .to_le_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Write one classic-layout unit: memo, optional fingerprint JSON with
+    /// dependency triples, and optionally a stamped artifact.
+    fn write_unit(
+        root: &Path,
+        package: &str,
+        suffix: &str,
+        memo: &str,
+        deps: &[(u64, &str)],
+        artifact_at: Option<u64>,
+    ) -> Result<()> {
+        let dir = root
+            .join("debug/.fingerprint")
+            .join(format!("{package}-{suffix}"));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(format!("lib-{package}")), memo)?;
+        let deps_json: Vec<String> = deps
+            .iter()
+            .map(|(hash, name)| format!("[{hash},\"{name}\",false,{hash}]"))
+            .collect();
+        fs::write(
+            dir.join(format!("lib-{package}.json")),
+            format!(
+                r#"{{"rustc":5244445300240561903,"features":"[]","declared_features":"[]","deps":[{}]}}"#,
+                deps_json.join(",")
+            ),
+        )?;
+        if let Some(at) = artifact_at {
+            fs::create_dir_all(root.join("debug/deps"))?;
+            let artifact = root
+                .join("debug/deps")
+                .join(format!("lib{package}-{suffix}.rlib"));
+            fs::write(&artifact, [1u8; 32])?;
+            stamp(&artifact, at)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mtime_violations_count_units_not_dependency_edges() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (first, second) = (1u64, 2u64);
+        write_unit(
+            root.path(),
+            "dep_a",
+            "1111111111111111",
+            &le_hex(first),
+            &[],
+            Some(1_700_000_600),
+        )?;
+        write_unit(
+            root.path(),
+            "dep_b",
+            "2222222222222222",
+            &le_hex(second),
+            &[],
+            Some(1_700_000_700),
+        )?;
+        write_unit(
+            root.path(),
+            "top",
+            "3333333333333333",
+            "3333333333333333",
+            &[(first, "dep_a"), (second, "dep_b")],
+            Some(1_700_000_000),
+        )?;
+
+        let rows = who::collect(root.path())?;
+        let checks = check_mtime_ordering(&rows);
+        assert!(
+            matches!(checks[0].level, Level::Warn),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("1 unit(s)"),
+            "two newer deps are still one recompiling unit: {}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("2 edge(s) checked"),
+            "both timestamped edges were inspected: {}",
+            checks[0].message
+        );
+        assert_eq!(checks.len(), 2, "one example for one affected unit");
+        Ok(())
+    }
+
+    #[test]
+    fn mtime_check_ignores_edges_without_timestamps() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let dep = 1u64;
+        write_unit(
+            root.path(),
+            "dep_a",
+            "1111111111111111",
+            &le_hex(dep),
+            &[],
+            Some(1_700_000_600),
+        )?;
+        // The dependent has no artifact, so the edge cannot be judged.
+        write_unit(
+            root.path(),
+            "top",
+            "3333333333333333",
+            "3333333333333333",
+            &[(dep, "dep_a")],
+            None,
+        )?;
+
+        let rows = who::collect(root.path())?;
+        let checks = check_mtime_ordering(&rows);
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].level, Level::Info),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("not checked"),
+            "got: {}",
+            checks[0].message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_wrapper_is_checked_directly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wrapper = dir.path().join("wrapper-tool");
+        fs::write(&wrapper, b"")?;
+        assert_eq!(
+            wrapper_location(&wrapper.to_string_lossy()),
+            Some(wrapper.clone())
+        );
+        assert!(wrapper_location(&dir.path().join("missing-tool").to_string_lossy()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_jobs_prefers_extensionless_config() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cargo = root.path().join(".cargo");
+        fs::create_dir_all(&cargo)?;
+        fs::write(cargo.join("config"), "[build]\njobs = 3\n")?;
+        fs::write(cargo.join("config.toml"), "[build]\njobs = 9\n")?;
+        assert_eq!(cargo_jobs_between(root.path()).as_deref(), Some("3"));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_jobs_uses_nearest_ancestor() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join(".cargo"))?;
+        fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[build]\njobs = 4\n",
+        )?;
+        let nested = root.path().join("crates/app");
+        fs::create_dir_all(nested.join(".cargo"))?;
+        fs::write(nested.join(".cargo/config.toml"), "[build]\njobs = 5\n")?;
+        assert_eq!(cargo_jobs_between(&nested).as_deref(), Some("5"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_dir_env_override_is_judged_against_the_cache() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cache = root.path().join("cache");
+        let elsewhere = root.path().join("elsewhere");
+        let aligned = check_build_dir_override(&cache, &cache.to_string_lossy());
+        assert!(matches!(aligned.level, Level::Pass), "{}", aligned.message);
+        let drifting = check_build_dir_override(&cache, &elsewhere.to_string_lossy());
+        assert!(
+            matches!(drifting.level, Level::Warn),
+            "{}",
+            drifting.message
+        );
+        assert!(drifting.message.contains("CARGO_BUILD_BUILD_DIR"));
+        Ok(())
+    }
+
+    #[test]
+    fn wild_is_matched_by_file_name_not_substring() {
+        assert!(linker_flags_target_wild(
+            "--ld-path=/home/dev/.cargo/bin/wild"
+        ));
+        assert!(linker_flags_target_wild(
+            r#"["--ld-path=C:\tools\wild.exe"]"#
+        ));
+        assert!(linker_flags_target_wild("--ld-path=wild"));
+        assert!(linker_flags_target_wild("-C link-arg=-fuse-ld=wild"));
+        assert!(!linker_flags_target_wild(
+            "--ld-path=/opt/wild-thing/bin/ld"
+        ));
+        assert!(!linker_flags_target_wild("--ld-path=/opt/lld/wildly"));
+    }
+
+    #[test]
+    fn failed_unit_scan_skips_orphan_diagnosis() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("debug/incremental/orphan-abc123/session"))?;
+        let checks = incremental_checks(root.path(), None);
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].level, Level::Info),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0].message.contains("skipped"),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            !checks
+                .iter()
+                .any(|check| check.message.contains("without a live fingerprint")),
+            "no orphan claim without a unit scan"
+        );
+        Ok(())
+    }
+}
