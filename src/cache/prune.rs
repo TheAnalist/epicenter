@@ -615,6 +615,33 @@ mod tests {
     }
 
     #[test]
+    fn incremental_only_prune_keeps_compiled_units() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let incremental = root.path().join("debug/incremental.kache-auto");
+        let deps = root.path().join("debug/deps");
+        fs::create_dir_all(&incremental)?;
+        fs::create_dir_all(&deps)?;
+        fs::write(incremental.join("session.bin"), b"scratch")?;
+        let artifact = deps.join("libdemo-aaaaaaaaaaaaaaaa.rlib");
+        fs::write(&artifact, b"compiled")?;
+
+        let report = prune_with(
+            root.path(),
+            SystemTime::now(),
+            true,
+            &Options {
+                keep_latest: Some(0),
+                incremental: true,
+            },
+        )?;
+        assert_eq!(report.removed_groups, 1);
+        assert_eq!(report.errors, 0);
+        assert!(!incremental.exists());
+        assert_eq!(fs::read(artifact)?, b"compiled");
+        Ok(())
+    }
+
+    #[test]
     fn prune_reports_then_deletes_stale_units() -> Result<()> {
         let root = tempfile::tempdir()?;
         let deps = root.path().join("debug/deps");

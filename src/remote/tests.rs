@@ -300,6 +300,53 @@ fn replay_state_rejects_rollback_and_equivocation() -> Result<()> {
 }
 
 #[test]
+fn replay_state_isolates_endpoints_and_publisher_keys() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let key = signing_key(7);
+    let remote = remote_policy(&public_key(&key));
+    let mut other_endpoint = remote.clone();
+    other_endpoint.url = Some("https://cache.example/other-root".into());
+    let rotated_key = signing_key(8);
+    let rotated_remote = remote_policy(&public_key(&rotated_key));
+
+    for (policy, key, sequence) in [
+        (&remote, &key, 7),
+        (&other_endpoint, &key, 2),
+        (&rotated_remote, &rotated_key, 1),
+    ] {
+        let body = body_for(key, now, sequence, RemoteTier::Libraries, Vec::new());
+        let index = make_index(body, key, now)?;
+        state::record_state_at(dir.path(), policy, &index, now)?;
+    }
+
+    state::clear_state_at(dir.path(), &other_endpoint)?;
+    assert!(state::load_state_at(dir.path(), &other_endpoint)?.is_none());
+    for (policy, sequence) in [(&remote, 7), (&rotated_remote, 1)] {
+        let saved = state::load_state_at(dir.path(), policy)?.expect("independent replay state");
+        assert_eq!(saved.sequence, sequence);
+    }
+    Ok(())
+}
+
+#[test]
+fn replaying_the_same_index_preserves_its_original_fetch_time() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let key = signing_key(7);
+    let remote = remote_policy(&public_key(&key));
+    let body = body_for(&key, now, 7, RemoteTier::Libraries, Vec::new());
+    let index = make_index(body, &key, now)?;
+
+    state::record_state_at(dir.path(), &remote, &index, now)?;
+    state::record_state_at(dir.path(), &remote, &index, now + 60)?;
+    let saved = state::load_state_at(dir.path(), &remote)?.expect("replay state");
+    assert_eq!(saved.fetched_at, now);
+    assert_eq!(saved.body_sha256, index.pointer().body_sha256);
+    Ok(())
+}
+
+#[test]
 fn replay_state_serializes_concurrent_writers() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let now = now_secs();

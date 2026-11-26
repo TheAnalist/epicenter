@@ -225,6 +225,88 @@ mod tests {
     }
 
     #[test]
+    fn invalid_upload_plans_make_no_remote_writes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sink = MemorySink::new();
+        let body = || upload_file(dir.path(), "indexes/body.json", b"body");
+        let pointer = || {
+            let mut upload = upload_file(dir.path(), INDEX_FILE, b"pointer");
+            upload.kind = UploadKind::Pointer;
+            upload
+        };
+
+        for uploads in [
+            vec![],
+            vec![body()],
+            vec![pointer(), pointer()],
+            vec![pointer(), body()],
+        ] {
+            assert!(
+                upload(&UploadRequest {
+                    sink: &sink,
+                    uploads: &uploads,
+                    current: None,
+                })
+                .is_err()
+            );
+        }
+        assert!(sink.order.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_blob_upload_leaves_the_published_pointer_unchanged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sink = MemorySink::new();
+        sink.objects
+            .lock()
+            .unwrap()
+            .insert(INDEX_FILE.into(), b"previous pointer".to_vec());
+        let mut blob = upload_file(dir.path(), "blobs/artifact", b"artifact");
+        blob.kind = UploadKind::Blob;
+        std::fs::remove_file(&blob.source)?;
+        let body = upload_file(dir.path(), "indexes/new.json", b"body");
+        let mut pointer = upload_file(dir.path(), INDEX_FILE, b"new pointer");
+        pointer.kind = UploadKind::Pointer;
+
+        assert!(
+            upload(&UploadRequest {
+                sink: &sink,
+                uploads: &[blob, body, pointer],
+                current: None,
+            })
+            .is_err()
+        );
+        assert_eq!(*sink.order.lock().unwrap(), ["blobs/artifact".to_string()]);
+        assert_eq!(sink.get(INDEX_FILE, 1024)?, b"previous pointer");
+        Ok(())
+    }
+
+    #[test]
+    fn pointer_readback_must_match_the_staged_digest() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sink = MemorySink::new();
+        let mut pointer = upload_file(dir.path(), INDEX_FILE, b"original");
+        pointer.kind = UploadKind::Pointer;
+        // This sink accepts a write without validating the planned hash.
+        std::fs::write(&pointer.source, b"modified")?;
+
+        let error = upload(&UploadRequest {
+            sink: &sink,
+            uploads: &[pointer],
+            current: None,
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the staged bytes"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn uploads_the_pointer_last_and_verifies_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let sink = MemorySink::new();

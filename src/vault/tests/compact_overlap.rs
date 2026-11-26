@@ -131,6 +131,35 @@ fn compact_links_identical_files_and_is_idempotent() -> Result<()> {
 }
 
 #[test]
+fn compact_generation_filter_excludes_duplicates_in_other_generations() -> Result<()> {
+    let store = tempfile::tempdir()?;
+    let hash = "aaaaaaaaaaaaaaaa";
+    let payload = b"shared bytes";
+    for generation in ["selected", "other"] {
+        write_overlap_unit(store.path(), generation, hash, payload)?;
+        save_manifest(
+            store.path(),
+            generation,
+            &compact_manifest(generation, &[hash], payload.len() as u64),
+        )?;
+    }
+
+    let selected = compact(store.path(), Some("selected"), true)?;
+    assert_eq!(selected.generations, 1);
+    assert_eq!(selected.groups, 0);
+    let all = compact(store.path(), None, true)?;
+    assert_eq!(all.generations, 2);
+    assert_eq!(all.groups, 1);
+
+    let error = compact(store.path(), Some("missing"), true).unwrap_err();
+    assert!(
+        error.to_string().contains("no vault generation matches"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn compact_dry_run_does_not_link() -> Result<()> {
     let store = tempfile::tempdir()?;
     let payload = b"dry-run payload";

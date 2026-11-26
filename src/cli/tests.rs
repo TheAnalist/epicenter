@@ -145,6 +145,31 @@ fn exec_and_restore_accept_no_remote() {
 }
 
 #[test]
+fn setup_rejects_remote_off_combined_with_remote_configuration() {
+    for (flag, value) in [
+        ("--remote-url", "https://cache.example"),
+        ("--remote-key", "key.pub"),
+        ("--remote-tier", "libraries"),
+    ] {
+        let error = Cli::try_parse_from(["epicenter", "setup", "--remote-off", flag, value])
+            .err()
+            .unwrap_or_else(|| panic!("--remote-off must conflict with {flag}"));
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}
+
+#[test]
+fn setup_requires_write_profile_for_dev_debug() {
+    let error = Cli::try_parse_from(["epicenter", "setup", "--dev-debug", "line"])
+        .err()
+        .expect("--dev-debug requires --write-profile");
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+}
+
+#[test]
 fn setup_accepts_measure() {
     let cli = Cli::try_parse_from(["epicenter", "setup", "--measure"]).unwrap();
     match cli.command {
